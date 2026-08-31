@@ -6,16 +6,17 @@ import io
 from PIL import Image
 import datetime
 
+# 고해상도 스캔 이미지 용량 제한 해제
+Image.MAX_IMAGE_PIXELS = None
+
 # ==========================================
-# 0. 사내 보안 비밀번호 설정
+# 0. 사내 전용 비밀번호 설정
 # ==========================================
 def check_password():
-    """비밀번호 검증 함수"""
     def password_entered():
-        # 클라우드 비밀 금고(Secrets)에 저장될 비밀번호와 비교
         if st.session_state["password"] == st.secrets["APP_PASSWORD"]:
             st.session_state["password_correct"] = True
-            del st.session_state["password"]  # 세션에서 비밀번호 삭제
+            del st.session_state["password"]
         else:
             st.session_state["password_correct"] = False
 
@@ -30,14 +31,12 @@ def check_password():
         return False
     return True
 
-# 비밀번호를 통과하지 못하면 아래 코드는 실행되지 않음
 if not check_password():
     st.stop()
 
 # ==========================================
-# 1. 환경 설정 및 API 키 입력 (클라우드 비밀 금고 사용)
+# 1. 환경 설정 및 API 키 입력
 # ==========================================
-# 코드가 아닌 Streamlit 클라우드의 Secrets(비밀 금고)에서 API 키를 안전하게 가져옵니다.
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 genai.configure(api_key=GEMINI_API_KEY)
 
@@ -148,7 +147,7 @@ if "extracted_data" not in st.session_state:
     st.session_state.extracted_data = None
 
 st.subheader("1. IMM5476 템플릿 업로드")
-st.info("💡지정된 IMM5476 서식을 올려주세요.")
+st.info("💡 입력 칸(파란색 박스)이 살아있는 IMM5476 원본 서식을 올려주세요.")
 template_file = st.file_uploader("IMM5476 템플릿 PDF 선택", type=['pdf'], key="template")
 
 st.subheader("2. 손님 여권 또는 퍼밋 (이미지 또는 PDF)")
@@ -160,12 +159,19 @@ if client_file is not None:
     if client_file.type == "application/pdf":
         doc = fitz.open(stream=client_file.read(), filetype="pdf")
         page = doc.load_page(0)
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+        # 메모리 절약을 위해 해상도 렌더링 최적화
+        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
         image_to_process = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        st.image(image_to_process, caption="PDF 문서 미리보기", use_container_width=True)
     else:
         image_to_process = Image.open(client_file)
-        st.image(image_to_process, caption="업로드된 이미지 미리보기", use_container_width=True)
+    
+    # 서버 메모리 초과 방지를 위한 스마트 리사이징 (최대 가로 1800px)
+    if image_to_process.width > 1800:
+        ratio = 1800 / image_to_process.width
+        new_size = (1800, int(image_to_process.height * ratio))
+        image_to_process = image_to_process.resize(new_size)
+
+    st.image(image_to_process, caption="업로드 문서 미리보기", use_container_width=True)
 
     if st.button("🚀 AI로 정보 자동 추출하기"):
         with st.spinner("AI가 문서를 꼼꼼히 읽고 있습니다... (약 3~5초 소요)"):
