@@ -147,7 +147,7 @@ if "extracted_data" not in st.session_state:
     st.session_state.extracted_data = None
 
 st.subheader("1. IMM5476 템플릿 업로드")
-st.info("💡 입력 칸(파란색 박스)이 살아있는 IMM5476 원본 서식을 올려주세요.")
+st.info("💡 지정된 IMM5476 서식을 올려주세요.")
 template_file = st.file_uploader("IMM5476 템플릿 PDF 선택", type=['pdf'], key="template")
 
 st.subheader("2. 손님 여권 또는 퍼밋 (이미지 또는 PDF)")
