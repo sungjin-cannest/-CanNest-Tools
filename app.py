@@ -3,6 +3,7 @@ import google.generativeai as genai
 import fitz  # PyMuPDF
 import json
 import io
+import os
 from PIL import Image
 import datetime
 
@@ -10,8 +11,13 @@ import datetime
 Image.MAX_IMAGE_PIXELS = None
 
 # ==========================================
-# 0. 사내 전용 비밀번호 설정
+# 0. Secrets 안전 검사 및 보안 비밀번호 설정
 # ==========================================
+if "APP_PASSWORD" not in st.secrets or "GEMINI_API_KEY" not in st.secrets:
+    st.error("⚠️ Streamlit Cloud의 Secrets 설정이 필요합니다.")
+    st.info("우측 하단 [Manage app] -> [Settings] -> [Secrets]에 GEMINI_API_KEY와 APP_PASSWORD를 입력해 주세요.")
+    st.stop()
+
 def check_password():
     def password_entered():
         if st.session_state["password"] == st.secrets["APP_PASSWORD"]:
@@ -21,11 +27,11 @@ def check_password():
             st.session_state["password_correct"] = False
 
     if "password_correct" not in st.session_state:
-        st.title("🔒 사내 전용 시스템")
+        st.title("🔒 CanNest 통합 업무 시스템")
         st.text_input("접속 비밀번호를 입력하세요", type="password", on_change=password_entered, key="password")
         return False
     elif not st.session_state["password_correct"]:
-        st.title("🔒 사내 전용 시스템")
+        st.title("🔒 CanNest 통합 업무 시스템")
         st.text_input("접속 비밀번호를 입력하세요", type="password", on_change=password_entered, key="password")
         st.error("비밀번호가 틀렸습니다.")
         return False
@@ -35,28 +41,40 @@ if not check_password():
     st.stop()
 
 # ==========================================
-# 1. 환경 설정 및 API 키 입력
+# 1. API 키 및 모델 설정
 # ==========================================
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 genai.configure(api_key=GEMINI_API_KEY)
-
 model = genai.GenerativeModel('gemini-3.6-flash')
 
 # ==========================================
-# 2. 핵심 함수 정의
+# 2. 공통 및 AI 데이터 추출 함수
 # ==========================================
-def extract_info_from_image(image):
-    prompt = """
-    You are an expert at extracting information from identity documents (passports, Canadian visas, study/work permits).
-    Analyze this document and extract the following information. 
-    Return ONLY a valid JSON object without markdown tags.
+def process_uploaded_file_to_image(file_obj):
+    if file_obj.type == "application/pdf":
+        doc = fitz.open(stream=file_obj.read(), filetype="pdf")
+        page = doc.load_page(0)
+        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    else:
+        img = Image.open(file_obj)
     
+    if img.width > 1800:
+        ratio = 1800 / img.width
+        new_size = (1800, int(img.height * ratio))
+        img = img.resize(new_size)
+    return img
+
+def extract_imm5476_info(image):
+    prompt = """
+    Analyze this document (passport/visa/permit) and extract the following information.
+    Return ONLY a valid JSON object without markdown tags.
     Format required:
     {
-      "surname": "Family name or Surname in English uppercase",
+      "surname": "Family name in English uppercase",
       "given_name": "Given names in English uppercase",
       "dob": "Date of birth in YYYY-MM-DD format",
-      "uci": "UCI (Unique Client Identifier) if present, formatted as digits only (e.g., 1234567890). If not found, return an empty string."
+      "uci": "UCI digits only if present, else empty string"
     }
     """
     try:
@@ -64,12 +82,44 @@ def extract_info_from_image(image):
         clean_text = response.text.strip().replace('```json', '').replace('```', '')
         return json.loads(clean_text)
     except Exception as e:
-        st.error(f"정보 추출 중 오류가 발생했습니다: {e}")
+        st.error(f"정보 추출 오류: {e}")
         return None
 
+def extract_passport_details(image):
+    prompt = """
+    Analyze this passport document and extract key details.
+    Return ONLY a valid JSON object without markdown tags.
+    Format required:
+    {
+      "surname": "Surname in English uppercase",
+      "given_name": "Given name in English uppercase",
+      "dob": "Date of birth in YYYY-MM-DD format",
+      "passport_number": "Passport number uppercase",
+      "gender": "F or M"
+    }
+    """
+    try:
+        response = model.generate_content([prompt, image])
+        clean_text = response.text.strip().replace('```json', '').replace('```', '')
+        return json.loads(clean_text)
+    except Exception as e:
+        st.error(f"여권 정보 추출 중 오류: {e}")
+        return None
+
+def is_minor(dob_str):
+    try:
+        birth_date = datetime.datetime.strptime(dob_str, "%Y-%m-%d").date()
+        today = datetime.date.today()
+        age = today.year - birth_date.year - ((today.month, today.day) < (birth_date.month, birth_date.day))
+        return age < 19
+    except:
+        return True
+
+# ==========================================
+# 3. PDF 서식 채우기 로직
+# ==========================================
 def fill_imm5476(template_bytes, data):
     doc = fitz.open(stream=template_bytes, filetype="pdf")
-    
     target_data = {
         "surname": data.get("surname", ""),
         "given": data.get("given_name", ""),
@@ -78,19 +128,14 @@ def fill_imm5476(template_bytes, data):
         "uci": data.get("uci", "").replace("-", ""),  
         "signDate": data.get("signDate", "")  
     }
-    
-    flags = {
-        "surname": False, "given": False, "dob": False, "email": False, "uci": False
-    }
+    flags = {"surname": False, "given": False, "dob": False, "email": False, "uci": False}
     date_counter = 0
     fields_found = False
     
     for page in doc:
         for widget in page.widgets():
             field_name = widget.field_name
-            if not field_name: 
-                continue
-            
+            if not field_name: continue
             fields_found = True
             fname_lower = field_name.lower()
             
@@ -98,27 +143,22 @@ def fill_imm5476(template_bytes, data):
                 widget.field_value = target_data["surname"]
                 widget.update()
                 flags["surname"] = True
-                
             elif "given name" in fname_lower and not flags["given"]:
                 widget.field_value = target_data["given"]
                 widget.update()
                 flags["given"] = True
-                
             elif "date of birth" in fname_lower and not flags["dob"]:
                 widget.field_value = target_data["dob"]
                 widget.update()
                 flags["dob"] = True
-                
             elif "email" in fname_lower and not flags["email"]:
                 widget.field_value = target_data["email"]
                 widget.update()
                 flags["email"] = True
-                
             elif ("uci" in fname_lower or "unique client identifier" in fname_lower) and not flags["uci"]:
                 widget.field_value = target_data["uci"]
                 widget.update()
                 flags["uci"] = True
-                
             elif "date" in fname_lower and "birth" not in fname_lower:
                 date_counter += 1
                 if date_counter == 1:
@@ -126,98 +166,330 @@ def fill_imm5476(template_bytes, data):
                     widget.update()
 
     if not fields_found:
-        raise Exception("PDF에서 입력 칸을 찾을 수 없습니다. (입력 칸이 살아있는 원본 PDF를 올려주세요.)")
+        raise Exception("PDF 입력 칸을 찾을 수 없습니다.")
 
     output_pdf = io.BytesIO()
     doc.save(output_pdf)
     doc.close()
     output_pdf.seek(0)
+    return output_pdf
+
+def fill_consent_letter(template_bytes, data):
+    doc = fitz.open(stream=template_bytes, filetype="pdf")
+    children = data.get("children", [])
+    num_children = len(children)
     
+    num_pages_needed = max(1, (num_children + 2) // 3)
+    for _ in range(num_pages_needed - 1):
+        doc.insert_pdf(doc, from_page=0, to_page=0)
+        
+    for page_num in range(num_pages_needed):
+        page = doc[page_num]
+        page_children = children[page_num * 3 : (page_num + 1) * 3]
+        child_widgets = [
+            ("Information about travelling children", "yyyymmdd"),
+            ("1_2", "2_2"),
+            ("1_3", "2_3")
+        ]
+        
+        for widget in page.widgets():
+            fname = widget.field_name.strip() if widget.field_name else ""
+            if not fname: continue
+            
+            if fname == "1":
+                widget.field_value = data.get("non_acc_name", "")
+                widget.update()
+            elif fname == "2":
+                widget.field_value = data.get("non_acc_address", "")
+                widget.update()
+            elif fname == "3":
+                widget.field_value = data.get("non_acc_phone", "")
+                widget.update()
+            elif fname == "email":
+                widget.field_value = data.get("non_acc_email", "")
+                widget.update()
+                
+            elif fname == "Check Box1":
+                widget.field_value = "0"
+                widget.update()
+            elif fname == "This child or these children hashave my or our consent to travel with":
+                widget.field_value = data.get("acc_name", "")
+                widget.update()
+            elif fname == "Relationship with Children 1":
+                widget.field_value = data.get("acc_relationship", "")
+                widget.update()
+            elif fname == "Relationship with Children 2":
+                widget.field_value = data.get("acc_passport", "")
+                widget.update()
+                
+            elif fname == "I give my consent for this child to travel to":
+                widget.field_value = "Canada"
+                widget.update()
+            elif fname == "1_4":
+                widget.field_value = ""
+                widget.update()
+            elif fname == "2_4":
+                widget.field_value = data.get("acc_name", "")
+                widget.update()
+            elif fname == "At the following addresses 1":
+                widget.field_value = data.get("trip_address", "")
+                widget.update()
+            elif fname == "At the following addresses 2":
+                widget.field_value = data.get("trip_phone", "")
+                widget.update()
+            elif fname == "email_2":
+                widget.field_value = data.get("trip_email", "")
+                widget.update()
+            elif fname == "yyyymmdd_2":
+                widget.field_value = data.get("sign_date", "")
+                widget.update()
+                
+            for idx, (name_key, dob_key) in enumerate(child_widgets):
+                if idx < len(page_children):
+                    if fname == name_key:
+                        widget.field_value = page_children[idx].get("name", "")
+                        widget.update()
+                    elif fname == dob_key:
+                        widget.field_value = page_children[idx].get("dob", "")
+                        widget.update()
+
+    output_pdf = io.BytesIO()
+    doc.save(output_pdf)
+    doc.close()
+    output_pdf.seek(0)
     return output_pdf
 
 # ==========================================
-# 3. Streamlit 웹 UI 구성
+# 4. Streamlit 네비게이션 및 UI 구성
 # ==========================================
-st.set_page_config(page_title="IMM5476 자동 작성 도구", layout="centered")
+st.set_page_config(page_title="CanNest 업무 자동화 툴", layout="centered")
 
-st.title("🍁 IMM5476 자동 작성 도구 (사내전용)")
-st.write("여권이나 퍼밋 서류를 올리면 최신 AI가 데이터를 완벽하게 읽어냅니다.")
+st.sidebar.title("🦅 CanNest Tool")
+app_mode = st.sidebar.radio("원하시는 업무 도구를 선택하세요", ["🍁 IMM5476 자동 작성", "✈️ 한부모 동의서 자동 작성"])
 
-if "extracted_data" not in st.session_state:
-    st.session_state.extracted_data = None
+# ------------------------------------------
+# 메뉴 1: IMM5476 자동 작성
+# ------------------------------------------
+if app_mode == "🍁 IMM5476 자동 작성":
+    st.title("🍁 IMM5476 자동 작성 도구")
+    st.write("여권이나 퍼밋 서류를 올리면 AI가 데이터를 추출하여 서식을 채워줍니다.")
 
-st.subheader("1. IMM5476 템플릿 업로드")
-st.info("💡 지정된 IMM5476 서식을 올려주세요.")
-template_file = st.file_uploader("IMM5476 템플릿 PDF 선택", type=['pdf'], key="template")
+    if "extracted_5476" not in st.session_state:
+        st.session_state.extracted_5476 = None
 
-st.subheader("2. 손님 여권 또는 퍼밋 (이미지 또는 PDF)")
-client_file = st.file_uploader("여권/퍼밋 선택 (JPG, PNG, PDF)", type=['jpg', 'jpeg', 'png', 'pdf'], key="client")
+    # IMM5476 템플릿 내장 여부 확인
+    default_5476_path = "imm5476_template.pdf"
+    template_5476_bytes = None
 
-if client_file is not None:
-    image_to_process = None
-    
-    if client_file.type == "application/pdf":
-        doc = fitz.open(stream=client_file.read(), filetype="pdf")
-        page = doc.load_page(0)
-        # 메모리 절약을 위해 해상도 렌더링 최적화
-        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
-        image_to_process = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    if os.path.exists(default_5476_path):
+        st.success("✅ 사내 표준 'IMM5476' 양식이 자동으로 로드되었습니다.")
+        with open(default_5476_path, "rb") as f:
+            template_5476_bytes = f.read()
     else:
-        image_to_process = Image.open(client_file)
+        st.subheader("1. IMM5476 템플릿 업로드")
+        template_file = st.file_uploader("IMM5476 템플릿 PDF 선택", type=['pdf'], key="template_5476")
+        if template_file:
+            template_5476_bytes = template_file.getvalue()
+
+    st.markdown("---")
+    st.subheader("1. 손님 여권 또는 퍼밋 (이미지 또는 PDF)")
+    client_file = st.file_uploader("여권/퍼밋 선택", type=['jpg', 'jpeg', 'png', 'pdf'], key="client_5476")
+
+    if client_file is not None:
+        img = process_uploaded_file_to_image(client_file)
+        st.image(img, caption="업로드 문서 미리보기", use_container_width=True)
+
+        if st.button("🚀 AI 정보 추출하기", key="btn_5476"):
+            with st.spinner("AI가 분석 중입니다..."):
+                extracted = extract_imm5476_info(img)
+                if extracted:
+                    st.session_state.extracted_5476 = extracted
+                    st.success("정보 추출 성공!")
+
+    if st.session_state.extracted_5476 is not None:
+        st.subheader("2. 정보 확인 및 입력")
+        data = st.session_state.extracted_5476
+        col1, col2 = st.columns(2)
+        with col1:
+            surname = st.text_input("성 (Surname)", value=data.get("surname", ""))
+            dob = st.text_input("생년월일 (YYYY-MM-DD)", value=data.get("dob", ""))
+            email = st.text_input("이메일", value="")
+        with col2:
+            given = st.text_input("이름 (Given Name)", value=data.get("given_name", ""))
+            uci = st.text_input("UCI (있는 경우)", value=data.get("uci", ""))
+            sign_date = st.date_input("서명란 날짜", value=datetime.date.today())
+
+        if st.button("문서 생성 및 다운로드", type="primary"):
+            if not template_5476_bytes:
+                st.error("1번 단계에서 IMM5476 템플릿 PDF를 올리거나, GitHub 저장소에 imm5476_template.pdf 파일을 추가해 주세요!")
+            elif not email:
+                st.warning("이메일을 입력해 주세요.")
+            else:
+                final_data = {
+                    "surname": surname, "given_name": given, "dob": dob,
+                    "uci": uci, "email": email, "signDate": sign_date.strftime("%Y-%m-%d")
+                }
+                try:
+                    pdf_out = fill_imm5476(template_5476_bytes, final_data)
+                    st.download_button("📥 완성된 IMM5476 다운로드", pdf_out, file_name=f"IMM5476_{surname}_{given}.pdf", mime="application/pdf")
+                    st.balloons()
+                except Exception as e:
+                    st.error(f"오류 발생: {e}")
+
+# ------------------------------------------
+# 메뉴 2: 한부모 동의서 자동 작성
+# ------------------------------------------
+elif app_mode == "✈️ 한부모 동의서 자동 작성":
+    st.title("✈️ 한부모 동의서(Consent Letter) 자동 작성 도구")
     
-    # 서버 메모리 초과 방지를 위한 스마트 리사이징 (최대 가로 1800px)
-    if image_to_process.width > 1800:
-        ratio = 1800 / image_to_process.width
-        new_size = (1800, int(image_to_process.height * ratio))
-        image_to_process = image_to_process.resize(new_size)
+    if "consent_non_acc" not in st.session_state: st.session_state.consent_non_acc = {}
+    if "consent_family" not in st.session_state: st.session_state.consent_family = []
 
-    st.image(image_to_process, caption="업로드 문서 미리보기", use_container_width=True)
+    # 동의서 템플릿 내장 여부 확인
+    default_template_path = "consent_template.pdf"
+    consent_template_bytes = None
 
-    if st.button("🚀 AI로 정보 자동 추출하기"):
-        with st.spinner("AI가 문서를 꼼꼼히 읽고 있습니다... (약 3~5초 소요)"):
-            extracted = extract_info_from_image(image_to_process)
-            if extracted:
-                st.session_state.extracted_data = extracted
-                st.success("정보 추출 성공!")
+    if os.path.exists(default_template_path):
+        st.success("✅ 사내 표준 '한부모 동의서' 양식이 자동으로 로드되었습니다.")
+        with open(default_template_path, "rb") as f:
+            consent_template_bytes = f.read()
+    else:
+        st.subheader("1. 동의서 템플릿 PDF 업로드")
+        consent_template = st.file_uploader("한부모 동의서 양식 PDF 선택", type=['pdf'], key="consent_tmpl")
+        if consent_template:
+            consent_template_bytes = consent_template.getvalue()
 
-if st.session_state.extracted_data is not None:
-    st.subheader("3. 정보 확인 및 추가 입력")
-    data = st.session_state.extracted_data
+    st.markdown("---")
+    st.subheader("1. 비동반 부모님 정보 (동의서 작성인)")
+    non_acc_file = st.file_uploader("비동반 부모님 여권 업로드", type=['jpg', 'jpeg', 'png', 'pdf'], key="non_acc")
     
-    col1, col2 = st.columns(2)
-    with col1:
-        surname = st.text_input("성 (Surname)", value=data.get("surname", ""))
-        dob = st.text_input("생년월일 (YYYY-MM-DD)", value=data.get("dob", ""))
-        email = st.text_input("이메일", value="")
-    with col2:
-        given = st.text_input("이름 (Given Name)", value=data.get("given_name", ""))
-        uci = st.text_input("UCI (있는 경우)", value=data.get("uci", ""))
-        sign_date = st.date_input("서명란 날짜", value=datetime.date.today())
+    if non_acc_file is not None:
+        img_non_acc = process_uploaded_file_to_image(non_acc_file)
+        st.image(img_non_acc, caption="비동반 부모님 여권", width=300)
+        if st.button("🔍 비동반 부모 성명 추출", key="btn_non_acc"):
+            with st.spinner("성명 추출 중..."):
+                extracted = extract_passport_details(img_non_acc)
+                if extracted:
+                    st.session_state.consent_non_acc = extracted
+                    st.success("비동반 부모 성명 추출 완료!")
 
-    st.subheader("4. 최종 PDF 생성")
-    if st.button("문서 생성 및 다운로드", type="primary"):
-        if template_file is None:
-            st.error("먼저 1번 단계에서 템플릿 PDF를 업로드해주세요!")
-        elif not email:
-            st.warning("이메일을 입력해주세요.")
+    non_acc_data = st.session_state.consent_non_acc
+    default_non_acc_name = f"{non_acc_data.get('surname', '')} {non_acc_data.get('given_name', '')}".strip()
+    
+    non_acc_name = st.text_input("비동반 부모 성명 (I, ...)", value=default_non_acc_name)
+    non_acc_address = st.text_input("비동반 부모 주소 (Address)", value="")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        non_acc_phone = st.text_input("비동반 부모 전화번호", value="")
+    with col_b:
+        non_acc_email = st.text_input("비동반 부모 이메일", value="")
+
+    st.markdown("---")
+    st.subheader("2. 동반 부모 및 자녀 여권 업로드")
+    family_files = st.file_uploader("동반 부모님 및 자녀들의 여권 파일 복수 선택", type=['jpg', 'jpeg', 'png', 'pdf'], accept_multiple_files=True, key="family_files")
+
+    if family_files:
+        if st.button("🚀 여권 한꺼번에 AI 분석 및 자녀 자동 분류", key="btn_family"):
+            st.session_state.consent_family = []
+            with st.spinner("여권 분석 중..."):
+                for f in family_files:
+                    f_img = process_uploaded_file_to_image(f)
+                    p_info = extract_passport_details(f_img)
+                    if p_info:
+                        st.session_state.consent_family.append(p_info)
+            st.success("분석 완료!")
+
+    acc_parents = []
+    children_list = []
+
+    for person in st.session_state.consent_family:
+        dob = person.get("dob", "")
+        if is_minor(dob):
+            children_list.append(person)
         else:
-            final_data = {
-                "surname": surname,
-                "given_name": given,
-                "dob": dob,
-                "uci": uci,
-                "email": email,
-                "signDate": sign_date.strftime("%Y-%m-%d")
+            acc_parents.append(person)
+
+    st.write("#### 👨‍👦 자동 분류된 동반인 및 자녀 목록")
+    
+    acc_name, acc_passport, acc_rel = "", "", "Mother"
+    if acc_parents:
+        selected_parent_str = st.selectbox("동반 부모님 선택", [f"{p.get('surname')} {p.get('given_name')} ({p.get('passport_number')})" for p in acc_parents])
+        selected_idx = 0
+        for idx, p in enumerate(acc_parents):
+            if f"{p.get('surname')} {p.get('given_name')}" in selected_parent_str:
+                selected_idx = idx
+                break
+        
+        parent_info = acc_parents[selected_idx]
+        acc_name = f"{parent_info.get('surname')} {parent_info.get('given_name')}".strip()
+        acc_passport = parent_info.get("passport_number", "")
+        acc_rel = "Mother" if parent_info.get("gender") == "F" else "Father"
+    
+    col_p1, col_p2, col_p3 = st.columns(3)
+    with col_p1:
+        acc_name = st.text_input("동반 부모 성명", value=acc_name)
+    with col_p2:
+        acc_rel = st.selectbox("관계 (Relationship)", ["Mother", "Father"], index=0 if acc_rel == "Mother" else 1)
+    with col_p3:
+        acc_passport = st.text_input("여권번호", value=acc_passport)
+
+    st.write("##### 👶 자녀 목록 (3명 초과 시 추가 페이지 자동 생성)")
+    final_children = []
+    if children_list:
+        for idx, child in enumerate(children_list):
+            c_col1, c_col2 = st.columns(2)
+            c_full_name = f"{child.get('surname')} {child.get('given_name')}".strip()
+            with c_col1:
+                c_name = st.text_input(f"자녀 #{idx+1} 성명", value=c_full_name, key=f"cname_{idx}")
+            with c_col2:
+                c_dob = st.text_input(f"자녀 #{idx+1} 생년월일 (YYYY/MM/DD)", value=child.get("dob", "").replace("-", "/"), key=f"cdob_{idx}")
+            final_children.append({"name": c_name, "dob": c_dob})
+    else:
+        st.info("업로드된 자녀 여권이 없습니다. 아래에서 직접 입력 가능합니다.")
+        c1, c2 = st.columns(2)
+        with c1: c_name_manual = st.text_input("자녀 #1 성명", value="")
+        with c2: c_dob_manual = st.text_input("자녀 #1 생년월일", value="")
+        if c_name_manual:
+            final_children.append({"name": c_name_manual, "dob": c_dob_manual})
+
+    st.markdown("---")
+    st.subheader("3. 캐나다 현지 체류 정보 (Contact Information during Trip)")
+    st.info(f"💡 'To stay with'는 동반 부모님 이름({acc_name})으로 자동 기입되며, Travel Date는 빈칸으로 남겨집니다.")
+    
+    trip_address = st.text_input("캐나다 현지 주소 (At the following address)", value="")
+    col_t1, col_t2 = st.columns(2)
+    with col_t1:
+        trip_phone = st.text_input("현지 연락처 전화번호", value="")
+    with col_t2:
+        trip_email = st.text_input("현지 연락처 이메일", value="")
+
+    st.markdown("---")
+    st.subheader("4. 동의서 문서 생성")
+    sign_date_str = st.date_input("서명란 자동 기입 날짜", value=datetime.date.today()).strftime("%Y/%m/%d")
+
+    if st.button("✈️ 한부모 동의서 생성 및 다운로드", type="primary"):
+        if not consent_template_bytes:
+            st.error("양식 PDF 파일(consent_template.pdf)을 찾을 수 없습니다. 템플릿을 업로드하거나 GitHub 저장소에 추가해 주세요.")
+        elif not non_acc_name:
+            st.warning("비동반 부모님 성명을 입력해 주세요.")
+        else:
+            data_consent = {
+                "non_acc_name": non_acc_name,
+                "non_acc_address": non_acc_address,
+                "non_acc_phone": non_acc_phone,
+                "non_acc_email": non_acc_email,
+                "children": final_children,
+                "acc_name": acc_name,
+                "acc_relationship": acc_rel,
+                "acc_passport": acc_passport,
+                "trip_address": trip_address,
+                "trip_phone": trip_phone,
+                "trip_email": trip_email,
+                "sign_date": sign_date_str
             }
-            
             try:
-                filled_pdf = fill_imm5476(template_file.getvalue(), final_data)
-                st.download_button(
-                    label="📥 완성된 IMM5476 다운로드",
-                    data=filled_pdf,
-                    file_name=f"IMM5476_{surname}_{given}.pdf",
-                    mime="application/pdf"
-                )
+                filled_consent = fill_consent_letter(consent_template_bytes, data_consent)
+                st.download_button("📥 완성된 IMM5476 다운로드", filled_consent, file_name=f"Consent_Letter_{non_acc_name}.pdf", mime="application/pdf")
                 st.balloons()
             except Exception as e:
-                st.error(f"PDF 생성 중 오류가 발생했습니다: {e}")
+                st.error(f"동의서 생성 오류: {e}")
