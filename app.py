@@ -65,6 +65,23 @@ def process_uploaded_file_to_image(file_obj):
         img = img.resize(new_size)
     return img
 
+def format_full_name(surname, given_name, style="FIRST_LAST"):
+    """영문 성명 표기법 조합 함수"""
+    s = surname.strip()
+    g = given_name.strip()
+    if not s and not g:
+        return ""
+    if not s:
+        return g
+    if not g:
+        return s
+    
+    if style == "FIRST_LAST":
+        return f"{g} {s}"        # 예: Huja Ko
+    elif style == "LAST_COMMA_FIRST":
+        return f"{s}, {g}"       # 예: Ko, Huja
+    return f"{g} {s}"
+
 def extract_imm5476_info(image):
     prompt = """
     Analyze this document (passport/visa/permit) and extract the following information.
@@ -277,7 +294,6 @@ if app_mode == "🍁 IMM5476 자동 작성":
     if "extracted_5476" not in st.session_state:
         st.session_state.extracted_5476 = None
 
-    # IMM5476 템플릿 내장 여부 확인
     default_5476_path = "imm5476_template.pdf"
     template_5476_bytes = None
 
@@ -296,11 +312,9 @@ if app_mode == "🍁 IMM5476 자동 작성":
     client_file = st.file_uploader("여권/퍼밋 선택", type=['jpg', 'jpeg', 'png', 'pdf'], key="client_5476")
 
     if client_file is not None:
-        img = process_uploaded_file_to_image(client_file)
-        st.image(img, caption="업로드 문서 미리보기", use_container_width=True)
-
         if st.button("🚀 AI 정보 추출하기", key="btn_5476"):
             with st.spinner("AI가 분석 중입니다..."):
+                img = process_uploaded_file_to_image(client_file)
                 extracted = extract_imm5476_info(img)
                 if extracted:
                     st.session_state.extracted_5476 = extracted
@@ -345,7 +359,6 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
     if "consent_non_acc" not in st.session_state: st.session_state.consent_non_acc = {}
     if "consent_family" not in st.session_state: st.session_state.consent_family = []
 
-    # 동의서 템플릿 내장 여부 확인
     default_template_path = "consent_template.pdf"
     consent_template_bytes = None
 
@@ -360,21 +373,47 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
             consent_template_bytes = consent_template.getvalue()
 
     st.markdown("---")
-    st.subheader("1. 비동반 부모님 정보 (동의서 작성인)")
-    non_acc_file = st.file_uploader("비동반 부모님 여권 업로드", type=['jpg', 'jpeg', 'png', 'pdf'], key="non_acc")
+    st.subheader("1. 여권 파일 업로드 (한번에 처리)")
     
-    if non_acc_file is not None:
-        img_non_acc = process_uploaded_file_to_image(non_acc_file)
-        st.image(img_non_acc, caption="비동반 부모님 여권", width=300)
-        if st.button("🔍 비동반 부모 성명 추출", key="btn_non_acc"):
-            with st.spinner("성명 추출 중..."):
-                extracted = extract_passport_details(img_non_acc)
-                if extracted:
-                    st.session_state.consent_non_acc = extracted
-                    st.success("비동반 부모 성명 추출 완료!")
+    # 영문 이름 표기법 선택 옵션
+    name_style_choice = st.radio("영문 성명 표기 방식 선택", ["Huja Ko (이름 성)", "Ko, Huja (성, 이름)"], horizontal=True)
+    name_style = "FIRST_LAST" if "Huja Ko" in name_style_choice else "LAST_COMMA_FIRST"
 
+    col_up1, col_up2 = st.columns(2)
+    with col_up1:
+        non_acc_file = st.file_uploader("비동반 부모님 여권 (1장)", type=['jpg', 'jpeg', 'png', 'pdf'], key="non_acc")
+    with col_up2:
+        family_files = st.file_uploader("동반 부모 및 자녀 여권 (복수 선택)", type=['jpg', 'jpeg', 'png', 'pdf'], accept_multiple_files=True, key="family_files")
+
+    # 모든 여권 일괄 추출 버튼
+    if st.button("🚀 모든 여권 정보 한 번에 AI 추출하기", type="primary", use_container_width=True):
+        if not non_acc_file and not family_files:
+            st.warning("분석할 여권 파일을 1장 이상 올려주세요.")
+        else:
+            with st.spinner("AI가 업로드된 모든 여권을 한 번에 분석 중입니다..."):
+                # 1. 비동반 부모 여권 처리
+                if non_acc_file:
+                    img_non = process_uploaded_file_to_image(non_acc_file)
+                    st.session_state.consent_non_acc = extract_passport_details(img_non) or {}
+
+                # 2. 동반 가족 여권들 처리
+                if family_files:
+                    st.session_state.consent_family = []
+                    for f in family_files:
+                        img_fam = process_uploaded_file_to_image(f)
+                        p_info = extract_passport_details(img_fam)
+                        if p_info:
+                            st.session_state.consent_family.append(p_info)
+
+            st.success("🎉 모든 여권 정보가 성공적으로 추출되었습니다!")
+
+    # ------------------------------------------
+    # 정보 입력 폼
+    # ------------------------------------------
+    st.markdown("---")
+    st.subheader("2. 비동반 부모님 정보 (동의서 작성인)")
     non_acc_data = st.session_state.consent_non_acc
-    default_non_acc_name = f"{non_acc_data.get('surname', '')} {non_acc_data.get('given_name', '')}".strip()
+    default_non_acc_name = format_full_name(non_acc_data.get('surname', ''), non_acc_data.get('given_name', ''), name_style)
     
     non_acc_name = st.text_input("비동반 부모 성명 (I, ...)", value=default_non_acc_name)
     non_acc_address = st.text_input("비동반 부모 주소 (Address)", value="")
@@ -385,20 +424,8 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
         non_acc_email = st.text_input("비동반 부모 이메일", value="")
 
     st.markdown("---")
-    st.subheader("2. 동반 부모 및 자녀 여권 업로드")
-    family_files = st.file_uploader("동반 부모님 및 자녀들의 여권 파일 복수 선택", type=['jpg', 'jpeg', 'png', 'pdf'], accept_multiple_files=True, key="family_files")
-
-    if family_files:
-        if st.button("🚀 여권 한꺼번에 AI 분석 및 자녀 자동 분류", key="btn_family"):
-            st.session_state.consent_family = []
-            with st.spinner("여권 분석 중..."):
-                for f in family_files:
-                    f_img = process_uploaded_file_to_image(f)
-                    p_info = extract_passport_details(f_img)
-                    if p_info:
-                        st.session_state.consent_family.append(p_info)
-            st.success("분석 완료!")
-
+    st.subheader("3. 동반 부모 및 자녀 정보")
+    
     acc_parents = []
     children_list = []
 
@@ -409,19 +436,18 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
         else:
             acc_parents.append(person)
 
-    st.write("#### 👨‍👦 자동 분류된 동반인 및 자녀 목록")
-    
     acc_name, acc_passport, acc_rel = "", "", "Mother"
     if acc_parents:
-        selected_parent_str = st.selectbox("동반 부모님 선택", [f"{p.get('surname')} {p.get('given_name')} ({p.get('passport_number')})" for p in acc_parents])
+        selected_parent_str = st.selectbox("동반 부모님 선택", [f"{format_full_name(p.get('surname',''), p.get('given_name',''), name_style)} ({p.get('passport_number')})" for p in acc_parents])
         selected_idx = 0
         for idx, p in enumerate(acc_parents):
-            if f"{p.get('surname')} {p.get('given_name')}" in selected_parent_str:
+            formatted_p_name = format_full_name(p.get('surname',''), p.get('given_name',''), name_style)
+            if formatted_p_name in selected_parent_str:
                 selected_idx = idx
                 break
         
         parent_info = acc_parents[selected_idx]
-        acc_name = f"{parent_info.get('surname')} {parent_info.get('given_name')}".strip()
+        acc_name = format_full_name(parent_info.get('surname',''), parent_info.get('given_name',''), name_style)
         acc_passport = parent_info.get("passport_number", "")
         acc_rel = "Mother" if parent_info.get("gender") == "F" else "Father"
     
@@ -438,14 +464,14 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
     if children_list:
         for idx, child in enumerate(children_list):
             c_col1, c_col2 = st.columns(2)
-            c_full_name = f"{child.get('surname')} {child.get('given_name')}".strip()
+            c_full_name = format_full_name(child.get('surname',''), child.get('given_name',''), name_style)
             with c_col1:
                 c_name = st.text_input(f"자녀 #{idx+1} 성명", value=c_full_name, key=f"cname_{idx}")
             with c_col2:
                 c_dob = st.text_input(f"자녀 #{idx+1} 생년월일 (YYYY/MM/DD)", value=child.get("dob", "").replace("-", "/"), key=f"cdob_{idx}")
             final_children.append({"name": c_name, "dob": c_dob})
     else:
-        st.info("업로드된 자녀 여권이 없습니다. 아래에서 직접 입력 가능합니다.")
+        st.info("업로드된 자녀 여권이 없습니다. 필요 시 아래에 직접 입력하세요.")
         c1, c2 = st.columns(2)
         with c1: c_name_manual = st.text_input("자녀 #1 성명", value="")
         with c2: c_dob_manual = st.text_input("자녀 #1 생년월일", value="")
@@ -453,7 +479,7 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
             final_children.append({"name": c_name_manual, "dob": c_dob_manual})
 
     st.markdown("---")
-    st.subheader("3. 캐나다 현지 체류 정보 (Contact Information during Trip)")
+    st.subheader("4. 캐나다 현지 체류 정보 (Contact Information during Trip)")
     st.info(f"💡 'To stay with'는 동반 부모님 이름({acc_name})으로 자동 기입되며, Travel Date는 빈칸으로 남겨집니다.")
     
     trip_address = st.text_input("캐나다 현지 주소 (At the following address)", value="")
@@ -464,12 +490,12 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
         trip_email = st.text_input("현지 연락처 이메일", value="")
 
     st.markdown("---")
-    st.subheader("4. 동의서 문서 생성")
+    st.subheader("5. 동의서 문서 생성")
     sign_date_str = st.date_input("서명란 자동 기입 날짜", value=datetime.date.today()).strftime("%Y/%m/%d")
 
     if st.button("✈️ 한부모 동의서 생성 및 다운로드", type="primary"):
         if not consent_template_bytes:
-            st.error("양식 PDF 파일(consent_template.pdf)을 찾을 수 없습니다. 템플릿을 업로드하거나 GitHub 저장소에 추가해 주세요.")
+            st.error("양식 PDF 파일(consent_template.pdf)을 찾을 수 없습니다. GitHub 저장소에 consent_template.pdf 파일이 있는지 확인해 주세요.")
         elif not non_acc_name:
             st.warning("비동반 부모님 성명을 입력해 주세요.")
         else:
@@ -489,7 +515,7 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
             }
             try:
                 filled_consent = fill_consent_letter(consent_template_bytes, data_consent)
-                st.download_button("📥 완성된 IMM5476 다운로드", filled_consent, file_name=f"Consent_Letter_{non_acc_name}.pdf", mime="application/pdf")
+                st.download_button("📥 완성된 한부모 동의서 다운로드", filled_consent, file_name=f"Consent_Letter_{non_acc_name}.pdf", mime="application/pdf")
                 st.balloons()
             except Exception as e:
                 st.error(f"동의서 생성 오류: {e}")
