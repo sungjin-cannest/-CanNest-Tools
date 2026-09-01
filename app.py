@@ -65,8 +65,8 @@ def process_uploaded_file_to_image(file_obj):
         img = img.resize(new_size)
     return img
 
-def format_full_name(surname, given_name, style="FIRST_LAST"):
-    """영문 성명 표기법 조합 함수"""
+def format_full_name(surname, given_name):
+    """영문 성명 표기법 (기본값: 이름 성 / Huja Ko)"""
     s = surname.strip()
     g = given_name.strip()
     if not s and not g:
@@ -75,11 +75,6 @@ def format_full_name(surname, given_name, style="FIRST_LAST"):
         return g
     if not g:
         return s
-    
-    if style == "FIRST_LAST":
-        return f"{g} {s}"        # 예: Huja Ko
-    elif style == "LAST_COMMA_FIRST":
-        return f"{s}, {g}"       # 예: Ko, Huja
     return f"{g} {s}"
 
 def extract_imm5476_info(image):
@@ -373,11 +368,7 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
             consent_template_bytes = consent_template.getvalue()
 
     st.markdown("---")
-    st.subheader("1. 여권 파일 업로드 (한번에 처리)")
-    
-    # 영문 이름 표기법 선택 옵션
-    name_style_choice = st.radio("영문 성명 표기 방식 선택", ["Huja Ko (이름 성)", "Ko, Huja (성, 이름)"], horizontal=True)
-    name_style = "FIRST_LAST" if "Huja Ko" in name_style_choice else "LAST_COMMA_FIRST"
+    st.subheader("1. 여권 파일 업로드")
 
     col_up1, col_up2 = st.columns(2)
     with col_up1:
@@ -385,18 +376,15 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
     with col_up2:
         family_files = st.file_uploader("동반 부모 및 자녀 여권 (복수 선택)", type=['jpg', 'jpeg', 'png', 'pdf'], accept_multiple_files=True, key="family_files")
 
-    # 모든 여권 일괄 추출 버튼
     if st.button("🚀 모든 여권 정보 한 번에 AI 추출하기", type="primary", use_container_width=True):
         if not non_acc_file and not family_files:
             st.warning("분석할 여권 파일을 1장 이상 올려주세요.")
         else:
             with st.spinner("AI가 업로드된 모든 여권을 한 번에 분석 중입니다..."):
-                # 1. 비동반 부모 여권 처리
                 if non_acc_file:
                     img_non = process_uploaded_file_to_image(non_acc_file)
                     st.session_state.consent_non_acc = extract_passport_details(img_non) or {}
 
-                # 2. 동반 가족 여권들 처리
                 if family_files:
                     st.session_state.consent_family = []
                     for f in family_files:
@@ -407,13 +395,10 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
 
             st.success("🎉 모든 여권 정보가 성공적으로 추출되었습니다!")
 
-    # ------------------------------------------
-    # 정보 입력 폼
-    # ------------------------------------------
     st.markdown("---")
     st.subheader("2. 비동반 부모님 정보 (동의서 작성인)")
     non_acc_data = st.session_state.consent_non_acc
-    default_non_acc_name = format_full_name(non_acc_data.get('surname', ''), non_acc_data.get('given_name', ''), name_style)
+    default_non_acc_name = format_full_name(non_acc_data.get('surname', ''), non_acc_data.get('given_name', ''))
     
     non_acc_name = st.text_input("비동반 부모 성명 (I, ...)", value=default_non_acc_name)
     non_acc_address = st.text_input("비동반 부모 주소 (Address)", value="")
@@ -438,16 +423,16 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
 
     acc_name, acc_passport, acc_rel = "", "", "Mother"
     if acc_parents:
-        selected_parent_str = st.selectbox("동반 부모님 선택", [f"{format_full_name(p.get('surname',''), p.get('given_name',''), name_style)} ({p.get('passport_number')})" for p in acc_parents])
+        selected_parent_str = st.selectbox("동반 부모님 선택", [f"{format_full_name(p.get('surname',''), p.get('given_name',''))} ({p.get('passport_number')})" for p in acc_parents])
         selected_idx = 0
         for idx, p in enumerate(acc_parents):
-            formatted_p_name = format_full_name(p.get('surname',''), p.get('given_name',''), name_style)
+            formatted_p_name = format_full_name(p.get('surname',''), p.get('given_name',''))
             if formatted_p_name in selected_parent_str:
                 selected_idx = idx
                 break
         
         parent_info = acc_parents[selected_idx]
-        acc_name = format_full_name(parent_info.get('surname',''), parent_info.get('given_name',''), name_style)
+        acc_name = format_full_name(parent_info.get('surname',''), parent_info.get('given_name',''))
         acc_passport = parent_info.get("passport_number", "")
         acc_rel = "Mother" if parent_info.get("gender") == "F" else "Father"
     
@@ -464,7 +449,7 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
     if children_list:
         for idx, child in enumerate(children_list):
             c_col1, c_col2 = st.columns(2)
-            c_full_name = format_full_name(child.get('surname',''), child.get('given_name',''), name_style)
+            c_full_name = format_full_name(child.get('surname',''), child.get('given_name',''))
             with c_col1:
                 c_name = st.text_input(f"자녀 #{idx+1} 성명", value=c_full_name, key=f"cname_{idx}")
             with c_col2:
