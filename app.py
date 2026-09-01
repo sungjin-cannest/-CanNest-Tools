@@ -183,7 +183,7 @@ def is_minor(dob_str):
         return True
 
 def get_preloaded_file(file_names):
-    """여러 형태의 파일명을 체크하여 박제된 파일을 찾아냅니다."""
+    """여러 형태의 파일명을 체크하여 파일을 찾아냅니다."""
     for fn in file_names:
         if os.path.exists(fn):
             return fn
@@ -435,7 +435,7 @@ elif app_mode == "📋 이민서류 정보 정리 (Case File Prep)":
         "IMM5645 (가족정보)": "imm5645.pdf"
     }
     
-    selected_form = st.selectbox("📌 템플릿 서식 선택 (GitHub 박제본)", list(form_map.keys()))
+    selected_form = st.selectbox("📌 템플릿 서식 선택", list(form_map.keys()))
     
     tmpl_part = None
     
