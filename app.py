@@ -41,7 +41,7 @@ if not check_password():
     st.stop()
 
 # ==========================================
-# 1. API 키 단일 설정
+# 1. API 키 설정
 # ==========================================
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 genai.configure(api_key=GEMINI_API_KEY)
@@ -71,6 +71,21 @@ def process_uploaded_file_to_image(file_obj):
     img.save(buf, format="JPEG", quality=85)
     buf.seek(0)
     return Image.open(buf)
+
+def file_to_gemini_part(file_obj):
+    """Gemini API에 직접 전달 가능한 데이터 파트 생성"""
+    file_bytes = file_obj.getvalue()
+    mime_type = file_obj.type
+    if not mime_type:
+        if file_obj.name.lower().endswith('.pdf'):
+            mime_type = 'application/pdf'
+        elif file_obj.name.lower().endswith(('.jpg', '.jpeg')):
+            mime_type = 'image/jpeg'
+        elif file_obj.name.lower().endswith('.png'):
+            mime_type = 'image/png'
+        else:
+            mime_type = 'application/octet-stream'
+    return {"mime_type": mime_type, "data": file_bytes}
 
 def format_full_name(surname, given_name):
     """영문 성명 표기법 (이름 성 / Huja Ko)"""
@@ -145,6 +160,47 @@ def extract_all_passports_batch(has_non_acc, images):
             st.error("⚠️ AI 무료 사용 한도가 초과되었습니다. 1분 후 시도하시거나 Google AI Studio에 결제 카드를 등록해 주세요.")
         else:
             st.error(f"여권 일괄 추출 오류: {e}")
+        return None
+
+def extract_case_prep_info(tmpl_part, client_parts):
+    """서식 템플릿과 손님 제출 서류를 대조하여 항목별 정보 정리"""
+    prompt = """
+    You are helping immigration case-prep staff. 
+    The FIRST document attached is a BLANK reference immigration form (Canadian IRCC "IMM" series) — read it to find every field that requires client-specific data entry (skip legal/instructional boilerplate text, section headers with no blank, and anything already pre-filled).
+    The REMAINING attached documents are the client's own materials (intake questionnaire, passport, permit, etc.) — use them as your source of truth for values.
+
+    Return ONLY a raw JSON object (no markdown codeblock fences, no prose) in this exact shape:
+    {
+      "sections": [
+        {
+          "section": "short section name from the form (e.g. 'Personal Details', 'Family Information')",
+          "fields": [
+            { 
+              "field": "field label as it appears on the form", 
+              "value": "value found in client docs, or empty string if not found", 
+              "source": "which client doc this came from (e.g. 'Passport', 'Questionnaire p.2'), or empty string if not found" 
+            }
+          ]
+        }
+      ]
+    }
+
+    Rules:
+    - Only include fields that actually require client-specific data entry on the blank form.
+    - Keep values exact (dates YYYY-MM-DD, names uppercase/printed).
+    - If a field cannot be found in client materials, set "value": "" and "source": "". Do not skip it or guess.
+    - Maintain strict order of fields as they appear on the physical blank form.
+    """
+    contents = [prompt, tmpl_part] + client_parts
+    try:
+        response = model.generate_content(contents)
+        clean_text = response.text.strip().replace('```json', '').replace('```', '')
+        return json.loads(clean_text)
+    except Exception as e:
+        if "429" in str(e):
+            st.error("⚠️ AI 무료 사용 한도가 초과되었습니다. 1분 후 시도하시거나 Google AI Studio에 결제 카드를 등록해 주세요.")
+        else:
+            st.error(f"서류 정리 오류: {e}")
         return None
 
 def is_minor(dob_str):
@@ -306,7 +362,11 @@ def fill_consent_letter(template_bytes, data):
 st.set_page_config(page_title="CanNest 업무 자동화 툴", layout="centered")
 
 st.sidebar.title("🦅 CanNest Tool")
-app_mode = st.sidebar.radio("원하시는 업무 도구를 선택하세요", ["🍁 IMM5476 자동 작성", "✈️ 한부모 동의서 자동 작성"])
+app_mode = st.sidebar.radio("원하시는 업무 도구를 선택하세요", [
+    "🍁 IMM5476 자동 작성", 
+    "✈️ 한부모 동의서 자동 작성",
+    "📋 이민서류 정보 정리 (Case File Prep)"
+])
 
 # ------------------------------------------
 # 메뉴 1: IMM5476 자동 작성
@@ -337,7 +397,7 @@ if app_mode == "🍁 IMM5476 자동 작성":
 
     if client_file is not None:
         if st.button("🚀 AI 정보 추출하기", key="btn_5476"):
-            with st.spinner("서류를 분석 중입니다..잠시만 기다려 주세요."):
+            with st.spinner("AI가 고속으로 서류를 분석 중입니다..."):
                 img = process_uploaded_file_to_image(client_file)
                 extracted = extract_imm5476_info(img)
                 if extracted:
@@ -409,7 +469,7 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
         if not non_acc_file and not family_files:
             st.warning("분석할 여권 파일을 1장 이상 올려주세요.")
         else:
-            with st.spinner("⚡정보를 분석 중입니다..잠시만 기다려 주세요."):
+            with st.spinner("⚡ 모든 여권을 묶어서 단 1회의 API 호출로 고속 일괄 분석 중입니다..."):
                 images = []
                 has_non_acc = False
 
@@ -430,7 +490,7 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
                         st.session_state.consent_non_acc = {}
 
                     st.session_state.consent_family = result.get("family_members", []) or []
-                    st.success("🎉 모든 여권 정보 추출이 완료되었습니다!")
+                    st.success("🎉 모든 여권 정보 추출이 단 1회의 API 호출로 완벽히 완료되었습니다!")
 
     st.markdown("---")
     st.subheader("2. 비동반 부모님 정보 (동의서 작성인)")
@@ -541,3 +601,81 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
                 st.balloons()
             except Exception as e:
                 st.error(f"동의서 생성 오류: {e}")
+
+# ------------------------------------------
+# 메뉴 3: 이민서류 정보 정리 (Case File Prep)
+# ------------------------------------------
+elif app_mode == "📋 이민서류 정보 정리 (Case File Prep)":
+    st.title("📋 이민서류 정보 정리 도구")
+    st.write("빈 IMM 서식과 손님의 서류(질문지, 여권, 퍼밋 등)를 함께 올리면 서식에 필요한 항목을 AI가 깔끔하게 대조·정리해 드립니다.")
+
+    if "prep_result" not in st.session_state:
+        st.session_state.prep_result = None
+
+    st.subheader("1. 대상 서식 (빈 IMM PDF)")
+    tmpl_prep_file = st.file_uploader("빈 IMM 서식 선택 (예: IMM5645, IMM5257, IMM1294 등)", type=['pdf'], key="case_tmpl")
+
+    st.markdown("---")
+    st.subheader("2. 손님 제출 서류 (복수 선택 가능)")
+    client_prep_files = st.file_uploader("질문지, 여권, 퍼밋 등 서류 올리기", type=['jpg', 'jpeg', 'png', 'pdf'], accept_multiple_files=True, key="case_client_docs")
+
+    if st.button("🚀 서류 읽고 항목별 정보 정리하기", type="primary", use_container_width=True):
+        if not tmpl_prep_file:
+            st.warning("1번 단계에서 대상 서식 PDF를 올리세요.")
+        elif not client_prep_files:
+            st.warning("2번 단계에서 손님 서류를 1개 이상 올려주세요.")
+        else:
+            with st.spinner("AI가 서식 구조와 손님 서류를 비교 분석하여 정보를 정리 중입니다..."):
+                tmpl_part = file_to_gemini_part(tmpl_prep_file)
+                client_parts = [file_to_gemini_part(f) for f in client_prep_files]
+                
+                res = extract_case_prep_info(tmpl_part, client_parts)
+                if res:
+                    st.session_state.prep_result = res
+                    st.success("🎉 서류 정보 정리가 완료되었습니다!")
+
+    if st.session_state.prep_result:
+        st.markdown("---")
+        st.subheader("3. 정리된 정보 결과")
+
+        parsed = st.session_state.prep_result
+        sections = parsed.get("sections", [])
+
+        if not sections:
+            st.error("서식에서 분석할 항목을 찾지 못했습니다.")
+        else:
+            full_text_list = []
+            for sec in sections:
+                sec_name = sec.get("section", "기타 항목")
+                st.write(f"### 📌 {sec_name}")
+                full_text_list.append(f"[{sec_name}]")
+
+                table_data = []
+                for f in sec.get("fields", []):
+                    field_lbl = f.get("field", "")
+                    val = f.get("value", "")
+                    src = f.get("source", "")
+
+                    if not val:
+                        display_val = "⚠️ 확인 필요 (서류 미발견)"
+                        full_text_list.append(f"{field_lbl}: (확인 필요)")
+                    else:
+                        display_val = val
+                        full_text_list.append(f"{field_lbl}: {val}")
+
+                    table_data.append({
+                        "항목 (Field)": field_lbl,
+                        "추출값 (Value)": display_val,
+                        "출처 (Source)": src if src else "-"
+                    })
+
+                st.table(table_data)
+                full_text_list.append("")
+
+            # 복사 용이 텍스트 박스
+            st.markdown("#### 📋 한눈에 복사하기")
+            st.text_area("아래 텍스트를 복사하여 서식에 옮겨 적으세요", value="\n".join(full_text_list), height=250)
+            
+            if st.button("＋ 새 케이스 정리하기"):
+                st.session_state.prep_result = None
+                st.rerun()
