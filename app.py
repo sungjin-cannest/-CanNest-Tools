@@ -4,6 +4,7 @@ import fitz  # PyMuPDF
 import json
 import io
 import os
+import time
 from PIL import Image
 import datetime
 
@@ -66,7 +67,6 @@ def process_uploaded_file_to_image(file_obj):
     return img
 
 def format_full_name(surname, given_name):
-    """영문 성명 표기법 (기본값: 이름 성 / Huja Ko)"""
     s = surname.strip()
     g = given_name.strip()
     if not s and not g:
@@ -94,7 +94,10 @@ def extract_imm5476_info(image):
         clean_text = response.text.strip().replace('```json', '').replace('```', '')
         return json.loads(clean_text)
     except Exception as e:
-        st.error(f"정보 추출 오류: {e}")
+        if "429" in str(e):
+            st.error("⚠️ AI 사용 한도(Quota)가 초과되었습니다. 약 1분 후 다시 시도하시거나 Google AI Studio에서 결제 카드를 등록해 주세요.")
+        else:
+            st.error(f"정보 추출 오류: {e}")
         return None
 
 def extract_passport_details(image):
@@ -115,7 +118,10 @@ def extract_passport_details(image):
         clean_text = response.text.strip().replace('```json', '').replace('```', '')
         return json.loads(clean_text)
     except Exception as e:
-        st.error(f"여권 정보 추출 중 오류: {e}")
+        if "429" in str(e):
+            st.error("⚠️ AI 사용 한도(Quota)가 초과되었습니다. 1분 후 다시 시도하거나 Google AI Studio에 결제 수단을 등록해 주세요.")
+        else:
+            st.error(f"여권 정보 추출 중 오류: {e}")
         return None
 
 def is_minor(dob_str):
@@ -384,6 +390,7 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
                 if non_acc_file:
                     img_non = process_uploaded_file_to_image(non_acc_file)
                     st.session_state.consent_non_acc = extract_passport_details(img_non) or {}
+                    time.sleep(2)  # API 속도 제한 방지 대기
 
                 if family_files:
                     st.session_state.consent_family = []
@@ -392,8 +399,10 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
                         p_info = extract_passport_details(img_fam)
                         if p_info:
                             st.session_state.consent_family.append(p_info)
+                        time.sleep(2)  # 연속 요청 시 2초 대기
 
-            st.success("🎉 모든 여권 정보가 성공적으로 추출되었습니다!")
+            if st.session_state.consent_non_acc or st.session_state.consent_family:
+                st.success("🎉 모든 여권 정보가 성공적으로 추출되었습니다!")
 
     st.markdown("---")
     st.subheader("2. 비동반 부모님 정보 (동의서 작성인)")
