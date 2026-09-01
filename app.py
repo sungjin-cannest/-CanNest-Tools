@@ -330,7 +330,7 @@ if app_mode == "🍁 IMM5476 자동 작성":
 
     if client_file is not None:
         if st.button("🚀 AI 정보 추출하기", key="btn_5476"):
-            with st.spinner("AI가 고속으로 서류를 분석 중입니다..."):
+            with st.spinner("서류를 분석 중입니다. 조금만 기다려 주세요."):
                 img = process_uploaded_file_to_image(client_file)
                 extracted = extract_imm5476_info(img)
                 if extracted:
@@ -398,7 +398,7 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
     with col_up2:
         family_files = st.file_uploader("동반 부모 및 자녀 여권 (복수 선택)", type=['jpg', 'jpeg', 'png', 'pdf'], accept_multiple_files=True, key="family_files")
 
-    if st.button("🚀 모든 여권 정보 한 번에 AI 추출하기", type="primary", use_container_width=True):
+    if st.button("🚀 모든 여권 정보 추출하기", type="primary", use_container_width=True):
         if not non_acc_file and not family_files:
             st.warning("분석할 여권 파일을 1장 이상 올려주세요.")
         else:
@@ -433,7 +433,7 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
             progress_bar.empty()
 
             if st.session_state.consent_non_acc or st.session_state.consent_family:
-                st.success("🎉 모든 여권 정보 추출이 완벽하게 완료되었습니다!")
+                st.success("🎉 모든 여권 정보 추출이 완료되었습니다!")
 
     st.markdown("---")
     st.subheader("2. 비동반 부모님 정보 (동의서 작성인)")
