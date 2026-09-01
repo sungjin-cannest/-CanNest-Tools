@@ -4,7 +4,6 @@ import fitz  # PyMuPDF
 import json
 import io
 import os
-import time
 from PIL import Image
 import datetime
 
@@ -14,10 +13,9 @@ Image.MAX_IMAGE_PIXELS = None
 # ==========================================
 # 0. Secrets 안전 검사 및 보안 비밀번호 설정
 # ==========================================
-has_keys = "GEMINI_API_KEYS" in st.secrets or "GEMINI_API_KEY" in st.secrets
-if "APP_PASSWORD" not in st.secrets or not has_keys:
+if "APP_PASSWORD" not in st.secrets or "GEMINI_API_KEY" not in st.secrets:
     st.error("⚠️ Streamlit Cloud의 Secrets 설정이 필요합니다.")
-    st.info("우측 하단 [Manage app] -> [Settings] -> [Secrets]에 GEMINI_API_KEYS와 APP_PASSWORD를 입력해 주세요.")
+    st.info("우측 하단 [Manage app] -> [Settings] -> [Secrets]에 GEMINI_API_KEY와 APP_PASSWORD를 입력해 주세요.")
     st.stop()
 
 def check_password():
@@ -43,43 +41,17 @@ if not check_password():
     st.stop()
 
 # ==========================================
-# 1. API 키 다중 로테이션(Fallback) 호출 함수
+# 1. API 키 단일 설정
 # ==========================================
-def generate_content_with_fallback(prompt, image):
-    """429 한도 초과 발생 시 다음 API 키로 자동 전환하여 호출"""
-    keys = []
-    if "GEMINI_API_KEYS" in st.secrets:
-        keys = list(st.secrets["GEMINI_API_KEYS"])
-    elif "GEMINI_API_KEY" in st.secrets:
-        keys = [st.secrets["GEMINI_API_KEY"]]
-        if "GEMINI_API_KEY_2" in st.secrets:
-            keys.append(st.secrets["GEMINI_API_KEY_2"])
-
-    if not keys:
-        raise Exception("설정된 Gemini API 키가 없습니다.")
-
-    last_exception = None
-    for idx, key in enumerate(keys):
-        try:
-            genai.configure(api_key=key)
-            model = genai.GenerativeModel('gemini-3.6-flash')
-            response = model.generate_content([prompt, image])
-            return response.text
-        except Exception as e:
-            last_exception = e
-            # 429 한도 초과 오류이고 다음 사용 가능한 키가 있는 경우
-            if "429" in str(e) and idx < len(keys) - 1:
-                st.toast(f"🔄 API 키 #{idx+1} 한도 초과. API 키 #{idx+2}로 자동 전환 중...", icon="⚠️")
-                time.sleep(1)
-                continue
-            else:
-                raise e
-    raise last_exception
+GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-3.6-flash')
 
 # ==========================================
 # 2. 공통 및 AI 데이터 추출 함수
 # ==========================================
 def process_uploaded_file_to_image(file_obj):
+    """선명도 유지 및 경량화로 API 전송 및 처리 속도 극대화"""
     if file_obj.type == "application/pdf":
         doc = fitz.open(stream=file_obj.read(), filetype="pdf")
         page = doc.load_page(0)
@@ -101,6 +73,7 @@ def process_uploaded_file_to_image(file_obj):
     return Image.open(buf)
 
 def format_full_name(surname, given_name):
+    """영문 성명 표기법 (이름 성 / Huja Ko)"""
     s = surname.strip()
     g = given_name.strip()
     if not s and not g:
@@ -123,46 +96,55 @@ def extract_imm5476_info(image):
     Return ONLY raw valid JSON object without markdown or code formatting.
     """
     try:
-        raw_res = generate_content_with_fallback(prompt, image)
-        clean_text = raw_res.strip().replace('```json', '').replace('```', '')
+        response = model.generate_content([prompt, image])
+        clean_text = response.text.strip().replace('```json', '').replace('```', '')
         return json.loads(clean_text)
     except Exception as e:
         if "429" in str(e):
-            st.error("⚠️ 모든 API 키의 무료 한도가 초과되었습니다. 잠시 후 재시도하거나 Google AI Studio에 결제 수단을 등록해 주세요.")
+            st.error("⚠️ AI 무료 사용 한도가 초과되었습니다. 1분 후 시도하시거나 Google AI Studio에 결제 카드를 등록해 주세요.")
         else:
             st.error(f"정보 추출 오류: {e}")
         return None
 
-def extract_passport_details(image):
-    prompt = """
+def extract_all_passports_batch(has_non_acc, images):
+    """단 1회의 API 호출로 모든 여권을 묶어서 일괄 분석"""
+    prompt = f"""
     You are an expert OCR system specialized in international passports.
-    Analyze the passport image carefully. Focus heavily on the Machine Readable Zone (MRZ) at the bottom (e.g., P<KOR...).
+    I am providing {len(images)} passport image(s) in exact order.
 
-    Extract the following fields with 100% precision:
-    1. surname: Surname / Family name in English uppercase.
-    2. given_name: Given name(s) in English uppercase.
-    3. dob: Date of birth in YYYY-MM-DD format.
-    4. passport_number: Passport number in uppercase alphanumeric (e.g., M12345678).
-    5. gender: Sex of the person, strictly "F" or "M".
+    Order structure:
+    - {'Image 1 is the non-accompanying parent passport.' if has_non_acc else 'There is no non-accompanying parent passport provided.'}
+    - {'Remaining images (Image ' + ('2' if has_non_acc else '1') + f' to {len(images)}) are accompanying family members (parents or children).' if (len(images) > (1 if has_non_acc else 0)) else 'No family passports provided.'}
 
-    Return ONLY a valid raw JSON object without codeblock backticks or markdown:
-    {
-      "surname": "...",
-      "given_name": "...",
-      "dob": "YYYY-MM-DD",
-      "passport_number": "...",
-      "gender": "M"
-    }
+    For EACH passport image, carefully analyze the Machine Readable Zone (MRZ) at the bottom and extract:
+    - surname: Surname / Family name in English uppercase
+    - given_name: Given name(s) in English uppercase
+    - dob: Date of birth in YYYY-MM-DD format
+    - passport_number: Passport number in uppercase alphanumeric (e.g., M12345678)
+    - gender: Sex of the person, strictly "F" or "M"
+
+    Return ONLY a raw valid JSON object without markdown tags or codeblock backticks:
+    {{
+      "non_accompanying_parent": {{
+        "surname": "...", "given_name": "...", "dob": "YYYY-MM-DD", "passport_number": "...", "gender": "M"
+      }} or null,
+      "family_members": [
+        {{
+          "surname": "...", "given_name": "...", "dob": "YYYY-MM-DD", "passport_number": "...", "gender": "F"
+        }}
+      ]
+    }}
     """
+    contents = [prompt] + images
     try:
-        raw_res = generate_content_with_fallback(prompt, image)
-        clean_text = raw_res.strip().replace('```json', '').replace('```', '')
+        response = model.generate_content(contents)
+        clean_text = response.text.strip().replace('```json', '').replace('```', '')
         return json.loads(clean_text)
     except Exception as e:
         if "429" in str(e):
-            st.error("⚠️ 모든 API 키의 무료 한도가 초과되었습니다. 잠시 후 재시도하거나 Google AI Studio에 결제 수단을 등록해 주세요.")
+            st.error("⚠️ AI 무료 사용 한도가 초과되었습니다. 1분 후 시도하시거나 Google AI Studio에 결제 카드를 등록해 주세요.")
         else:
-            st.error(f"여권 정보 추출 중 오류: {e}")
+            st.error(f"여권 일괄 추출 오류: {e}")
         return None
 
 def is_minor(dob_str):
@@ -355,7 +337,7 @@ if app_mode == "🍁 IMM5476 자동 작성":
 
     if client_file is not None:
         if st.button("🚀 AI 정보 추출하기", key="btn_5476"):
-            with st.spinner("AI가 고속으로 서류를 분석 중입니다..."):
+            with st.spinner("서류를 분석 중입니다..잠시만 기다려 주세요."):
                 img = process_uploaded_file_to_image(client_file)
                 extracted = extract_imm5476_info(img)
                 if extracted:
@@ -427,38 +409,28 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
         if not non_acc_file and not family_files:
             st.warning("분석할 여권 파일을 1장 이상 올려주세요.")
         else:
-            total_files = (1 if non_acc_file else 0) + len(family_files)
-            processed_count = 0
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+            with st.spinner("⚡정보를 분석 중입니다..잠시만 기다려 주세요."):
+                images = []
+                has_non_acc = False
 
-            # 1. 비동반 부모 여권 처리
-            if non_acc_file:
-                processed_count += 1
-                status_text.text(f"⏳ ({processed_count}/{total_files}) 비동반 부모님 여권 분석 중...")
-                img_non = process_uploaded_file_to_image(non_acc_file)
-                st.session_state.consent_non_acc = extract_passport_details(img_non) or {}
-                progress_bar.progress(processed_count / total_files)
-                time.sleep(0.5)
+                if non_acc_file:
+                    has_non_acc = True
+                    images.append(process_uploaded_file_to_image(non_acc_file))
 
-            # 2. 동반 가족 여권들 처리
-            if family_files:
-                st.session_state.consent_family = []
-                for idx, f in enumerate(family_files):
-                    processed_count += 1
-                    status_text.text(f"⏳ ({processed_count}/{total_files}) 동반 가족 여권 #{idx+1} 분석 중...")
-                    img_fam = process_uploaded_file_to_image(f)
-                    p_info = extract_passport_details(img_fam)
-                    if p_info:
-                        st.session_state.consent_family.append(p_info)
-                    progress_bar.progress(processed_count / total_files)
-                    time.sleep(0.5)
+                if family_files:
+                    for f in family_files:
+                        images.append(process_uploaded_file_to_image(f))
 
-            status_text.empty()
-            progress_bar.empty()
+                result = extract_all_passports_batch(has_non_acc, images)
 
-            if st.session_state.consent_non_acc or st.session_state.consent_family:
-                st.success("🎉 모든 여권 정보 추출이 완벽하게 완료되었습니다!")
+                if result:
+                    if has_non_acc and result.get("non_accompanying_parent"):
+                        st.session_state.consent_non_acc = result["non_accompanying_parent"]
+                    else:
+                        st.session_state.consent_non_acc = {}
+
+                    st.session_state.consent_family = result.get("family_members", []) or []
+                    st.success("🎉 모든 여권 정보 추출이 완료되었습니다!")
 
     st.markdown("---")
     st.subheader("2. 비동반 부모님 정보 (동의서 작성인)")
