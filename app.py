@@ -14,9 +14,10 @@ Image.MAX_IMAGE_PIXELS = None
 # ==========================================
 # 0. Secrets 안전 검사 및 보안 비밀번호 설정
 # ==========================================
-if "APP_PASSWORD" not in st.secrets or "GEMINI_API_KEY" not in st.secrets:
+has_keys = "GEMINI_API_KEYS" in st.secrets or "GEMINI_API_KEY" in st.secrets
+if "APP_PASSWORD" not in st.secrets or not has_keys:
     st.error("⚠️ Streamlit Cloud의 Secrets 설정이 필요합니다.")
-    st.info("우측 하단 [Manage app] -> [Settings] -> [Secrets]에 GEMINI_API_KEY와 APP_PASSWORD를 입력해 주세요.")
+    st.info("우측 하단 [Manage app] -> [Settings] -> [Secrets]에 GEMINI_API_KEYS와 APP_PASSWORD를 입력해 주세요.")
     st.stop()
 
 def check_password():
@@ -42,17 +43,43 @@ if not check_password():
     st.stop()
 
 # ==========================================
-# 1. API 키 및 모델 설정
+# 1. API 키 다중 로테이션(Fallback) 호출 함수
 # ==========================================
-GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-3.6-flash')
+def generate_content_with_fallback(prompt, image):
+    """429 한도 초과 발생 시 다음 API 키로 자동 전환하여 호출"""
+    keys = []
+    if "GEMINI_API_KEYS" in st.secrets:
+        keys = list(st.secrets["GEMINI_API_KEYS"])
+    elif "GEMINI_API_KEY" in st.secrets:
+        keys = [st.secrets["GEMINI_API_KEY"]]
+        if "GEMINI_API_KEY_2" in st.secrets:
+            keys.append(st.secrets["GEMINI_API_KEY_2"])
+
+    if not keys:
+        raise Exception("설정된 Gemini API 키가 없습니다.")
+
+    last_exception = None
+    for idx, key in enumerate(keys):
+        try:
+            genai.configure(api_key=key)
+            model = genai.GenerativeModel('gemini-3.6-flash')
+            response = model.generate_content([prompt, image])
+            return response.text
+        except Exception as e:
+            last_exception = e
+            # 429 한도 초과 오류이고 다음 사용 가능한 키가 있는 경우
+            if "429" in str(e) and idx < len(keys) - 1:
+                st.toast(f"🔄 API 키 #{idx+1} 한도 초과. API 키 #{idx+2}로 자동 전환 중...", icon="⚠️")
+                time.sleep(1)
+                continue
+            else:
+                raise e
+    raise last_exception
 
 # ==========================================
-# 2. 공통 및 AI 데이터 추출 함수 (고속/고화질 최적화)
+# 2. 공통 및 AI 데이터 추출 함수
 # ==========================================
 def process_uploaded_file_to_image(file_obj):
-    """선명한 해상도 유지 + 경량화로 AI 전송 및 처리 속도 3배 향상"""
     if file_obj.type == "application/pdf":
         doc = fitz.open(stream=file_obj.read(), filetype="pdf")
         page = doc.load_page(0)
@@ -74,7 +101,6 @@ def process_uploaded_file_to_image(file_obj):
     return Image.open(buf)
 
 def format_full_name(surname, given_name):
-    """영문 성명 표기법 (이름 성 / Huja Ko)"""
     s = surname.strip()
     g = given_name.strip()
     if not s and not g:
@@ -97,18 +123,17 @@ def extract_imm5476_info(image):
     Return ONLY raw valid JSON object without markdown or code formatting.
     """
     try:
-        response = model.generate_content([prompt, image])
-        clean_text = response.text.strip().replace('```json', '').replace('```', '')
+        raw_res = generate_content_with_fallback(prompt, image)
+        clean_text = raw_res.strip().replace('```json', '').replace('```', '')
         return json.loads(clean_text)
     except Exception as e:
         if "429" in str(e):
-            st.error("⚠️ AI 사용 한도(Quota)가 초과되었습니다. 1분 후 시도하시거나 Google AI Studio에 결제 수단을 등록해 주세요.")
+            st.error("⚠️ 모든 API 키의 무료 한도가 초과되었습니다. 잠시 후 재시도하거나 Google AI Studio에 결제 수단을 등록해 주세요.")
         else:
             st.error(f"정보 추출 오류: {e}")
         return None
 
 def extract_passport_details(image):
-    """여권 MRZ 기계판독구역 집중 분석 프롬프트"""
     prompt = """
     You are an expert OCR system specialized in international passports.
     Analyze the passport image carefully. Focus heavily on the Machine Readable Zone (MRZ) at the bottom (e.g., P<KOR...).
@@ -130,12 +155,12 @@ def extract_passport_details(image):
     }
     """
     try:
-        response = model.generate_content([prompt, image])
-        clean_text = response.text.strip().replace('```json', '').replace('```', '')
+        raw_res = generate_content_with_fallback(prompt, image)
+        clean_text = raw_res.strip().replace('```json', '').replace('```', '')
         return json.loads(clean_text)
     except Exception as e:
         if "429" in str(e):
-            st.error("⚠️ AI 사용 한도(Quota)가 초과되었습니다. 1분 후 시도하시거나 Google AI Studio에 결제 수단을 등록해 주세요.")
+            st.error("⚠️ 모든 API 키의 무료 한도가 초과되었습니다. 잠시 후 재시도하거나 Google AI Studio에 결제 수단을 등록해 주세요.")
         else:
             st.error(f"여권 정보 추출 중 오류: {e}")
         return None
@@ -330,7 +355,7 @@ if app_mode == "🍁 IMM5476 자동 작성":
 
     if client_file is not None:
         if st.button("🚀 AI 정보 추출하기", key="btn_5476"):
-            with st.spinner("서류를 분석 중입니다. 조금만 기다려 주세요."):
+            with st.spinner("AI가 고속으로 서류를 분석 중입니다..."):
                 img = process_uploaded_file_to_image(client_file)
                 extracted = extract_imm5476_info(img)
                 if extracted:
@@ -398,7 +423,7 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
     with col_up2:
         family_files = st.file_uploader("동반 부모 및 자녀 여권 (복수 선택)", type=['jpg', 'jpeg', 'png', 'pdf'], accept_multiple_files=True, key="family_files")
 
-    if st.button("🚀 모든 여권 정보 추출하기", type="primary", use_container_width=True):
+    if st.button("🚀 모든 여권 정보 한 번에 AI 추출하기", type="primary", use_container_width=True):
         if not non_acc_file and not family_files:
             st.warning("분석할 여권 파일을 1장 이상 올려주세요.")
         else:
@@ -414,7 +439,7 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
                 img_non = process_uploaded_file_to_image(non_acc_file)
                 st.session_state.consent_non_acc = extract_passport_details(img_non) or {}
                 progress_bar.progress(processed_count / total_files)
-                time.sleep(1)
+                time.sleep(0.5)
 
             # 2. 동반 가족 여권들 처리
             if family_files:
@@ -427,13 +452,13 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
                     if p_info:
                         st.session_state.consent_family.append(p_info)
                     progress_bar.progress(processed_count / total_files)
-                    time.sleep(1)
+                    time.sleep(0.5)
 
             status_text.empty()
             progress_bar.empty()
 
             if st.session_state.consent_non_acc or st.session_state.consent_family:
-                st.success("🎉 모든 여권 정보 추출이 완료되었습니다!")
+                st.success("🎉 모든 여권 정보 추출이 완벽하게 완료되었습니다!")
 
     st.markdown("---")
     st.subheader("2. 비동반 부모님 정보 (동의서 작성인)")
