@@ -64,7 +64,7 @@ def safe_generate_content(contents):
     raise last_error
 
 # ==========================================
-# 2. 캐싱 및 파일 최적화 함수
+# 2. 캐싱 및 이미지 선명도 최적화 함수
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_pdf_bytes_cached(file_path):
@@ -82,23 +82,24 @@ def get_preloaded_file_bytes(file_names):
     return None
 
 def process_uploaded_file_to_image(file_obj):
+    """여권 및 퍼밋 단일 이미지 선명도 상향 (DPI 2.5, 화질 90%)"""
     if file_obj.type == "application/pdf":
         doc = fitz.open(stream=file_obj.read(), filetype="pdf")
         page = doc.load_page(0)
-        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+        pix = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5))
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     else:
         img = Image.open(file_obj)
         if img.mode != "RGB":
             img = img.convert("RGB")
     
-    if img.width > 1400:
-        ratio = 1400 / img.width
-        new_size = (1400, int(img.height * ratio))
+    if img.width > 1600:
+        ratio = 1600 / img.width
+        new_size = (1600, int(img.height * ratio))
         img = img.resize(new_size, Image.Resampling.LANCZOS)
     
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
+    img.save(buf, format="JPEG", quality=90)
     buf.seek(0)
     return Image.open(buf)
 
@@ -111,7 +112,7 @@ def format_full_name(surname, given_name):
     return f"{g} {s}"
 
 def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
-    """쿼터 절감 및 스캔본 경량화 파싱"""
+    """숫자 오인식을 방지하기 위해 스캔본 해상도(Matrix 1.8) 및 화질(Quality 80) 상향"""
     if "pdf" in mime_type.lower():
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -119,16 +120,18 @@ def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
             for page in doc:
                 text += page.get_text("text") + "\n"
             
+            # 텍스트 추출 성공 시: 최대 2만 자 제한
             if len(text.strip()) > 100:
                 return [f"\n--- [Document: {file_name}] ---\n{text[:20000]}\n"]
             else:
+                # 스캔본 PDF: 숫자 인식 정확도를 위해 선명도 80%로 개선
                 images = []
                 for page_num in range(min(len(doc), 10)):
                     page = doc.load_page(page_num)
-                    pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2))
+                    pix = page.get_pixmap(matrix=fitz.Matrix(1.8, 1.8))
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                     buf = io.BytesIO()
-                    img.save(buf, format="JPEG", quality=60)
+                    img.save(buf, format="JPEG", quality=80)
                     buf.seek(0)
                     images.append({"mime_type": "image/jpeg", "data": buf.getvalue()})
                 return images
@@ -484,7 +487,7 @@ elif app_mode == "📋 이민서류 정보 정리 (Case File Prep)":
         "IMM5710 (WP-INSIDE)": "imm5710.pdf"
     }
     
-    selected_form = st.selectbox("📌 템플릿 서식 선택 (GitHub 박제본)", list(form_map.keys()))
+    selected_form = st.selectbox("📌 템플릿 서식 선택", list(form_map.keys()))
     
     tmpl_bytes = None
     
