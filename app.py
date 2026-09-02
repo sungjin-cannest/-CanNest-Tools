@@ -64,7 +64,7 @@ def safe_generate_content(contents):
     raise last_error
 
 # ==========================================
-# 2. 캐싱 및 최적화 함수
+# 2. 캐싱 및 화질 70% 최적화 함수
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_pdf_bytes_cached(file_path):
@@ -265,7 +265,7 @@ def is_minor(dob_str):
         return True
 
 # ==========================================
-# 3. PDF 서식 채우기 로직
+# 3. PDF 서식 채우기 로직 (수정가능 및 폰트 축소 적용)
 # ==========================================
 def fill_imm5476(template_bytes, data):
     doc = fitz.open(stream=template_bytes, filetype="pdf")
@@ -279,6 +279,10 @@ def fill_imm5476(template_bytes, data):
     
     for page in doc:
         for widget in page.widgets():
+            widget.text_fontsize = 0  # 글자 자동 축소 (박스 크기에 맞춤)
+            if hasattr(widget, "field_flags") and widget.field_flags:
+                widget.field_flags &= ~1  # Read-Only 해제 (다운로드 후 수정 가능)
+                
             field_name = widget.field_name
             if not field_name: continue
             fname_lower = field_name.lower()
@@ -313,6 +317,10 @@ def fill_consent_letter(template_bytes, data):
         child_widgets = [("Information about travelling children", "yyyymmdd"), ("1_2", "2_2"), ("1_3", "2_3")]
         
         for widget in page.widgets():
+            widget.text_fontsize = 0  # 긴 이메일/주소 입력 시 글자 자동 축소
+            if hasattr(widget, "field_flags") and widget.field_flags:
+                widget.field_flags &= ~1  # Read-Only 해제 (다운로드 후 언제든 수정 가능)
+            
             fname = widget.field_name.strip() if widget.field_name else ""
             if not fname: continue
             if fname == "1": widget.field_value = data.get("non_acc_name", ""); widget.update()
@@ -504,7 +512,7 @@ elif app_mode == "📋 이민서류 정보 정리 (Case File Prep)":
         "IMM5710 (WP-INSIDE)": "imm5710.pdf"
     }
     
-    selected_form = st.selectbox("📌 템플릿 서식 선택", list(form_map.keys()))
+    selected_form = st.selectbox("📌 템플릿 서식 선택 (GitHub 박제본)", list(form_map.keys()))
     
     tmpl_bytes = None
     
