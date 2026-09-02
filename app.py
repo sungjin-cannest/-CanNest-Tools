@@ -20,7 +20,7 @@ if "GEMINI_API_KEY" not in st.secrets:
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
 # ==========================================
-# 1. CRM 서류 판별 로직 (AI)
+# 1. CRM 서류 판별 로직 (AI 모델 자동 탐색 적용)
 # ==========================================
 def analyze_document_with_crm_rules(file_bytes, mime_type, original_filename):
     prompt = """
@@ -96,9 +96,34 @@ def analyze_document_with_crm_rules(file_bytes, mime_type, original_filename):
     else:
         img_data = {"mime_type": mime_type, "data": file_bytes}
 
+    # 404 에러 방지를 위한 5중 모델 안전망
+    candidate_models = [
+        'gemini-1.5-flash-latest', 
+        'gemini-1.5-flash', 
+        'gemini-1.5-pro-latest', 
+        'gemini-1.5-pro',
+        'gemini-pro-vision'
+    ]
+    
+    response = None
+    last_error = None
+    
+    for model_name in candidate_models:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content([prompt, img_data])
+            break # 성공하면 즉시 루프 탈출
+        except Exception as e:
+            last_error = e
+            if "404" in str(e).lower() or "not found" in str(e).lower():
+                continue # 404 에러면 다음 모델로 넘어감
+            else:
+                break # 다른 치명적 에러면 루프 중단
+
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        response = model.generate_content([prompt, img_data])
+        if response is None:
+            raise Exception(f"사용 가능한 모델이 없습니다. 마지막 에러: {last_error}")
+            
         clean_text = response.text.strip().replace('```json', '').replace('```', '')
         data = json.loads(clean_text)
         
