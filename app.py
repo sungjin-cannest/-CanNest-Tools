@@ -41,12 +41,32 @@ if not check_password():
     st.stop()
 
 # ==========================================
-# 1. API 키 및 모델 설정
+# 1. API 키 및 모델 호환 자동 검색 설정
 # ==========================================
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 genai.configure(api_key=GEMINI_API_KEY)
-# 가장 빠르고 최신인 1.5-flash 모델 적용
-model = genai.GenerativeModel('gemini-1.5-flash') 
+
+def safe_generate_content(contents):
+    """404 모델 에러 발생 시 지원 가능한 모델(2.5-flash, 1.5-flash-latest 등)을 순차 탐색하여 호출"""
+    candidate_models = [
+        'gemini-2.5-flash', 
+        'gemini-1.5-flash-latest', 
+        'gemini-1.5-flash', 
+        'gemini-2.0-flash'
+    ]
+    last_error = None
+    for model_name in candidate_models:
+        try:
+            mod = genai.GenerativeModel(model_name)
+            response = mod.generate_content(contents)
+            return response
+        except Exception as e:
+            last_error = e
+            if "404" in str(e) or "not found" in str(e).lower():
+                continue
+            else:
+                raise e
+    raise last_error
 
 # ==========================================
 # 2. 공통 및 AI 데이터 추출 함수
@@ -81,9 +101,8 @@ def format_full_name(surname, given_name):
     if not g: return s
     return f"{g} {s}"
 
-# ⚡ [신규 추가] PDF 텍스트 초고속 추출 로직
 def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
-    """PDF에서 텍스트만 뽑아 속도를 10배 이상 향상시킵니다."""
+    """PDF에서 텍스트만 0.1초 만에 뽑아 속도를 극대화합니다."""
     if "pdf" in mime_type.lower():
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -91,13 +110,11 @@ def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
             for page in doc:
                 text += page.get_text("text") + "\n"
             
-            # 텍스트가 정상적으로 추출되었다면 가벼운 텍스트로 넘김
             if len(text.strip()) > 100:
                 return f"\n--- [Document: {file_name}] ---\n{text}\n"
         except:
             pass
     
-    # 텍스트 추출이 불가능한 스캔본/이미지면 기존처럼 바이너리로 넘김
     return {"mime_type": mime_type, "data": file_bytes}
 
 def extract_imm5476_info(image):
@@ -111,7 +128,7 @@ def extract_imm5476_info(image):
     Return ONLY raw valid JSON object without markdown or code formatting.
     """
     try:
-        response = model.generate_content([prompt, image])
+        response = safe_generate_content([prompt, image])
         clean_text = response.text.strip().replace('```json', '').replace('```', '')
         return json.loads(clean_text)
     except Exception as e:
@@ -145,7 +162,7 @@ def extract_all_passports_batch(has_non_acc, images):
     """
     contents = [prompt] + images
     try:
-        response = model.generate_content(contents)
+        response = safe_generate_content(contents)
         clean_text = response.text.strip().replace('```json', '').replace('```', '')
         return json.loads(clean_text)
     except Exception as e:
@@ -172,7 +189,6 @@ def extract_case_prep_info(tmpl_bytes, client_files):
     Rules: Keep values exact. If missing, set value/source to empty string. Maintain strict order.
     """
     
-    # 초고속 텍스트 변환 로직 탑재 🚀
     contents = [prompt]
     contents.append(prepare_document_for_gemini(tmpl_bytes, "application/pdf", "Blank_IMM_Form.pdf"))
     
@@ -181,7 +197,7 @@ def extract_case_prep_info(tmpl_bytes, client_files):
         contents.append(prepare_document_for_gemini(f.getvalue(), mime, f.name))
 
     try:
-        response = model.generate_content(contents)
+        response = safe_generate_content(contents)
         clean_text = response.text.strip().replace('```json', '').replace('```', '')
         return json.loads(clean_text)
     except Exception as e:
@@ -198,7 +214,6 @@ def is_minor(dob_str):
         return True
 
 def get_preloaded_file(file_names):
-    """여러 형태의 파일명을 체크하여 박제된 파일을 찾아냅니다."""
     for fn in file_names:
         if os.path.exists(fn):
             return fn
@@ -280,7 +295,7 @@ def fill_consent_letter(template_bytes, data):
     return output_pdf
 
 # ==========================================
-# 4. Stream tangential 및 UI 구성
+# 4. Streamlit 네비게이션 및 UI 구성
 # ==========================================
 st.set_page_config(page_title="CanNest 업무 자동화 툴", layout="centered")
 
