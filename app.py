@@ -7,7 +7,7 @@ import zipfile
 import json
 import os
 import datetime
-import time  # 👈 시간 지연을 위해 추가된 모듈
+import time
 
 # ==========================================
 # 0. 기본 설정
@@ -117,7 +117,7 @@ def analyze_document_with_crm_rules(file_bytes, mime_type, original_filename):
         return {"client_name": "고객명", "doc_category": "기타", "suggested_filename": f"{base_name}.pdf"}
 
 # ==========================================
-# 2. 파일 압축 변환 엔진 (PDF / JPG 분기)
+# 2. 파일 압축 변환 엔진 (에러 수정 완료)
 # ==========================================
 def process_and_compress_file(file_bytes, mime_type, target_filename):
     is_jpeg = target_filename.lower().endswith(('.jpg', '.jpeg'))
@@ -154,10 +154,9 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
                 img.save(img_buf, format="JPEG", quality=quality, optimize=True)
                 img_buf.seek(0)
                 
-                img_doc = fitz.open(stream=img_buf.getvalue(), filetype="jpeg")
+                # ✅ 수정된 부분: insert_image 명령어로 교체 완료
                 pdf_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
-                pdf_page.show_pdf_page(pdf_page.rect, img_doc, 0)
-                img_doc.close()
+                pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
                 
             new_doc.save(output_pdf, deflate=True, garbage=4)
             new_doc.close()
@@ -175,13 +174,16 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
             img.save(img_buf, format="JPEG", quality=quality, optimize=True)
             img_buf.seek(0)
             
-            img_doc = fitz.open(stream=img_buf.getvalue(), filetype="jpeg")
             new_doc = fitz.open()
-            page = new_doc.new_page(width=img.width * 72 / target_dpi, height=img.height * 72 / target_dpi)
-            page.show_pdf_page(page.rect, img_doc, 0)
+            page_width = img.width * 72 / target_dpi
+            page_height = img.height * 72 / target_dpi
+            pdf_page = new_doc.new_page(width=page_width, height=page_height)
+            
+            # ✅ 수정된 부분: insert_image 명령어로 교체 완료
+            pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
+            
             new_doc.save(output_pdf)
             new_doc.close()
-            img_doc.close()
             
         output_pdf.seek(0)
         return output_pdf.getvalue(), "application/pdf"
@@ -190,7 +192,7 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
 # 3. 화면 UI 구성
 # ==========================================
 st.title("🧪 [DEV] CRM 규격 서류 자동 판별 & 압축 시스템")
-st.caption("손님 서류 및 증명사진을 올려주시면 CRM 규칙 기반 파일명 생성 및 압축 변환을 진행합니다. (적용 모델: gemini-3.6-flash)")
+st.caption("손님 서류 및 증명사진을 올려주시면 CRM 규칙 기반 파일명 생성 및 압축 변환을 진행합니다.")
 
 st.info("🔒 **보안 안내**: 업로드된 모든 서류는 메모리에서만 처리되며, 작업 후 하단의 '파기' 버튼을 누르면 즉시 영구 삭제됩니다.")
 
@@ -227,7 +229,6 @@ if uploaded_files:
             })
             progress_bar.progress((idx + 1) / len(uploaded_files))
 
-            # 👈 핵심 수정 부분: 구글 무료 API 차단(429 에러) 방지를 위해 4초 대기
             if idx < len(uploaded_files) - 1:
                 time.sleep(4)
             
