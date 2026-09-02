@@ -30,8 +30,9 @@ def analyze_document_with_crm_rules(file_bytes, mime_type, original_filename):
 
     [CRITICAL NAMING RULES]
     1. Client Name:
-       - Korean client: Full Name in Korean with NO SPACES (e.g., 고주하, 홍길동, 김영미).
-       - Non-Korean client: STRICTLY the VERY FIRST WORD of their First Name in Title Case. (e.g., If the name is "Jose Tover Fernando", use "Jose". If "Maria Luisa", use "Maria").
+       - Korean client: Full Name in Korean with NO SPACES (e.g., 홍길동, 김영미).
+       - Non-Korean client: STRICTLY the VERY FIRST WORD of their First Name in Title Case. (e.g., If the name is "Jose", use "Jose").
+       - 🚨 CRITICAL RULE: If the document DOES NOT contain any text showing the client's name (for example, a plain Digital Photo), you MUST output the exact word "NAME". Do NOT guess or use example names.
     2. Dates:
        - Format MUST be YYYY.MM.DD (e.g., 2022.01.02).
        - Date ranges: Use a hyphen (e.g., 2022.04.22-2022.05.22).
@@ -39,10 +40,9 @@ def analyze_document_with_crm_rules(file_bytes, mime_type, original_filename):
     3. Delimiter: Always use underscore '_' between Name, Category, Details, and Dates.
     4. Unlisted Documents (CRITICAL): If the document does NOT match any category in the manual list below, look at the TOP of the document to find its exact title in English. 
        - Format for unlisted: {Name}_{ExactEnglishTitleAtTheTop}
-       - Example: If the document is a tax assessment, use "{Name}_Notice of Assessment".
 
     [MANUAL CATEGORY & FORMAT SPECIFICATIONS]
-    - Digital Photo / Passport Photo: {Name}_Digital Photo.jpg (MUST use .jpg extension)
+    - Digital Photo / Passport Photo: {Name}_Digital Photo.jpg (MUST use .jpg extension. If no name is visible, this will become NAME_Digital Photo.jpg)
     - Passport: {Name}_PP_{ExpiryDate YYYY.MM.DD}
     - Work Permit: {Name}_WP_{ExpiryDate YYYY.MM.DD}
     - Study Permit: {Name}_SP_{ExpiryDate YYYY.MM.DD}
@@ -74,7 +74,7 @@ def analyze_document_with_crm_rules(file_bytes, mime_type, original_filename):
 
     Return ONLY a raw JSON object with this format:
     {
-        "client_name": "Extracted formatted name (e.g., 고주하 or Jose)",
+        "client_name": "Extracted formatted name OR 'NAME'",
         "doc_category": "Category from manual OR exact English title",
         "suggested_filename": "Full_Generated_Filename_With_Correct_Extension"
     }
@@ -92,7 +92,7 @@ def analyze_document_with_crm_rules(file_bytes, mime_type, original_filename):
             img_data = {"mime_type": "image/jpeg", "data": buf.getvalue()}
             doc.close()
         except Exception as e:
-            return {"client_name": "고객명", "doc_category": "기타", "suggested_filename": f"미분류_{original_filename}"}
+            return {"client_name": "NAME", "doc_category": "기타", "suggested_filename": f"NAME_미분류_{original_filename}"}
     else:
         img_data = {"mime_type": mime_type, "data": file_bytes}
 
@@ -103,7 +103,7 @@ def analyze_document_with_crm_rules(file_bytes, mime_type, original_filename):
         clean_text = response.text.strip().replace('```json', '').replace('```', '')
         data = json.loads(clean_text)
         
-        filename = data.get("suggested_filename", "미분류_서류")
+        filename = data.get("suggested_filename", "NAME_미분류_서류.pdf")
         
         if not (filename.lower().endswith(".pdf") or filename.lower().endswith(".jpg") or filename.lower().endswith(".jpeg")):
             filename += ".pdf"
@@ -114,10 +114,10 @@ def analyze_document_with_crm_rules(file_bytes, mime_type, original_filename):
     except Exception as e:
         st.error(f"AI 분석 중 에러 발생 ({original_filename}): {e}")
         base_name = os.path.splitext(original_filename)[0]
-        return {"client_name": "고객명", "doc_category": "기타", "suggested_filename": f"{base_name}.pdf"}
+        return {"client_name": "NAME", "doc_category": "기타", "suggested_filename": f"NAME_{base_name}.pdf"}
 
 # ==========================================
-# 2. 파일 압축 변환 엔진 (에러 수정 완료)
+# 2. 파일 압축 변환 엔진
 # ==========================================
 def process_and_compress_file(file_bytes, mime_type, target_filename):
     is_jpeg = target_filename.lower().endswith(('.jpg', '.jpeg'))
@@ -154,7 +154,6 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
                 img.save(img_buf, format="JPEG", quality=quality, optimize=True)
                 img_buf.seek(0)
                 
-                # ✅ 수정된 부분: insert_image 명령어로 교체 완료
                 pdf_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
                 pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
                 
@@ -179,7 +178,6 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
             page_height = img.height * 72 / target_dpi
             pdf_page = new_doc.new_page(width=page_width, height=page_height)
             
-            # ✅ 수정된 부분: insert_image 명령어로 교체 완료
             pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
             
             new_doc.save(output_pdf)
