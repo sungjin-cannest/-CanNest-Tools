@@ -7,6 +7,7 @@ import zipfile
 import json
 import os
 import datetime
+import time  # 👈 시간 지연을 위해 추가된 모듈
 
 # ==========================================
 # 0. 기본 설정
@@ -71,7 +72,7 @@ def analyze_document_with_crm_rules(file_bytes, mime_type, original_filename):
     - Tuition Receipt: {Name}_Tuition Receipt_{SchoolName}
     - Confirmation of Enrollment: {Name}_Confirmation of Enrollment_{SchoolName}
 
-    Return ONLY a raw JSON object with this format (no markdown blocks, no formatting):
+    Return ONLY a raw JSON object with this format:
     {
         "client_name": "Extracted formatted name (e.g., 고주하 or Jose)",
         "doc_category": "Category from manual OR exact English title",
@@ -91,13 +92,11 @@ def analyze_document_with_crm_rules(file_bytes, mime_type, original_filename):
             img_data = {"mime_type": "image/jpeg", "data": buf.getvalue()}
             doc.close()
         except Exception as e:
-            st.error(f"PDF 이미지 변환 실패 ({original_filename}): {e}")
             return {"client_name": "고객명", "doc_category": "기타", "suggested_filename": f"미분류_{original_filename}"}
     else:
         img_data = {"mime_type": mime_type, "data": file_bytes}
 
     try:
-        # ✅ 에러 메시지 요청대로 gemini-3.6-flash 로 명확히 고정
         model = genai.GenerativeModel('gemini-3.6-flash')
         response = model.generate_content([prompt, img_data])
         
@@ -211,7 +210,7 @@ if uploaded_files:
         status_text = st.empty()
         
         for idx, file in enumerate(uploaded_files):
-            status_text.text(f"분석 중 ({idx+1}/{len(uploaded_files)}): {file.name}")
+            status_text.text(f"분석 중 ({idx+1}/{len(uploaded_files)}): {file.name} (API 속도 조절 중...)")
             file_bytes = file.getvalue()
             mime_type = file.type if file.type else "application/pdf"
             
@@ -227,6 +226,10 @@ if uploaded_files:
                 "client_name": analysis.get("client_name", "")
             })
             progress_bar.progress((idx + 1) / len(uploaded_files))
+
+            # 👈 핵심 수정 부분: 구글 무료 API 차단(429 에러) 방지를 위해 4초 대기
+            if idx < len(uploaded_files) - 1:
+                time.sleep(4)
             
         status_text.success("✅ 파일 분석 완료! 아래에서 생성된 파일명을 확인 및 수정해 주세요.")
         st.session_state.analysis_results = results
