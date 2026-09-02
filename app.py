@@ -41,19 +41,13 @@ if not check_password():
     st.stop()
 
 # ==========================================
-# 1. API 키 및 모델 호환 자동 검색 설정
+# 1. API 키 및 모델 설정
 # ==========================================
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 genai.configure(api_key=GEMINI_API_KEY)
 
 def safe_generate_content(contents):
-    """404 모델 에러 발생 시 지원 가능한 모델(2.5-flash, 1.5-flash-latest 등)을 순차 탐색하여 호출"""
-    candidate_models = [
-        'gemini-2.5-flash', 
-        'gemini-1.5-flash-latest', 
-        'gemini-1.5-flash', 
-        'gemini-2.0-flash'
-    ]
+    candidate_models = ['gemini-3.6-flash']
     last_error = None
     for model_name in candidate_models:
         try:
@@ -69,10 +63,9 @@ def safe_generate_content(contents):
     raise last_error
 
 # ==========================================
-# 2. 공통 및 AI 데이터 추출 함수
+# 2. 공통 및 데이터 추출 함수
 # ==========================================
 def process_uploaded_file_to_image(file_obj):
-    """여권 등 이미지 분석 시 선명도 유지 및 경량화"""
     if file_obj.type == "application/pdf":
         doc = fitz.open(stream=file_obj.read(), filetype="pdf")
         page = doc.load_page(0)
@@ -102,7 +95,6 @@ def format_full_name(surname, given_name):
     return f"{g} {s}"
 
 def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
-    """PDF에서 텍스트만 0.1초 만에 뽑아 속도를 극대화합니다."""
     if "pdf" in mime_type.lower():
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -317,20 +309,20 @@ if app_mode == "🍁 IMM5476 자동 작성":
     found_5476 = get_preloaded_file(["imm5476_template.pdf", "imm5476_template.pdf.pdf"])
     
     if found_5476:
-        st.success("✅ 사내 표준 'IMM5476' 양식이 시스템에서 자동으로 로드되었습니다.")
+        st.success("✅ 사내 표준 'IMM5476' 양식이 자동으로 로드되었습니다.")
         with open(found_5476, "rb") as f: template_5476_bytes = f.read()
     else:
-        st.error("⚠️ GitHub에 'imm5476_template.pdf' 파일이 없습니다. 우선 수동으로 업로드해주세요.")
-        template_file = st.file_uploader("IMM5476 템플릿 PDF 수동 업로드", type=['pdf'], key="template_5476")
+        st.error("⚠️ GitHub에 'imm5476_template.pdf' 파일이 없습니다. 수동으로 업로드해 주세요.")
+        template_file = st.file_uploader("IMM5476 템플릿 PDF 선택", type=['pdf'], key="template_5476")
         if template_file: template_5476_bytes = template_file.getvalue()
 
     st.markdown("---")
     client_file = st.file_uploader("1. 손님 여권 또는 퍼밋", type=['jpg', 'jpeg', 'png', 'pdf'], key="client_5476")
 
-    if client_file and st.button("🚀 AI 정보 추출하기", use_container_width=True):
-        with st.spinner("서류 분석 중..."):
+    if client_file and st.button("정보 추출하기", use_container_width=True):
+        with st.spinner("서류 분석 중입니다. 잠시만 기다려 주세요..."):
             extracted = extract_imm5476_info(process_uploaded_file_to_image(client_file))
-            if extracted: st.session_state.extracted_5476 = extracted; st.success("성공!")
+            if extracted: st.session_state.extracted_5476 = extracted; st.success("정보 추출이 완료되었습니다.")
 
     if st.session_state.extracted_5476:
         data = st.session_state.extracted_5476
@@ -364,11 +356,11 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
     found_consent = get_preloaded_file(["consent_template.pdf", "consent_template.pdf.pdf"])
 
     if found_consent:
-        st.success("✅ 사내 표준 '한부모 동의서' 양식이 시스템에서 자동으로 로드되었습니다.")
+        st.success("✅ 사내 표준 '한부모 동의서' 양식이 자동으로 로드되었습니다.")
         with open(found_consent, "rb") as f: consent_template_bytes = f.read()
     else:
-        st.error("⚠️ GitHub에 'consent_template.pdf' 파일이 없습니다. 우선 수동으로 업로드해주세요.")
-        consent_template = st.file_uploader("동의서 양식 수동 업로드", type=['pdf'])
+        st.error("⚠️ GitHub에 'consent_template.pdf' 파일이 없습니다. 수동으로 업로드해 주세요.")
+        consent_template = st.file_uploader("동의서 양식 선택", type=['pdf'])
         if consent_template: consent_template_bytes = consent_template.getvalue()
 
     st.markdown("---")
@@ -376,19 +368,19 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
     with c1: non_acc_file = st.file_uploader("비동반 부모님 여권 (1장)", type=['jpg', 'jpeg', 'png', 'pdf'])
     with c2: family_files = st.file_uploader("동반 부모/자녀 여권", type=['jpg', 'jpeg', 'png', 'pdf'], accept_multiple_files=True)
 
-    if st.button("🚀 일괄 추출하기", type="primary", use_container_width=True):
+    if st.button("여권 정보 추출하기", type="primary", use_container_width=True):
         images = []
         has_non_acc = bool(non_acc_file)
         if non_acc_file: images.append(process_uploaded_file_to_image(non_acc_file))
         if family_files: images.extend([process_uploaded_file_to_image(f) for f in family_files])
         
         if images:
-            with st.spinner("분석 중..."):
+            with st.spinner("여권 정보를 분석 중입니다. 잠시만 기다려 주세요..."):
                 res = extract_all_passports_batch(has_non_acc, images)
                 if res:
                     st.session_state.consent_non_acc = res.get("non_accompanying_parent", {}) or {}
                     st.session_state.consent_family = res.get("family_members", []) or []
-                    st.success("완료!")
+                    st.success("여권 정보 추출이 완료되었습니다.")
 
     non_acc_data = st.session_state.consent_non_acc
     non_acc_name = st.text_input("비동반 부모 성명", format_full_name(non_acc_data.get('surname',''), non_acc_data.get('given_name','')))
@@ -472,9 +464,9 @@ elif app_mode == "📋 이민서류 정보 정리 (Case File Prep)":
         if os.path.exists(file_path):
             with open(file_path, "rb") as f:
                 tmpl_bytes = f.read()
-            st.success(f"✅ 서버에 저장된 '{selected_form}' 양식이 자동으로 로드되었습니다.")
+            st.success(f"✅ '{selected_form}' 양식이 자동으로 로드되었습니다.")
         else:
-            st.error(f"⚠️ {file_path} 파일이 아직 GitHub에 없습니다. 파일을 업로드해 주세요!")
+            st.error(f"⚠️ {file_path} 파일이 서버에 없습니다. 파일 업로드 상태를 확인해 주세요.")
     else:
         tmpl_prep_file = st.file_uploader("빈 IMM 서식 (반드시 Print to PDF로 평탄화된 파일)", type=['pdf'], key="case_tmpl")
         if tmpl_prep_file:
@@ -482,19 +474,19 @@ elif app_mode == "📋 이민서류 정보 정리 (Case File Prep)":
 
     st.markdown("---")
     st.subheader("2. 손님 제출 서류 (복수 선택 가능)")
-    client_prep_files = st.file_uploader("질문지, 여권, 퍼밋 등 서류 올리기", type=['jpg', 'jpeg', 'png', 'pdf'], accept_multiple_files=True, key="case_client_docs")
+    client_prep_files = st.file_uploader("질문지, 여권, 퍼밋 등 서류 선택", type=['jpg', 'jpeg', 'png', 'pdf'], accept_multiple_files=True, key="case_client_docs")
 
-    if st.button("🚀 서류 읽고 항목별 정보 정리하기", type="primary", use_container_width=True):
+    if st.button("서류 정보 정리하기", type="primary", use_container_width=True):
         if tmpl_bytes is None:
             st.warning("1번 단계에서 서식이 정상적으로 선택되거나 업로드되지 않았습니다.")
         elif not client_prep_files:
             st.warning("2번 단계에서 손님 서류를 1개 이상 올려주세요.")
         else:
-            with st.spinner("⚡ AI가 초고속으로 문서를 읽고 정리 중입니다... (약 10~20초 소요)"):
+            with st.spinner("서류를 대조하여 정보를 정리 중입니다. 잠시만 기다려 주세요..."):
                 res = extract_case_prep_info(tmpl_bytes, client_prep_files)
                 if res:
                     st.session_state.prep_result = res
-                    st.success("🎉 서류 정보 정리가 완료되었습니다!")
+                    st.success("서류 정보 정리가 완료되었습니다.")
 
     if st.session_state.prep_result:
         st.markdown("---")
@@ -504,7 +496,7 @@ elif app_mode == "📋 이민서류 정보 정리 (Case File Prep)":
         sections = parsed.get("sections", [])
 
         if not sections:
-            st.error("서식에서 분석할 항목을 찾지 못했습니다. (파일이 평탄화된 PDF인지 확인하세요)")
+            st.error("서식에서 분석할 항목을 찾지 못했습니다. (파일이 평탄화된 PDF인지 확인해 주세요)")
         else:
             full_text_list = []
             for sec in sections:
