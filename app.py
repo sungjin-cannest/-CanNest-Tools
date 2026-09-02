@@ -64,7 +64,7 @@ def safe_generate_content(contents):
     raise last_error
 
 # ==========================================
-# 2. 캐싱 및 이미지 선명도 최적화 함수
+# 2. 캐싱 및 최적화 함수
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_pdf_bytes_cached(file_path):
@@ -82,24 +82,24 @@ def get_preloaded_file_bytes(file_names):
     return None
 
 def process_uploaded_file_to_image(file_obj):
-    """여권 및 퍼밋 단일 이미지 선명도 상향 (DPI 2.5, 화질 90%)"""
+    """여권/퍼밋 단일 이미지 선명도 균형 설정 (JPEG Quality 70)"""
     if file_obj.type == "application/pdf":
         doc = fitz.open(stream=file_obj.read(), filetype="pdf")
         page = doc.load_page(0)
-        pix = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5))
+        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     else:
         img = Image.open(file_obj)
         if img.mode != "RGB":
             img = img.convert("RGB")
     
-    if img.width > 1600:
-        ratio = 1600 / img.width
-        new_size = (1600, int(img.height * ratio))
+    if img.width > 1500:
+        ratio = 1500 / img.width
+        new_size = (1500, int(img.height * ratio))
         img = img.resize(new_size, Image.Resampling.LANCZOS)
     
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=90)
+    img.save(buf, format="JPEG", quality=70)
     buf.seek(0)
     return Image.open(buf)
 
@@ -112,7 +112,7 @@ def format_full_name(surname, given_name):
     return f"{g} {s}"
 
 def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
-    """숫자 오인식을 방지하기 위해 스캔본 해상도(Matrix 1.8) 및 화질(Quality 80) 상향"""
+    """스캔본 화질 70% 설정 적용"""
     if "pdf" in mime_type.lower():
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -120,18 +120,16 @@ def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
             for page in doc:
                 text += page.get_text("text") + "\n"
             
-            # 텍스트 추출 성공 시: 최대 2만 자 제한
             if len(text.strip()) > 100:
                 return [f"\n--- [Document: {file_name}] ---\n{text[:20000]}\n"]
             else:
-                # 스캔본 PDF: 숫자 인식 정확도를 위해 선명도 80%로 개선
                 images = []
                 for page_num in range(min(len(doc), 10)):
                     page = doc.load_page(page_num)
-                    pix = page.get_pixmap(matrix=fitz.Matrix(1.8, 1.8))
+                    pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                     buf = io.BytesIO()
-                    img.save(buf, format="JPEG", quality=80)
+                    img.save(buf, format="JPEG", quality=70)
                     buf.seek(0)
                     images.append({"mime_type": "image/jpeg", "data": buf.getvalue()})
                 return images
@@ -208,9 +206,28 @@ def extract_all_passports_batch(has_non_acc, images):
 
 def extract_case_prep_info(tmpl_bytes, client_files):
     prompt = """
-    You are helping immigration case-prep staff. 
-    The FIRST document attached is a BLANK reference immigration form (Canadian IRCC "IMM" series) — read it to find every field that requires client-specific data entry.
-    The REMAINING attached documents are the client's own materials (intake questionnaire, passport, permit, etc.) — use them as your source of truth for values.
+    You are an expert Canadian immigration case prep assistant.
+    The FIRST document is a BLANK reference IRCC IMM form template.
+    The REMAINING attached documents are client materials (intake questionnaire, passport, work/study permit, visitor record, resume, WES, etc.).
+
+    CRITICAL RULE FOR "Current country or territory of residence" (Section 7 in Personal Details):
+    - Status, From date, and To date in this section MUST be extracted directly from the client's CURRENT PERMIT / VISA document (Work Permit, Study Permit, Visitor Record).
+      * Country/Territory: Canada
+      * Status: Worker / Student / Visitor (based on current permit type)
+      * From: Permit Issue / Effective Date
+      * To: Permit Expiry Date
+
+    CRITICAL RULE FOR CROSS-DOCUMENT MISMATCH DETECTION:
+    Compare information across ALL client documents carefully.
+    If there is a mismatch between documents (e.g. Permit issue date vs Questionnaire entry date, or Resume employment date vs Questionnaire):
+       Set the "value" field strictly as:
+       "⚠️ 정보 불일치 (재확인 필요): [DocType A] ValueA vs [DocType B] ValueB"
+       Example: "⚠️ 정보 불일치 (재확인 필요): [질문지] 2024-06-09 vs [퍼밋] 2024-06-08"
+
+    Rules for extracting field values:
+    1. Standard match: Provide exact value and cite source document name.
+    2. Mismatch: Format as warning string above.
+    3. Missing: Set as empty string "".
 
     Return ONLY a raw JSON object in this exact shape:
     {
@@ -218,12 +235,12 @@ def extract_case_prep_info(tmpl_bytes, client_files):
         {
           "section": "short section name from the form",
           "fields": [
-            { "field": "field label", "value": "value found or empty", "source": "source document or empty" }
+            { "field": "field label", "value": "extracted value or mismatch warning", "source": "source document name(s)" }
           ]
         }
       ]
     }
-    Rules: Keep values exact. If missing, set value/source to empty string. Maintain strict order.
+    Maintain strict order of fields as requested by the template form.
     """
     
     contents = [prompt]
@@ -513,7 +530,7 @@ elif app_mode == "📋 이민서류 정보 정리 (Case File Prep)":
         elif not client_prep_files:
             st.warning("2번 단계에서 손님 서류를 1개 이상 올려주세요.")
         else:
-            with st.spinner("서류를 대조하여 정보를 정리 중입니다. 잠시만 기다려 주세요..."):
+            with st.spinner("서류를 대조하여 정보 및 불일치 항목을 확인 중입니다. 잠시만 기다려 주세요..."):
                 res = extract_case_prep_info(tmpl_bytes, client_prep_files)
                 if res:
                     st.session_state.prep_result = res
