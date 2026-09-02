@@ -9,7 +9,7 @@ import os
 import datetime
 
 # ==========================================
-# 0. 기본 설정 (반드시 코드 맨 윗줄에 1번만 있어야 함!)
+# 0. 기본 설정
 # ==========================================
 st.set_page_config(page_title="[DEV] CRM 서류 판별 및 압축", layout="wide")
 
@@ -19,10 +19,32 @@ if "GEMINI_API_KEY" not in st.secrets:
 
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
+# ✅ 내 API 키로 쓸 수 있는 모델을 구글 서버에서 직접 검색해서 가져오는 함수
+@st.cache_resource
+def get_working_model_name():
+    try:
+        valid_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        # 1. 1.5 Flash 최우선 탐색
+        for m in valid_models:
+            if '1.5-flash' in m.lower(): return m
+        # 2. 1.5 Pro 탐색
+        for m in valid_models:
+            if '1.5-pro' in m.lower(): return m
+        # 3. Vision 기능이 있는 구버전 탐색
+        for m in valid_models:
+            if 'vision' in m.lower(): return m
+        # 4. 아무 Gemini 모델이나 반환
+        for m in valid_models:
+            if 'gemini' in m.lower(): return m
+            
+        return 'gemini-1.5-flash' # 최후의 보루
+    except Exception as e:
+        return 'gemini-1.5-flash'
+
 # ==========================================
-# 1. CRM 서류 판별 로직 (AI 모델 자동 탐색 적용)
+# 1. CRM 서류 판별 로직
 # ==========================================
-def analyze_document_with_crm_rules(file_bytes, mime_type, original_filename):
+def analyze_document_with_crm_rules(file_bytes, mime_type, original_filename, auto_model_name):
     prompt = """
     You are an expert AI document classifier for a Canadian immigration firm.
     Read the provided document carefully and generate an EXACT filename according to our STRICT internal CRM rules.
@@ -96,34 +118,11 @@ def analyze_document_with_crm_rules(file_bytes, mime_type, original_filename):
     else:
         img_data = {"mime_type": mime_type, "data": file_bytes}
 
-    # 404 에러 방지를 위한 5중 모델 안전망
-    candidate_models = [
-        'gemini-1.5-flash-latest', 
-        'gemini-1.5-flash', 
-        'gemini-1.5-pro-latest', 
-        'gemini-1.5-pro',
-        'gemini-pro-vision'
-    ]
-    
-    response = None
-    last_error = None
-    
-    for model_name in candidate_models:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content([prompt, img_data])
-            break # 성공하면 즉시 루프 탈출
-        except Exception as e:
-            last_error = e
-            if "404" in str(e).lower() or "not found" in str(e).lower():
-                continue # 404 에러면 다음 모델로 넘어감
-            else:
-                break # 다른 치명적 에러면 루프 중단
-
     try:
-        if response is None:
-            raise Exception(f"사용 가능한 모델이 없습니다. 마지막 에러: {last_error}")
-            
+        # ✅ 자동으로 찾아낸 모델 사용
+        model = genai.GenerativeModel(auto_model_name)
+        response = model.generate_content([prompt, img_data])
+        
         clean_text = response.text.strip().replace('```json', '').replace('```', '')
         data = json.loads(clean_text)
         
@@ -214,7 +213,10 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
 # 3. 화면 UI 구성
 # ==========================================
 st.title("🧪 [DEV] CRM 규격 서류 자동 판별 & 압축 시스템")
-st.caption("손님 서류 및 증명사진을 올려주시면 CRM 규칙 기반 파일명 생성 및 압축 변환을 진행합니다.")
+
+# 자동 탐색된 모델명 표시
+current_model = get_working_model_name()
+st.caption(f"손님 서류 및 증명사진을 올려주시면 CRM 규칙 기반 파일명 생성 및 압축 변환을 진행합니다. (현재 AI 모델: {current_model})")
 
 st.info("🔒 **보안 안내**: 업로드된 모든 서류는 메모리에서만 처리되며, 작업 후 하단의 '파기' 버튼을 누르면 즉시 영구 삭제됩니다.")
 
@@ -238,7 +240,7 @@ if uploaded_files:
             file_bytes = file.getvalue()
             mime_type = file.type if file.type else "application/pdf"
             
-            analysis = analyze_document_with_crm_rules(file_bytes, mime_type, file.name)
+            analysis = analyze_document_with_crm_rules(file_bytes, mime_type, file.name, current_model)
             
             results.append({
                 "file_obj": file,
