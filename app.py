@@ -6,6 +6,7 @@ import io
 import os
 from PIL import Image
 import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 # 고해상도 스캔 이미지 용량 제한 해제
 Image.MAX_IMAGE_PIXELS = None
@@ -63,8 +64,23 @@ def safe_generate_content(contents):
     raise last_error
 
 # ==========================================
-# 2. 공통 및 데이터 추출 함수
+# 2. 캐싱 및 파일 최적화 함수
 # ==========================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_pdf_bytes_cached(file_path):
+    """서버 디스크 병목 방지를 위한 PDF 템플릿 메모리 캐싱"""
+    if os.path.exists(file_path):
+        with open(file_path, "rb") as f:
+            return f.read()
+    return None
+
+def get_preloaded_file_bytes(file_names):
+    for fn in file_names:
+        data = load_pdf_bytes_cached(fn)
+        if data:
+            return data
+    return None
+
 def process_uploaded_file_to_image(file_obj):
     if file_obj.type == "application/pdf":
         doc = fitz.open(stream=file_obj.read(), filetype="pdf")
@@ -95,6 +111,7 @@ def format_full_name(surname, given_name):
     return f"{g} {s}"
 
 def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
+    """쿼터 절감 및 스캔본 경량화 파싱"""
     if "pdf" in mime_type.lower():
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -103,11 +120,36 @@ def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
                 text += page.get_text("text") + "\n"
             
             if len(text.strip()) > 100:
-                return f"\n--- [Document: {file_name}] ---\n{text}\n"
+                return [f"\n--- [Document: {file_name}] ---\n{text[:20000]}\n"]
+            else:
+                images = []
+                for page_num in range(min(len(doc), 10)):
+                    page = doc.load_page(page_num)
+                    pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2))
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=60)
+                    buf.seek(0)
+                    images.append({"mime_type": "image/jpeg", "data": buf.getvalue()})
+                return images
         except:
             pass
     
-    return {"mime_type": mime_type, "data": file_bytes}
+    return [{"mime_type": mime_type, "data": file_bytes}]
+
+def batch_process_client_files(client_files):
+    """다중 스레드로 여러 제출 서류를 동시 병렬 파싱"""
+    def worker(f):
+        mime = f.type if f.type else "application/pdf"
+        return prepare_document_for_gemini(f.getvalue(), mime, f.name)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(worker, client_files))
+
+    flat_contents = []
+    for res in results:
+        flat_contents.extend(res)
+    return flat_contents
 
 def extract_imm5476_info(image):
     prompt = """
@@ -182,11 +224,8 @@ def extract_case_prep_info(tmpl_bytes, client_files):
     """
     
     contents = [prompt]
-    contents.append(prepare_document_for_gemini(tmpl_bytes, "application/pdf", "Blank_IMM_Form.pdf"))
-    
-    for f in client_files:
-        mime = f.type if f.type else "application/pdf"
-        contents.append(prepare_document_for_gemini(f.getvalue(), mime, f.name))
+    contents.extend(prepare_document_for_gemini(tmpl_bytes, "application/pdf", "Blank_IMM_Form.pdf"))
+    contents.extend(batch_process_client_files(client_files))
 
     try:
         response = safe_generate_content(contents)
@@ -204,12 +243,6 @@ def is_minor(dob_str):
         return age < 19
     except:
         return True
-
-def get_preloaded_file(file_names):
-    for fn in file_names:
-        if os.path.exists(fn):
-            return fn
-    return None
 
 # ==========================================
 # 3. PDF 서식 채우기 로직
@@ -304,13 +337,11 @@ app_mode = st.sidebar.radio("원하시는 업무 도구를 선택하세요", [
 if app_mode == "🍁 IMM5476 자동 작성":
     st.title("🍁 IMM5476 자동 작성 도구")
     if "extracted_5476" not in st.session_state: st.session_state.extracted_5476 = None
-    template_5476_bytes = None
 
-    found_5476 = get_preloaded_file(["imm5476_template.pdf", "imm5476_template.pdf.pdf"])
+    template_5476_bytes = get_preloaded_file_bytes(["imm5476_template.pdf", "imm5476_template.pdf.pdf"])
     
-    if found_5476:
+    if template_5476_bytes:
         st.success("✅ 사내 표준 'IMM5476' 양식이 자동으로 로드되었습니다.")
-        with open(found_5476, "rb") as f: template_5476_bytes = f.read()
     else:
         st.error("⚠️ GitHub에 'imm5476_template.pdf' 파일이 없습니다. 수동으로 업로드해 주세요.")
         template_file = st.file_uploader("IMM5476 템플릿 PDF 선택", type=['pdf'], key="template_5476")
@@ -352,12 +383,10 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
     if "consent_non_acc" not in st.session_state: st.session_state.consent_non_acc = {}
     if "consent_family" not in st.session_state: st.session_state.consent_family = []
 
-    consent_template_bytes = None
-    found_consent = get_preloaded_file(["consent_template.pdf", "consent_template.pdf.pdf"])
+    consent_template_bytes = get_preloaded_file_bytes(["consent_template.pdf", "consent_template.pdf.pdf"])
 
-    if found_consent:
+    if consent_template_bytes:
         st.success("✅ 사내 표준 '한부모 동의서' 양식이 자동으로 로드되었습니다.")
-        with open(found_consent, "rb") as f: consent_template_bytes = f.read()
     else:
         st.error("⚠️ GitHub에 'consent_template.pdf' 파일이 없습니다. 수동으로 업로드해 주세요.")
         consent_template = st.file_uploader("동의서 양식 선택", type=['pdf'])
@@ -461,9 +490,8 @@ elif app_mode == "📋 이민서류 정보 정리 (Case File Prep)":
     
     if form_map[selected_form] is not None:
         file_path = form_map[selected_form]
-        if os.path.exists(file_path):
-            with open(file_path, "rb") as f:
-                tmpl_bytes = f.read()
+        tmpl_bytes = load_pdf_bytes_cached(file_path)
+        if tmpl_bytes:
             st.success(f"✅ '{selected_form}' 양식이 자동으로 로드되었습니다.")
         else:
             st.error(f"⚠️ {file_path} 파일이 서버에 없습니다. 파일 업로드 상태를 확인해 주세요.")
