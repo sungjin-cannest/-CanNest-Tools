@@ -2,13 +2,17 @@ import streamlit as st
 import google.generativeai as genai
 import fitz  # PyMuPDF
 from PIL import Image
+import pillow_heif  # 👈 HEIC 지원 라이브러리 추가
 import io
 import zipfile
 import json
 import os
 import datetime
 import time
-import uuid # 고유 키 생성을 위한 모듈 추가
+import uuid
+
+# 💡 HEIC 이미지를 PIL(Image) 라이브러리에서 기본적으로 열 수 있도록 활성화
+pillow_heif.register_heif_opener()
 
 # ==========================================
 # 0. 기본 설정
@@ -89,7 +93,20 @@ def analyze_document_with_crm_rules(file_bytes, mime_type, original_filename):
         except Exception as e:
             return {"client_name": "NAME", "doc_category": "기타", "suggested_filename": f"NAME_미분류_{original_filename}"}
     else:
-        img_data = {"mime_type": mime_type, "data": file_bytes}
+        # ✅ HEIC, PNG 등 모든 이미지 포맷을 AI가 가장 잘 읽는 JPEG로 안전하게 변환하여 전달
+        try:
+            img = Image.open(io.BytesIO(file_bytes))
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            buf = io.BytesIO()
+            # AI 분석 속도 향상을 위해 적당한 크기로 리사이즈
+            if img.width > 2000:
+                ratio = 2000 / img.width
+                img = img.resize((2000, int(img.height * ratio)), Image.Resampling.LANCZOS)
+            img.save(buf, format="JPEG", quality=75)
+            img_data = {"mime_type": "image/jpeg", "data": buf.getvalue()}
+        except Exception:
+            img_data = {"mime_type": mime_type, "data": file_bytes}
 
     try:
         model = genai.GenerativeModel('gemini-3.6-flash')
@@ -187,16 +204,15 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
 st.title("CRM 파일명 자동 생성 및 최적화")
 st.caption("고객 서류 업로드 시 AI가 파일명을 규칙에 맞게 자동 생성하고 즉시 압축 변환합니다.")
 
-# 파일 업로더 초기화를 위한 고유 키 관리
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = str(uuid.uuid4())
 if "analysis_results" not in st.session_state:
     st.session_state.analysis_results = None
 
-# ✅ key 값에 st.session_state.uploader_key를 넣어 리셋 시 위젯이 완전히 초기화되게 만듦
+# ✅ 업로드 창에 'heic' 확장자 허용 추가
 uploaded_files = st.file_uploader(
     "서류 업로드 (복수 선택 가능)", 
-    type=['jpg', 'jpeg', 'png', 'pdf'], 
+    type=['jpg', 'jpeg', 'png', 'pdf', 'heic'], 
     accept_multiple_files=True,
     key=st.session_state.uploader_key
 )
@@ -290,11 +306,10 @@ if st.session_state.analysis_results:
     )
 
     # ==========================================
-    # 4. 전체 리셋 버튼 (업로드된 파일 목록까지 완전히 지움)
+    # 4. 전체 리셋 버튼
     # ==========================================
     st.markdown("---")
     if st.button("🔄 전체 리셋 (모든 데이터 파기)", type="secondary", use_container_width=True):
-        # 세션 데이터 완전 초기화 및 업로더 고유 키(UUID) 새로 발급
         for key in list(st.session_state.keys()):
             del st.session_state[key]
         st.session_state.uploader_key = str(uuid.uuid4())
