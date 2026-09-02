@@ -12,7 +12,7 @@ import time
 # ==========================================
 # 0. 기본 설정
 # ==========================================
-st.set_page_config(page_title="[DEV] CRM 서류 판별 및 압축", layout="wide")
+st.set_page_config(page_title="CRM 파일명 자동 생성 및 PDF 변환", layout="wide")
 
 if "GEMINI_API_KEY" not in st.secrets:
     st.error("⚠️ Streamlit Secrets에 GEMINI_API_KEY가 필요합니다.")
@@ -112,7 +112,7 @@ def analyze_document_with_crm_rules(file_bytes, mime_type, original_filename):
         return data
         
     except Exception as e:
-        st.error(f"AI 분석 중 에러 발생 ({original_filename}): {e}")
+        st.error(f"AI 분석 중 오류 발생 ({original_filename}): {e}")
         base_name = os.path.splitext(original_filename)[0]
         return {"client_name": "NAME", "doc_category": "기타", "suggested_filename": f"NAME_{base_name}.pdf"}
 
@@ -189,28 +189,26 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
 # ==========================================
 # 3. 화면 UI 구성
 # ==========================================
-st.title("🧪 [DEV] CRM 규격 서류 자동 판별 & 압축 시스템")
-st.caption("손님 서류 및 증명사진을 올려주시면 CRM 규칙 기반 파일명 생성 및 압축 변환을 진행합니다.")
-
-st.info("🔒 **보안 안내**: 업로드된 모든 서류는 메모리에서만 처리되며, 작업 후 하단의 '파기' 버튼을 누르면 즉시 영구 삭제됩니다.")
+st.title("CRM 파일명 자동 생성 및 PDF 변환")
+st.caption("고객 서류 업로드 시 파일명을 규격에 맞게 자동 생성하고 압축 변환합니다.")
 
 if "analysis_results" not in st.session_state:
     st.session_state.analysis_results = None
 
 uploaded_files = st.file_uploader(
-    "손님 서류 및 사진 업로드 (복수 선택 가능)", 
+    "서류 업로드 (복수 선택 가능)", 
     type=['jpg', 'jpeg', 'png', 'pdf'], 
     accept_multiple_files=True
 )
 
 if uploaded_files:
-    if st.button("🔍 서류 분석 및 파일명 생성", type="primary", use_container_width=True):
+    if st.button("서류 분석 및 파일명 생성", type="primary", use_container_width=True):
         results = []
         progress_bar = st.progress(0)
         status_text = st.empty()
         
         for idx, file in enumerate(uploaded_files):
-            status_text.text(f"분석 중 ({idx+1}/{len(uploaded_files)}): {file.name} (API 속도 조절 중...)")
+            status_text.text(f"서류 분석 중 ({idx+1}/{len(uploaded_files)}): {file.name} - 잠시만 기다려주세요...")
             file_bytes = file.getvalue()
             mime_type = file.type if file.type else "application/pdf"
             
@@ -230,12 +228,12 @@ if uploaded_files:
             if idx < len(uploaded_files) - 1:
                 time.sleep(4)
             
-        status_text.success("✅ 파일 분석 완료! 아래에서 생성된 파일명을 확인 및 수정해 주세요.")
+        status_text.success("서류 분석이 완료되었습니다. 아래에서 파일명을 확인해 주세요.")
         st.session_state.analysis_results = results
 
 if st.session_state.analysis_results:
     st.markdown("---")
-    st.subheader("📋 생성된 파일명 검토 및 수정")
+    st.subheader("생성된 파일명 확인 및 수정")
     
     updated_filenames = []
     
@@ -253,11 +251,11 @@ if st.session_state.analysis_results:
             updated_filenames.append(new_name)
 
     st.markdown("---")
-    if st.button("🚀 최종 파일 압축 변환 및 패키징", type="primary", use_container_width=True):
+    if st.button("최종 변환 및 패키징", type="primary", use_container_width=True):
         zip_buffer = io.BytesIO()
         final_outputs = []
         
-        with st.spinner("파일 최적화 압축 및 패키징 중입니다..."):
+        with st.spinner("파일 변환 및 압축 중입니다. 잠시만 기다려주세요..."):
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
                 for idx, item in enumerate(st.session_state.analysis_results):
                     final_name = updated_filenames[idx]
@@ -281,9 +279,9 @@ if st.session_state.analysis_results:
                         "bytes": compressed_bytes
                     })
                     
-        st.success("🎉 파일 변환 및 ZIP 패키징 완료!")
+        st.success("파일 변환 및 패키징이 완료되었습니다.")
         
-        st.markdown("### 📥 변환 결과 및 개별 다운로드")
+        st.markdown("### 변환 결과 다운로드")
         for out in final_outputs:
             c1, c2, c3 = st.columns([4, 2, 2])
             with c1:
@@ -302,7 +300,7 @@ if st.session_state.analysis_results:
         zip_buffer.seek(0)
         today_str = datetime.date.today().strftime("%Y%m%d")
         st.download_button(
-            "📦 전체 서류 ZIP 다운로드",
+            "전체 파일 ZIP 다운로드",
             data=zip_buffer,
             file_name=f"CRM_Documents_{today_str}.zip",
             mime="application/zip",
@@ -311,12 +309,10 @@ if st.session_state.analysis_results:
         )
 
     # ==========================================
-    # 4. 보안 데이터 파기 버튼
+    # 4. 전체 리셋 버튼
     # ==========================================
     st.markdown("---")
-    st.subheader("🗑️ 보안 및 데이터 파기")
-    if st.button("작업 완료 및 모든 데이터 즉시 파기", type="secondary", use_container_width=True):
+    if st.button("전체 리셋", type="secondary", use_container_width=True):
         for key in list(st.session_state.keys()):
             del st.session_state[key]
-        st.success("✅ 모든 서류와 데이터가 메모리에서 안전하게 삭제되었습니다.")
         st.rerun()
