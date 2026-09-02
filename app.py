@@ -1,14 +1,19 @@
 import streamlit as st
 import google.generativeai as genai
 import fitz  # PyMuPDF
-import json
-import io
-import os
 from PIL import Image
+import pillow_heif  # HEIC 지원 라이브러리
+import io
+import zipfile
+import json
+import os
 import datetime
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
-# 고해상도 스캔 이미지 용량 제한 해제
+# HEIC 이미지 지원 등록 및 고해상도 제한 해제
+pillow_heif.register_heif_opener()
 Image.MAX_IMAGE_PIXELS = None
 
 # ==========================================
@@ -64,11 +69,10 @@ def safe_generate_content(contents):
     raise last_error
 
 # ==========================================
-# 2. 캐싱 및 화질 70% 최적화 함수
+# 2. 공통 캐싱 및 이미지 처리 함수
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_pdf_bytes_cached(file_path):
-    """서버 디스크 병목 방지를 위한 PDF 템플릿 메모리 캐싱"""
     if os.path.exists(file_path):
         with open(file_path, "rb") as f:
             return f.read()
@@ -82,7 +86,6 @@ def get_preloaded_file_bytes(file_names):
     return None
 
 def process_uploaded_file_to_image(file_obj):
-    """여권/퍼밋 단일 이미지 선명도 균형 설정 (JPEG Quality 70)"""
     if file_obj.type == "application/pdf":
         doc = fitz.open(stream=file_obj.read(), filetype="pdf")
         page = doc.load_page(0)
@@ -112,7 +115,6 @@ def format_full_name(surname, given_name):
     return f"{g} {s}"
 
 def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
-    """스캔본 화질 70% 설정 적용"""
     if "pdf" in mime_type.lower():
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -139,7 +141,6 @@ def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
     return [{"mime_type": mime_type, "data": file_bytes}]
 
 def batch_process_client_files(client_files):
-    """다중 스레드로 여러 제출 서류를 동시 병렬 파싱"""
     def worker(f):
         mime = f.type if f.type else "application/pdf"
         return prepare_document_for_gemini(f.getvalue(), mime, f.name)
@@ -152,6 +153,18 @@ def batch_process_client_files(client_files):
         flat_contents.extend(res)
     return flat_contents
 
+def is_minor(dob_str):
+    try:
+        birth_date = datetime.datetime.strptime(dob_str, "%Y-%m-%d").date()
+        today = datetime.date.today()
+        age = today.year - birth_date.year - ((today.month, today.day) < (birth_date.month, birth_date.day))
+        return age < 19
+    except:
+        return True
+
+# ==========================================
+# 3. AI 분석 및 PDF 채우기 로직 (1, 2, 3번 툴)
+# ==========================================
 def extract_imm5476_info(image):
     prompt = """
     Analyze this identity document (passport/permit/visa) carefully.
@@ -255,18 +268,6 @@ def extract_case_prep_info(tmpl_bytes, client_files):
         st.error(f"서류 정리 오류: {e}")
         return None
 
-def is_minor(dob_str):
-    try:
-        birth_date = datetime.datetime.strptime(dob_str, "%Y-%m-%d").date()
-        today = datetime.date.today()
-        age = today.year - birth_date.year - ((today.month, today.day) < (birth_date.month, birth_date.day))
-        return age < 19
-    except:
-        return True
-
-# ==========================================
-# 3. PDF 서식 채우기 로직 (수정가능 및 폰트 축소 적용)
-# ==========================================
 def fill_imm5476(template_bytes, data):
     doc = fitz.open(stream=template_bytes, filetype="pdf")
     target_data = {
@@ -279,9 +280,9 @@ def fill_imm5476(template_bytes, data):
     
     for page in doc:
         for widget in page.widgets():
-            widget.text_fontsize = 0  # 글자 자동 축소 (박스 크기에 맞춤)
+            widget.text_fontsize = 0
             if hasattr(widget, "field_flags") and widget.field_flags:
-                widget.field_flags &= ~1  # Read-Only 해제 (다운로드 후 수정 가능)
+                widget.field_flags &= ~1
                 
             field_name = widget.field_name
             if not field_name: continue
@@ -317,9 +318,9 @@ def fill_consent_letter(template_bytes, data):
         child_widgets = [("Information about travelling children", "yyyymmdd"), ("1_2", "2_2"), ("1_3", "2_3")]
         
         for widget in page.widgets():
-            widget.text_fontsize = 0  # 긴 이메일/주소 입력 시 글자 자동 축소
+            widget.text_fontsize = 0
             if hasattr(widget, "field_flags") and widget.field_flags:
-                widget.field_flags &= ~1  # Read-Only 해제 (다운로드 후 언제든 수정 가능)
+                widget.field_flags &= ~1
             
             fname = widget.field_name.strip() if widget.field_name else ""
             if not fname: continue
@@ -348,15 +349,181 @@ def fill_consent_letter(template_bytes, data):
     return output_pdf
 
 # ==========================================
-# 4. Streamlit 네비게이션 및 UI 구성
+# 4. CRM 서류 판별 및 압축 변환 엔진 (4번 툴)
 # ==========================================
-st.set_page_config(page_title="CanNest 업무 자동화 툴", layout="centered")
+def analyze_document_with_crm_rules(file_bytes, mime_type, original_filename):
+    prompt = """
+    You are an expert AI document classifier for a Canadian immigration firm.
+    Read the provided document carefully and generate an EXACT filename according to our STRICT internal CRM rules.
+
+    [CRITICAL NAMING RULES]
+    1. Client Name:
+       - Korean client: Full Name in Korean with NO SPACES (e.g., 홍길동, 김영미).
+       - Non-Korean client: STRICTLY the VERY FIRST WORD of their Given Name / First Name in Title Case. (e.g., If the name is "Janani SARATH BABU", extract "Janani"). Look very closely at fields like "Client personal details", "Given names", or "Applicant".
+       - ONLY if the document has absolutely ZERO text (like a blank Digital Photo), use the word "NAME". Otherwise, try your best to find the name.
+    2. Dates:
+       - Format MUST be YYYY.MM.DD (e.g., 2022.01.02).
+       - Year ONLY where specified in the manual (e.g., COI, Emedical, Bank Statement). For Emedical, look for the examination year (e.g., 2026).
+    3. Delimiter: Always use underscore '_' between Name, Category, Details, and Dates.
+    4. Unlisted Documents: If the document does NOT match any category in the manual list below, look at the TOP of the document to find its exact title in English.
+
+    [MANUAL CATEGORY & FORMAT SPECIFICATIONS]
+    - Digital Photo / Passport Photo: {Name}_Digital Photo.jpg (MUST use .jpg extension)
+    - Passport: {Name}_PP_{ExpiryDate YYYY.MM.DD}
+    - Work Permit: {Name}_WP_{ExpiryDate YYYY.MM.DD}
+    - Study Permit: {Name}_SP_{ExpiryDate YYYY.MM.DD}
+    - Visitor Record: {Name}_VR_{ExpiryDate YYYY.MM.DD}
+    - Questionnaire: {Name}_QA_{Type e.g. WP/EE/PR Card/PNP/Spouse WP/VR}_{ReceivedDate YYYY.MM.DD}
+    - Police Certificate: {Name}_Police Cert_{CountryNameInEnglish}
+    - LOE / Employment Letter: {Name}_LOE_{CompanyInEnglish}_{한글/영문/공증}
+    - Paystub: {Name}_Paystub_{CompanyInEnglish}_{StartDate YYYY.MM.DD-EndDate YYYY.MM.DD}
+    - Degree/Diploma: {Name}_{Diploma/Bachelor/Highschool/Master/Certificate}_{SchoolName}
+    - WES: {Name}_WES
+    - Certificate of Income: {Name}_COI_{Year YYYY}
+    - Language Test: {Name}_{IELTS/CELPIP}_{TestDate YYYY.MM.DD}
+    - Resume: {Name}_Resume_{ReceivedDate YYYY.MM.DD}
+    - Medical Exam (eMedical Information Sheet): {Name}_Emedical_{Year YYYY}
+    - Marriage Cert: {Name}_Marriage Cert_{IssueDate YYYY.MM.DD}
+    - Transcript: {Name}_Transcript_{SchoolName}
+    - Bank Statement: {Name}_Bank Statement_{Year YYYY}
+    - Family Cert: {Name}_Family Cert_{IssueDate YYYY.MM.DD}
+    - Basic Cert: {Name}_Basic Cert
+    - Birth Cert: {Name}_Birth Cert
+    - Travel Consent: {ChildName}_Travel Consent
+    - LOA (Letter of Acceptance): {Name}_LOA_{SchoolName}
+    - Tuition Receipt: {Name}_Tuition Receipt_{SchoolName}
+    - Confirmation of Enrollment: {Name}_Confirmation of Enrollment_{SchoolName}
+
+    Return ONLY a raw JSON object with this format:
+    {
+        "client_name": "Extracted name",
+        "doc_category": "Category from manual OR exact title",
+        "suggested_filename": "Full_Generated_Filename_With_Correct_Extension"
+    }
+    """
+    
+    img_data = None
+    if "pdf" in mime_type.lower():
+        try:
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            page = doc.load_page(0)
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=70)
+            img_data = {"mime_type": "image/jpeg", "data": buf.getvalue()}
+            doc.close()
+        except Exception:
+            return {"client_name": "NAME", "doc_category": "기타", "suggested_filename": f"NAME_미분류_{original_filename}"}
+    else:
+        try:
+            img = Image.open(io.BytesIO(file_bytes))
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            buf = io.BytesIO()
+            if img.width > 2000:
+                ratio = 2000 / img.width
+                img = img.resize((2000, int(img.height * ratio)), Image.Resampling.LANCZOS)
+            img.save(buf, format="JPEG", quality=75)
+            img_data = {"mime_type": "image/jpeg", "data": buf.getvalue()}
+        except Exception:
+            img_data = {"mime_type": mime_type, "data": file_bytes}
+
+    try:
+        response = safe_generate_content([prompt, img_data])
+        clean_text = response.text.strip().replace('```json', '').replace('```', '')
+        data = json.loads(clean_text)
+        
+        filename = data.get("suggested_filename", "NAME_미분류_서류.pdf")
+        if not (filename.lower().endswith(".pdf") or filename.lower().endswith(".jpg") or filename.lower().endswith(".jpeg")):
+            filename += ".pdf"
+            
+        data["suggested_filename"] = filename
+        return data
+        
+    except Exception as e:
+        st.error(f"서류 분석 중 오류가 발생했습니다 ({original_filename}): {e}")
+        base_name = os.path.splitext(original_filename)[0]
+        return {"client_name": "NAME", "doc_category": "기타", "suggested_filename": f"NAME_{base_name}.pdf"}
+
+def process_and_compress_file(file_bytes, mime_type, target_filename):
+    is_jpeg = target_filename.lower().endswith(('.jpg', '.jpeg'))
+    
+    if is_jpeg:
+        img = Image.open(io.BytesIO(file_bytes))
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+            
+        if img.width > 2400:
+            ratio = 2400 / img.width
+            img = img.resize((2400, int(img.height * ratio)), Image.Resampling.LANCZOS)
+            
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85, optimize=True)
+        buf.seek(0)
+        return buf.getvalue(), "image/jpeg"
+        
+    else:
+        output_pdf = io.BytesIO()
+        target_dpi = 150
+        quality = 65
+        
+        if "pdf" in mime_type.lower():
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            new_doc = fitz.open()
+            
+            for page in doc:
+                zoom = target_dpi / 72.0
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                
+                img_buf = io.BytesIO()
+                img.save(img_buf, format="JPEG", quality=quality, optimize=True)
+                img_buf.seek(0)
+                
+                pdf_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
+                pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
+                
+            new_doc.save(output_pdf, deflate=True, garbage=4)
+            new_doc.close()
+            doc.close()
+        else:
+            img = Image.open(io.BytesIO(file_bytes))
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+                
+            if img.width > 1800:
+                ratio = 1800 / img.width
+                img = img.resize((1800, int(img.height * ratio)), Image.Resampling.LANCZOS)
+                
+            img_buf = io.BytesIO()
+            img.save(img_buf, format="JPEG", quality=quality, optimize=True)
+            img_buf.seek(0)
+            
+            new_doc = fitz.open()
+            page_width = img.width * 72 / target_dpi
+            page_height = img.height * 72 / target_dpi
+            pdf_page = new_doc.new_page(width=page_width, height=page_height)
+            
+            pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
+            
+            new_doc.save(output_pdf)
+            new_doc.close()
+            
+        output_pdf.seek(0)
+        return output_pdf.getvalue(), "application/pdf"
+
+# ==========================================
+# 5. Streamlit 네비게이션 및 UI 구성 (4개 툴 통합)
+# ==========================================
+st.set_page_config(page_title="CanNest 통합 업무 시스템", layout="wide")
 
 st.sidebar.title("🦅 CanNest Tool")
 app_mode = st.sidebar.radio("원하시는 업무 도구를 선택하세요", [
     "🍁 IMM5476 자동 작성", 
     "✈️ 한부모 동의서 자동 작성",
-    "📋 이민서류 정보 정리 (Case File Prep)"
+    "📋 이민서류 정보 정리 (Case File Prep)",
+    "🏷️ CRM 파일명 자동 생성 및 최적화"
 ])
 
 # ------------------------------------------
@@ -588,3 +755,111 @@ elif app_mode == "📋 이민서류 정보 정리 (Case File Prep)":
             if st.button("＋ 새 케이스 정리하기"):
                 st.session_state.prep_result = None
                 st.rerun()
+
+# ------------------------------------------
+# 메뉴 4: CRM 파일명 자동 생성 및 최적화
+# ------------------------------------------
+elif app_mode == "🏷️ CRM 파일명 자동 생성 및 최적화":
+    st.title("🏷️ CRM 파일명 자동 생성 및 최적화 도구")
+    st.caption("고객 서류 업로드 시 AI가 파일명을 규칙에 맞게 자동 생성하고 즉시 압축 변환합니다.")
+
+    if "uploader_key" not in st.session_state:
+        st.session_state.uploader_key = str(uuid.uuid4())
+    if "analysis_results" not in st.session_state:
+        st.session_state.analysis_results = None
+
+    uploaded_files = st.file_uploader(
+        "서류 업로드 (복수 선택 가능)", 
+        type=['jpg', 'jpeg', 'png', 'pdf', 'heic'], 
+        accept_multiple_files=True,
+        key=st.session_state.uploader_key
+    )
+
+    if uploaded_files:
+        if st.button("서류 분석 및 최적화 시작", type="primary", use_container_width=True):
+            results = []
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            for idx, file in enumerate(uploaded_files):
+                status_text.text(f"서류 분석 및 압축 중 ({idx+1}/{len(uploaded_files)}): {file.name} - 잠시만 기다려 주세요...")
+                file_bytes = file.getvalue()
+                mime_type = file.type if file.type else "application/pdf"
+                
+                analysis = analyze_document_with_crm_rules(file_bytes, mime_type, file.name)
+                final_name = analysis.get("suggested_filename", file.name)
+                
+                compressed_bytes, out_mime = process_and_compress_file(file_bytes, mime_type, final_name)
+                
+                orig_kb = len(file_bytes) / 1024
+                comp_kb = len(compressed_bytes) / 1024
+                
+                results.append({
+                    "original_name": file.name,
+                    "suggested_filename": final_name,
+                    "category": analysis.get("doc_category", "기타"),
+                    "client_name": analysis.get("client_name", ""),
+                    "mime": out_mime,
+                    "orig_kb": orig_kb,
+                    "comp_kb": comp_kb,
+                    "bytes": compressed_bytes
+                })
+                
+                progress_bar.progress((idx + 1) / len(uploaded_files))
+
+                if idx < len(uploaded_files) - 1:
+                    time.sleep(1)
+                
+            status_text.success("모든 서류의 분석 및 최적화가 완료되었습니다.")
+            st.session_state.analysis_results = results
+
+    if st.session_state.analysis_results:
+        st.markdown("---")
+        st.subheader("변환 완료된 서류 다운로드")
+        st.info("💡 파일명이 잘못 설정된 경우, 다운로드 버튼 옆 텍스트 입력창에서 직접 수정한 후 다운로드할 수 있습니다.")
+        
+        zip_buffer = io.BytesIO()
+        final_downloads = []
+        
+        for idx, item in enumerate(st.session_state.analysis_results):
+            col1, col2, col3 = st.columns([3, 3, 2])
+            
+            with col1:
+                st.write(f"**원본**: `{item['original_name']}`")
+                st.caption(f"{item['orig_kb']:.1f} KB ➡️ **{item['comp_kb']:.1f} KB**")
+                
+            with col2:
+                user_edited_name = st.text_input(
+                    "파일명", 
+                    value=item['suggested_filename'], 
+                    key=f"edit_{idx}_{item['original_name']}",
+                    label_visibility="collapsed"
+                )
+                final_downloads.append((user_edited_name, item['bytes'], item['mime']))
+                
+            with col3:
+                st.download_button("⬇️ 개별 다운로드", data=item['bytes'], file_name=user_edited_name, mime=item['mime'], key=f"dl_btn_{idx}")
+                
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            for fname, fbytes, _ in final_downloads:
+                zip_file.writestr(fname, fbytes)
+                
+        zip_buffer.seek(0)
+        today_str = datetime.date.today().strftime("%Y%m%d")
+        
+        st.markdown("---")
+        st.download_button(
+            "📦 전체 서류 ZIP 다운로드",
+            data=zip_buffer,
+            file_name=f"CRM_Documents_{today_str}.zip",
+            mime="application/zip",
+            type="primary",
+            use_container_width=True
+        )
+
+        st.markdown("---")
+        if st.button("🔄 전체 리셋", type="secondary", use_container_width=True):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.session_state.uploader_key = str(uuid.uuid4())
+            st.rerun()
