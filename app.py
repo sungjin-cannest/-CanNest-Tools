@@ -69,7 +69,7 @@ def safe_generate_content(contents):
     raise last_error
 
 # ==========================================
-# 2. 공통 캐싱 및 이미지 처리 함수
+# 2. 공통 캐싱 및 스마트 글자 크기 조절 함수
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_pdf_bytes_cached(file_path):
@@ -113,6 +113,38 @@ def format_full_name(surname, given_name):
     if not s: return g
     if not g: return s
     return f"{g} {s}"
+
+def set_smart_widget_value(widget, value, default_fontsize=10, min_fontsize=5.5):
+    """기본 글자 크기를 10pt로 유지하되, 긴 이메일/주소 등 칸을 넘어서는 텍스트만 자동 축소"""
+    val_str = str(value) if value is not None else ""
+    widget.field_value = val_str
+    
+    if hasattr(widget, "field_flags") and widget.field_flags:
+        widget.field_flags &= ~1  # Read-Only 해제 (수정 가능)
+        
+    if val_str and hasattr(widget, "rect"):
+        box_width = widget.rect.width - 4  # 좌우 여백 제외
+        if box_width > 0:
+            try:
+                font = fitz.Font("helv")
+                len_at_default = font.text_length(val_str, fontsize=default_fontsize)
+                if len_at_default > box_width:
+                    len_at_1 = font.text_length(val_str, fontsize=1)
+                    if len_at_1 > 0:
+                        scaled_size = box_width / len_at_1
+                        widget.text_fontsize = max(min_fontsize, min(default_fontsize, scaled_size))
+                    else:
+                        widget.text_fontsize = default_fontsize
+                else:
+                    widget.text_fontsize = default_fontsize
+            except Exception:
+                widget.text_fontsize = default_fontsize
+        else:
+            widget.text_fontsize = default_fontsize
+    else:
+        widget.text_fontsize = default_fontsize
+        
+    widget.update()
 
 def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
     if "pdf" in mime_type.lower():
@@ -280,27 +312,27 @@ def fill_imm5476(template_bytes, data):
     
     for page in doc:
         for widget in page.widgets():
-            widget.text_fontsize = 0
-            if hasattr(widget, "field_flags") and widget.field_flags:
-                widget.field_flags &= ~1
-                
             field_name = widget.field_name
             if not field_name: continue
             fname_lower = field_name.lower()
             
+            val_to_set = None
             if "family name" in fname_lower and not flags["surname"]:
-                widget.field_value = target_data["surname"]; widget.update(); flags["surname"] = True
+                val_to_set = target_data["surname"]; flags["surname"] = True
             elif "given name" in fname_lower and not flags["given"]:
-                widget.field_value = target_data["given"]; widget.update(); flags["given"] = True
+                val_to_set = target_data["given"]; flags["given"] = True
             elif "date of birth" in fname_lower and not flags["dob"]:
-                widget.field_value = target_data["dob"]; widget.update(); flags["dob"] = True
+                val_to_set = target_data["dob"]; flags["dob"] = True
             elif "email" in fname_lower and not flags["email"]:
-                widget.field_value = target_data["email"]; widget.update(); flags["email"] = True
+                val_to_set = target_data["email"]; flags["email"] = True
             elif ("uci" in fname_lower or "unique client identifier" in fname_lower) and not flags["uci"]:
-                widget.field_value = target_data["uci"]; widget.update(); flags["uci"] = True
+                val_to_set = target_data["uci"]; flags["uci"] = True
             elif "date" in fname_lower and "birth" not in fname_lower:
                 date_counter += 1
-                if date_counter == 1: widget.field_value = target_data["signDate"]; widget.update()
+                if date_counter == 1: val_to_set = target_data["signDate"]
+                
+            if val_to_set is not None:
+                set_smart_widget_value(widget, val_to_set, default_fontsize=10)
 
     output_pdf = io.BytesIO()
     doc.save(output_pdf); doc.close(); output_pdf.seek(0)
@@ -318,31 +350,32 @@ def fill_consent_letter(template_bytes, data):
         child_widgets = [("Information about travelling children", "yyyymmdd"), ("1_2", "2_2"), ("1_3", "2_3")]
         
         for widget in page.widgets():
-            widget.text_fontsize = 0
-            if hasattr(widget, "field_flags") and widget.field_flags:
-                widget.field_flags &= ~1
-            
             fname = widget.field_name.strip() if widget.field_name else ""
             if not fname: continue
-            if fname == "1": widget.field_value = data.get("non_acc_name", ""); widget.update()
-            elif fname == "2": widget.field_value = data.get("non_acc_address", ""); widget.update()
-            elif fname == "3": widget.field_value = data.get("non_acc_phone", ""); widget.update()
-            elif fname == "email": widget.field_value = data.get("non_acc_email", ""); widget.update()
-            elif fname == "Check Box1": widget.field_value = "0"; widget.update()
-            elif fname == "This child or these children hashave my or our consent to travel with": widget.field_value = data.get("acc_name", ""); widget.update()
-            elif fname == "Relationship with Children 1": widget.field_value = data.get("acc_relationship", ""); widget.update()
-            elif fname == "Relationship with Children 2": widget.field_value = data.get("acc_passport", ""); widget.update()
-            elif fname == "I give my consent for this child to travel to": widget.field_value = "Canada"; widget.update()
-            elif fname == "2_4": widget.field_value = data.get("acc_name", ""); widget.update()
-            elif fname == "At the following addresses 1": widget.field_value = data.get("trip_address", ""); widget.update()
-            elif fname == "At the following addresses 2": widget.field_value = data.get("trip_phone", ""); widget.update()
-            elif fname == "email_2": widget.field_value = data.get("trip_email", ""); widget.update()
-            elif fname == "yyyymmdd_2": widget.field_value = data.get("sign_date", ""); widget.update()
-                
-            for idx, (name_key, dob_key) in enumerate(child_widgets):
-                if idx < len(page_children):
-                    if fname == name_key: widget.field_value = page_children[idx].get("name", ""); widget.update()
-                    elif fname == dob_key: widget.field_value = page_children[idx].get("dob", ""); widget.update()
+            
+            val_to_set = None
+            if fname == "1": val_to_set = data.get("non_acc_name", "")
+            elif fname == "2": val_to_set = data.get("non_acc_address", "")
+            elif fname == "3": val_to_set = data.get("non_acc_phone", "")
+            elif fname == "email": val_to_set = data.get("non_acc_email", "")
+            elif fname == "Check Box1": val_to_set = "0"
+            elif fname == "This child or these children hashave my or our consent to travel with": val_to_set = data.get("acc_name", "")
+            elif fname == "Relationship with Children 1": val_to_set = data.get("acc_relationship", "")
+            elif fname == "Relationship with Children 2": val_to_set = data.get("acc_passport", "")
+            elif fname == "I give my consent for this child to travel to": val_to_set = "Canada"
+            elif fname == "2_4": val_to_set = data.get("acc_name", "")
+            elif fname == "At the following addresses 1": val_to_set = data.get("trip_address", "")
+            elif fname == "At the following addresses 2": val_to_set = data.get("trip_phone", "")
+            elif fname == "email_2": val_to_set = data.get("trip_email", "")
+            elif fname == "yyyymmdd_2": val_to_set = data.get("sign_date", "")
+            else:
+                for idx, (name_key, dob_key) in enumerate(child_widgets):
+                    if idx < len(page_children):
+                        if fname == name_key: val_to_set = page_children[idx].get("name", "")
+                        elif fname == dob_key: val_to_set = page_children[idx].get("dob", "")
+            
+            if val_to_set is not None:
+                set_smart_widget_value(widget, val_to_set, default_fontsize=10)
 
     output_pdf = io.BytesIO()
     doc.save(output_pdf); doc.close(); output_pdf.seek(0)
