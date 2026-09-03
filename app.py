@@ -1,4 +1,8 @@
 import streamlit as st
+
+# 📌 가장 먼저 실행되어야 하는 Streamlit 페이지 설정 (안정성 극대화)
+st.set_page_config(page_title="CanNest 통합 업무 시스템", layout="wide")
+
 import google.generativeai as genai
 import fitz  # PyMuPDF
 from PIL import Image
@@ -393,12 +397,10 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
         return buf.getvalue(), "image/jpeg"
         
     else:
-        # PDF의 경우: 디지털 텍스트 원본인지, 이미지 스캔본인지 스마트 판별
         if "pdf" in mime_type.lower():
             doc = fitz.open(stream=file_bytes, filetype="pdf")
             total_text_len = 0
             
-            # 페이지 내 텍스트 유무 스캔 (초반부 페이지만 검사)
             for page_idx in range(min(len(doc), 5)):
                 page = doc.load_page(page_idx)
                 text = page.get_text("text").strip()
@@ -406,13 +408,10 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
                 if total_text_len > 50:
                     break
             
-            # 💡 텍스트가 50자 이상 발견된 경우 (은행 서류, 이력서 등 디지털 원본)
-            # -> 픽셀화로 인한 용량 폭발 및 화질 저하를 막기 위해 이미지화 과정을 완전히 건너뛰고 바이패스!
             if total_text_len > 50:
                 doc.close()
                 return file_bytes, "application/pdf"
             
-            # 💡 글자가 없는 스캔본(사진)인 경우 -> 기존대로 용량 다이어트 실행
             new_doc = fitz.open()
             target_dpi = 150
             quality = 65
@@ -437,7 +436,6 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
             return output_pdf.getvalue(), "application/pdf"
             
         else:
-            # 단일 이미지 -> PDF 변환 과정
             target_dpi = 150
             quality = 65
             img = Image.open(io.BytesIO(file_bytes))
@@ -467,23 +465,22 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
             return output_pdf.getvalue(), "application/pdf"
 
 # ==========================================
-# 5. Streamlit 네비게이션 및 UI 구성 (4개 툴 통합)
+# 5. Streamlit 네비게이션 및 UI 구성 
+# (💡 변수로 묶어 메뉴 이름 불일치로 인한 백화현상 완벽 차단)
 # ==========================================
-st.set_page_config(page_title="CanNest 통합 업무 시스템", layout="wide")
+MENU_1 = "🍁 IMM5476 자동 작성"
+MENU_2 = "✈️ 한부모 동의서 자동 작성"
+MENU_3 = "📋 IMM서류 정보 정리"
+MENU_4 = "🏷️ CRM 파일명 생성 및 묶기/분할"
 
 st.sidebar.title("🦅 CanNest Tool")
-app_mode = st.sidebar.radio("원하시는 업무 도구를 선택하세요", [
-    "🍁 IMM5476 자동 작성", 
-    "✈️ 한부모 동의서 자동 작성",
-    "📋 IMM서류 정보 정리",
-    "🏷️ CRM 파일명 생성 및 묶기/분할"
-])
+app_mode = st.sidebar.radio("원하시는 업무 도구를 선택하세요", [MENU_1, MENU_2, MENU_3, MENU_4])
 
 # ------------------------------------------
 # 메뉴 1: IMM5476 자동 작성
 # ------------------------------------------
-if app_mode == "🍁 IMM5476 자동 작성":
-    st.title("🍁 IMM5476 자동 작성 도구")
+if app_mode == MENU_1:
+    st.title(MENU_1)
     if "extracted_5476" not in st.session_state: st.session_state.extracted_5476 = None
 
     template_5476_bytes = get_preloaded_file_bytes(["imm5476_template.pdf", "imm5476_template.pdf.pdf"])
@@ -526,8 +523,8 @@ if app_mode == "🍁 IMM5476 자동 작성":
 # ------------------------------------------
 # 메뉴 2: 한부모 동의서 자동 작성
 # ------------------------------------------
-elif app_mode == "✈️ 한부모 동의서 자동 작성":
-    st.title("✈️ 한부모 동의서 자동 작성 도구")
+elif app_mode == MENU_2:
+    st.title(MENU_2)
     if "consent_non_acc" not in st.session_state: st.session_state.consent_non_acc = {}
     if "consent_family" not in st.session_state: st.session_state.consent_family = []
 
@@ -615,8 +612,8 @@ elif app_mode == "✈️ 한부모 동의서 자동 작성":
 # ------------------------------------------
 # 메뉴 3: 이민서류 정보 정리 (Case File Prep)
 # ------------------------------------------
-elif app_mode == "📋 이민서류 정보 정리 (Case File Prep)":
-    st.title("📋 이민서류 정보 정리 도구")
+elif app_mode == MENU_3:
+    st.title(MENU_3)
     
     if "prep_result" not in st.session_state:
         st.session_state.prep_result = None
@@ -712,8 +709,8 @@ elif app_mode == "📋 이민서류 정보 정리 (Case File Prep)":
 # ------------------------------------------
 # 메뉴 4: CRM 파일명 자동 생성 및 스마트 분할/병합
 # ------------------------------------------
-elif app_mode == "🏷️ CRM 파일명 생성 및 스마트 묶기/분할":
-    st.title("🏷️ CRM 파일명 생성 및 스마트 묶기/분할 도구")
+elif app_mode == MENU_4:
+    st.title(MENU_4)
     st.caption("개별 낱장 이미지, 여러 장짜리 통짜 PDF 등을 섞어서 올려도 AI가 알아서 문서 단위로 묶거나 분할하여 CRM 파일명으로 최적화합니다.")
 
     if "uploader_key" not in st.session_state:
@@ -908,7 +905,6 @@ elif app_mode == "🏷️ CRM 파일명 생성 및 스마트 묶기/분할":
                     comp_bytes, out_mime = process_and_compress_file(p_data["file_bytes"], p_data["mime_type"], final_name)
                     orig_bytes_len = len(p_data["file_bytes"])
                 else:
-                    # 스마트 압축 엔진 통과 (디지털 원본인지 스캔본인지 스스로 판단)
                     comp_bytes, out_mime = process_and_compress_file(merged_pdf_bytes, "application/pdf", final_name)
                     orig_bytes_len = len(merged_pdf_bytes)
                     
@@ -919,7 +915,7 @@ elif app_mode == "🏷️ CRM 파일명 생성 및 스마트 묶기/분할":
                 if len(src_display) > 30: src_display = src_display[:27] + "..."
                 
                 results.append({
-                    "original_name": f"AI 분석 묶음 ({src_display})",
+                    "original_name": f"AI 묶음 ({src_display})",
                     "suggested_filename": final_name,
                     "category": doc_info.get("doc_category", "기타"),
                     "client_name": doc_info.get("client_name", ""),
