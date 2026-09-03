@@ -497,4 +497,459 @@ def analyze_and_split_crm_document(file_bytes, mime_type, original_filename):
 
     try:
         response = safe_generate_content(contents)
-        clean_text = response.text.strip().replace('```json', '').replace('
+        clean_text = response.text.strip().replace('```json', '').replace('```', '')
+        data = json.loads(clean_text)
+        return data.get("documents", []), num_pages
+    except Exception as e:
+        st.error(f"서류 분석 중 오류가 발생했습니다 ({original_filename}): {e}")
+        base_name = os.path.splitext(original_filename)[0]
+        fallback = [{
+            "client_name": "NAME", 
+            "doc_category": "기타", 
+            "suggested_filename": f"NAME_{base_name}.pdf",
+            "start_page": 1,
+            "end_page": num_pages
+        }]
+        return fallback, num_pages
+
+def process_and_compress_file(file_bytes, mime_type, target_filename):
+    is_jpeg = target_filename.lower().endswith(('.jpg', '.jpeg'))
+    
+    if is_jpeg:
+        img = Image.open(io.BytesIO(file_bytes))
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+            
+        if img.width > 2400:
+            ratio = 2400 / img.width
+            img = img.resize((2400, int(img.height * ratio)), Image.Resampling.LANCZOS)
+            
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85, optimize=True)
+        buf.seek(0)
+        return buf.getvalue(), "image/jpeg"
+        
+    else:
+        output_pdf = io.BytesIO()
+        target_dpi = 150
+        quality = 65
+        
+        if "pdf" in mime_type.lower():
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            new_doc = fitz.open()
+            
+            for page in doc:
+                zoom = target_dpi / 72.0
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                
+                img_buf = io.BytesIO()
+                img.save(img_buf, format="JPEG", quality=quality, optimize=True)
+                img_buf.seek(0)
+                
+                pdf_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
+                pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
+                
+            new_doc.save(output_pdf, deflate=True, garbage=4)
+            new_doc.close()
+            doc.close()
+        else:
+            img = Image.open(io.BytesIO(file_bytes))
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+                
+            if img.width > 1800:
+                ratio = 1800 / img.width
+                img = img.resize((1800, int(img.height * ratio)), Image.Resampling.LANCZOS)
+                
+            img_buf = io.BytesIO()
+            img.save(img_buf, format="JPEG", quality=quality, optimize=True)
+            img_buf.seek(0)
+            
+            new_doc = fitz.open()
+            page_width = img.width * 72 / target_dpi
+            page_height = img.height * 72 / target_dpi
+            pdf_page = new_doc.new_page(width=page_width, height=page_height)
+            
+            pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
+            
+            new_doc.save(output_pdf)
+            new_doc.close()
+            
+        output_pdf.seek(0)
+        return output_pdf.getvalue(), "application/pdf"
+
+# ==========================================
+# 5. Streamlit 네비게이션 및 UI 구성 (4개 툴 통합)
+# ==========================================
+st.set_page_config(page_title="CanNest 통합 업무 시스템", layout="wide")
+
+st.sidebar.title("🦅 CanNest Tool")
+app_mode = st.sidebar.radio("원하시는 업무 도구를 선택하세요", [
+    "🍁 IMM5476 자동 작성", 
+    "✈️ 한부모 동의서 자동 작성",
+    "📋 이민서류 정보 정리 (Case File Prep)",
+    "🏷️ CRM 파일명 자동 생성 및 최적화"
+])
+
+# ------------------------------------------
+# 메뉴 1: IMM5476 자동 작성
+# ------------------------------------------
+if app_mode == "🍁 IMM5476 자동 작성":
+    st.title("🍁 IMM5476 자동 작성 도구")
+    if "extracted_5476" not in st.session_state: st.session_state.extracted_5476 = None
+
+    template_5476_bytes = get_preloaded_file_bytes(["imm5476_template.pdf", "imm5476_template.pdf.pdf"])
+    
+    if template_5476_bytes:
+        st.success("✅ 사내 표준 'IMM5476' 양식이 자동으로 로드되었습니다.")
+    else:
+        st.error("⚠️ GitHub에 'imm5476_template.pdf' 파일이 없습니다. 수동으로 업로드해 주세요.")
+        template_file = st.file_uploader("IMM5476 템플릿 PDF 선택", type=['pdf'], key="template_5476")
+        if template_file: template_5476_bytes = template_file.getvalue()
+
+    st.markdown("---")
+    client_file = st.file_uploader("1. 손님 여권 또는 퍼밋", type=['jpg', 'jpeg', 'png', 'pdf'], key="client_5476")
+
+    if client_file and st.button("정보 추출하기", use_container_width=True):
+        with st.spinner("서류 분석 중입니다. 잠시만 기다려 주세요..."):
+            extracted = extract_imm5476_info(process_uploaded_file_to_image(client_file))
+            if extracted: st.session_state.extracted_5476 = extracted; st.success("정보 추출이 완료되었습니다.")
+
+    if st.session_state.extracted_5476:
+        data = st.session_state.extracted_5476
+        c1, c2 = st.columns(2)
+        with c1:
+            surname = st.text_input("성 (Surname)", data.get("surname", ""))
+            dob = st.text_input("생년월일", data.get("dob", ""))
+            email = st.text_input("이메일", "")
+        with c2:
+            given = st.text_input("이름 (Given Name)", data.get("given_name", ""))
+            uci = st.text_input("UCI", data.get("uci", ""))
+            sign_date = st.date_input("서명날짜", datetime.date.today())
+
+        if st.button("문서 생성 및 다운로드", type="primary"):
+            if not template_5476_bytes:
+                st.error("템플릿 파일이 없습니다.")
+            else:
+                final_data = {"surname": surname, "given_name": given, "dob": dob, "uci": uci, "email": email, "signDate": sign_date.strftime("%Y-%m-%d")}
+                pdf_out = fill_imm5476(template_5476_bytes, final_data)
+                st.download_button("📥 다운로드", pdf_out, file_name=f"IMM5476_{surname}_{given}.pdf", mime="application/pdf")
+
+# ------------------------------------------
+# 메뉴 2: 한부모 동의서 자동 작성
+# ------------------------------------------
+elif app_mode == "✈️ 한부모 동의서 자동 작성":
+    st.title("✈️ 한부모 동의서 자동 작성 도구")
+    if "consent_non_acc" not in st.session_state: st.session_state.consent_non_acc = {}
+    if "consent_family" not in st.session_state: st.session_state.consent_family = []
+
+    consent_template_bytes = get_preloaded_file_bytes(["consent_template.pdf", "consent_template.pdf.pdf"])
+
+    if consent_template_bytes:
+        st.success("✅ 사내 표준 '한부모 동의서' 양식이 자동으로 로드되었습니다.")
+    else:
+        st.error("⚠️ GitHub에 'consent_template.pdf' 파일이 없습니다. 수동으로 업로드해 주세요.")
+        consent_template = st.file_uploader("동의서 양식 선택", type=['pdf'])
+        if consent_template: consent_template_bytes = consent_template.getvalue()
+
+    st.markdown("---")
+    c1, c2 = st.columns(2)
+    with c1: non_acc_file = st.file_uploader("비동반 부모님 여권 (1장)", type=['jpg', 'jpeg', 'png', 'pdf'])
+    with c2: family_files = st.file_uploader("동반 부모/자녀 여권", type=['jpg', 'jpeg', 'png', 'pdf'], accept_multiple_files=True)
+
+    if st.button("여권 정보 추출하기", type="primary", use_container_width=True):
+        images = []
+        has_non_acc = bool(non_acc_file)
+        if non_acc_file: images.append(process_uploaded_file_to_image(non_acc_file))
+        if family_files: images.extend([process_uploaded_file_to_image(f) for f in family_files])
+        
+        if images:
+            with st.spinner("여권 정보를 분석 중입니다. 잠시만 기다려 주세요..."):
+                res = extract_all_passports_batch(has_non_acc, images)
+                if res:
+                    st.session_state.consent_non_acc = res.get("non_accompanying_parent", {}) or {}
+                    st.session_state.consent_family = res.get("family_members", []) or []
+                    st.success("여권 정보 추출이 완료되었습니다.")
+
+    non_acc_data = st.session_state.consent_non_acc
+    non_acc_name = st.text_input("비동반 부모 성명", format_full_name(non_acc_data.get('surname',''), non_acc_data.get('given_name','')))
+    non_acc_address = st.text_input("주소")
+    ca, cb = st.columns(2)
+    with ca: non_acc_phone = st.text_input("전화번호")
+    with cb: non_acc_email = st.text_input("이메일")
+
+    acc_parents = [p for p in st.session_state.consent_family if not is_minor(p.get("dob", ""))]
+    children_list = [p for p in st.session_state.consent_family if is_minor(p.get("dob", ""))]
+    
+    acc_name, acc_passport, acc_rel = "", "", "Mother"
+    if acc_parents:
+        p = acc_parents[0]
+        acc_name = format_full_name(p.get('surname',''), p.get('given_name',''))
+        acc_passport = p.get("passport_number", "")
+        acc_rel = "Mother" if p.get("gender") == "F" else "Father"
+
+    cp1, cp2, cp3 = st.columns(3)
+    with cp1: acc_name = st.text_input("동반 부모 성명", acc_name)
+    with cp2: acc_rel = st.selectbox("관계", ["Mother", "Father"], index=0 if acc_rel=="Mother" else 1)
+    with cp3: acc_passport = st.text_input("여권번호", acc_passport)
+
+    final_children = []
+    for idx, c in enumerate(children_list):
+        cc1, cc2 = st.columns(2)
+        with cc1: n = st.text_input(f"자녀{idx+1} 성명", format_full_name(c.get('surname',''), c.get('given_name','')))
+        with cc2: d = st.text_input(f"자녀{idx+1} 생일", c.get("dob", "").replace("-", "/"))
+        final_children.append({"name": n, "dob": d})
+    
+    if not children_list:
+        cc1, cc2 = st.columns(2)
+        with cc1: n = st.text_input("자녀 성명")
+        with cc2: d = st.text_input("자녀 생일")
+        if n: final_children.append({"name": n, "dob": d})
+
+    trip_address = st.text_input("현지 주소")
+    ct1, ct2 = st.columns(2)
+    with ct1: trip_phone = st.text_input("현지 전화")
+    with ct2: trip_email = st.text_input("현지 이메일")
+    sign_date_str = st.date_input("서명일", datetime.date.today()).strftime("%Y/%m/%d")
+
+    if st.button("문서 생성 및 다운로드", type="primary"):
+        if not consent_template_bytes:
+            st.error("양식 파일이 없습니다.")
+        else:
+            data_consent = {
+                "non_acc_name": non_acc_name, "non_acc_address": non_acc_address, "non_acc_phone": non_acc_phone, "non_acc_email": non_acc_email,
+                "children": final_children, "acc_name": acc_name, "acc_relationship": acc_rel, "acc_passport": acc_passport,
+                "trip_address": trip_address, "trip_phone": trip_phone, "trip_email": trip_email, "sign_date": sign_date_str
+            }
+            pdf_out = fill_consent_letter(consent_template_bytes, data_consent)
+            st.download_button("📥 다운로드", pdf_out, f"Consent_{non_acc_name}.pdf", "application/pdf")
+
+# ------------------------------------------
+# 메뉴 3: 이민서류 정보 정리 (Case File Prep)
+# ------------------------------------------
+elif app_mode == "📋 이민서류 정보 정리 (Case File Prep)":
+    st.title("📋 이민서류 정보 정리 도구")
+    
+    if "prep_result" not in st.session_state:
+        st.session_state.prep_result = None
+
+    st.subheader("1. 대상 서식 (IMM PDF)")
+    
+    form_map = {
+        "직접 파일 업로드 (기타 서식)": None,
+        "IMM1294 (SP-OUTSIDE)": "imm1294.pdf",
+        "IMM1295 (WP-OUTSIDE)": "imm1295.pdf",
+        "IMM5708 (VR-INSIDE)": "imm5708.pdf",
+        "IMM5709 (SP-INSIDE)": "imm5709.pdf",
+        "IMM5710 (WP-INSIDE)": "imm5710.pdf"
+    }
+    
+    selected_form = st.selectbox("📌 템플릿 서식 선택 (GitHub 박제본)", list(form_map.keys()))
+    
+    tmpl_bytes = None
+    
+    if form_map[selected_form] is not None:
+        file_path = form_map[selected_form]
+        tmpl_bytes = load_pdf_bytes_cached(file_path)
+        if tmpl_bytes:
+            st.success(f"✅ '{selected_form}' 양식이 자동으로 로드되었습니다.")
+        else:
+            st.error(f"⚠️ {file_path} 파일이 서버에 없습니다. 파일 업로드 상태를 확인해 주세요.")
+    else:
+        tmpl_prep_file = st.file_uploader("빈 IMM 서식 (반드시 Print to PDF로 평탄화된 파일)", type=['pdf'], key="case_tmpl")
+        if tmpl_prep_file:
+            tmpl_bytes = tmpl_prep_file.getvalue()
+
+    st.markdown("---")
+    st.subheader("2. 손님 제출 서류 (복수 선택 가능)")
+    client_prep_files = st.file_uploader("질문지, 여권, 퍼밋 등 서류 선택", type=['jpg', 'jpeg', 'png', 'pdf'], accept_multiple_files=True, key="case_client_docs")
+
+    if st.button("서류 정보 정리하기", type="primary", use_container_width=True):
+        if tmpl_bytes is None:
+            st.warning("1번 단계에서 서식이 정상적으로 선택되거나 업로드되지 않았습니다.")
+        elif not client_prep_files:
+            st.warning("2번 단계에서 손님 서류를 1개 이상 올려주세요.")
+        else:
+            with st.spinner("서류를 대조하여 정보 및 불일치 항목을 확인 중입니다. 잠시만 기다려 주세요..."):
+                res = extract_case_prep_info(tmpl_bytes, client_prep_files)
+                if res:
+                    st.session_state.prep_result = res
+                    st.success("서류 정보 정리가 완료되었습니다.")
+
+    if st.session_state.prep_result:
+        st.markdown("---")
+        st.subheader("3. 정리된 정보 결과")
+
+        parsed = st.session_state.prep_result
+        sections = parsed.get("sections", [])
+
+        if not sections:
+            st.error("서식에서 분석할 항목을 찾지 못했습니다. (파일이 평탄화된 PDF인지 확인해 주세요)")
+        else:
+            full_text_list = []
+            for sec in sections:
+                sec_name = sec.get("section", "기타 항목")
+                st.write(f"### 📌 {sec_name}")
+                full_text_list.append(f"[{sec_name}]")
+
+                table_data = []
+                for f in sec.get("fields", []):
+                    field_lbl = f.get("field", "")
+                    val = f.get("value", "")
+                    src = f.get("source", "")
+
+                    if not val:
+                        display_val = "⚠️ 확인 필요 (미발견)"
+                        full_text_list.append(f"{field_lbl}: (확인 필요)")
+                    else:
+                        display_val = val
+                        full_text_list.append(f"{field_lbl}: {val}")
+
+                    table_data.append({
+                        "항목 (Field)": field_lbl,
+                        "추출값 (Value)": display_val,
+                        "출처 (Source)": src if src else "-"
+                    })
+
+                st.table(table_data)
+                full_text_list.append("")
+
+            st.markdown("#### 📋 한눈에 복사하기")
+            st.text_area("아래 텍스트를 복사하여 서식에 옮겨 적으세요", value="\n".join(full_text_list), height=250)
+            
+            if st.button("＋ 새 케이스 정리하기"):
+                st.session_state.prep_result = None
+                st.rerun()
+
+# ------------------------------------------
+# 메뉴 4: CRM 파일명 자동 생성 및 최적화
+# ------------------------------------------
+elif app_mode == "🏷️ CRM 파일명 자동 생성 및 최적화":
+    st.title("🏷️ CRM 파일명 자동 생성 및 최적화 도구")
+    st.caption("고객 서류 업로드 시 AI가 파일명을 규칙에 맞게 자동 생성하고, 병합된 여러 서류를 분할 및 최적화합니다.")
+
+    if "uploader_key" not in st.session_state:
+        st.session_state.uploader_key = str(uuid.uuid4())
+    if "analysis_results" not in st.session_state:
+        st.session_state.analysis_results = None
+
+    uploaded_files = st.file_uploader(
+        "서류 업로드 (단일 또는 병합된 PDF 모두 가능)", 
+        type=['jpg', 'jpeg', 'png', 'pdf', 'heic'], 
+        accept_multiple_files=True,
+        key=st.session_state.uploader_key
+    )
+
+    if uploaded_files:
+        if st.button("서류 분석 및 자동 분할/최적화 시작", type="primary", use_container_width=True):
+            results = []
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            for idx, file in enumerate(uploaded_files):
+                status_text.text(f"서류 분석 및 분할 중 ({idx+1}/{len(uploaded_files)}): {file.name} - 잠시만 기다려 주세요...")
+                file_bytes = file.getvalue()
+                mime_type = file.type if file.type else "application/pdf"
+                
+                # 📌 AI를 통한 문서 파악 및 분할 범위 리스트 추출
+                docs_info, total_pages = analyze_and_split_crm_document(file_bytes, mime_type, file.name)
+                
+                for doc_info in docs_info:
+                    final_name = doc_info.get("suggested_filename", file.name)
+                    
+                    # 확장자 보정
+                    if not (final_name.lower().endswith(".pdf") or final_name.lower().endswith(".jpg") or final_name.lower().endswith(".jpeg")):
+                        if "pdf" in mime_type.lower(): final_name += ".pdf"
+                        else: final_name += ".jpg"
+                            
+                    start_p = doc_info.get("start_page", 1)
+                    end_p = doc_info.get("end_page", total_pages)
+                    
+                    # PDF인 경우 AI가 지시한 페이지 구간만 잘라내기
+                    if "pdf" in mime_type.lower():
+                        split_bytes = split_pdf_bytes(file_bytes, start_p, end_p)
+                        current_mime = "application/pdf"
+                    else:
+                        split_bytes = file_bytes
+                        current_mime = mime_type
+                        
+                    # 잘라낸 파일을 압축 최적화 엔진에 전달
+                    compressed_bytes, out_mime = process_and_compress_file(split_bytes, current_mime, final_name)
+                    
+                    orig_kb = len(split_bytes) / 1024
+                    comp_kb = len(compressed_bytes) / 1024
+                    
+                    # UI 식별을 위한 페이지 라벨 추가
+                    page_label = f" (p.{start_p}-{end_p})" if ("pdf" in mime_type.lower() and total_pages > 1) else ""
+                    display_name = file.name + page_label
+                    
+                    results.append({
+                        "original_name": display_name,
+                        "suggested_filename": final_name,
+                        "category": doc_info.get("doc_category", "기타"),
+                        "client_name": doc_info.get("client_name", ""),
+                        "mime": out_mime,
+                        "orig_kb": orig_kb,
+                        "comp_kb": comp_kb,
+                        "bytes": compressed_bytes
+                    })
+                
+                progress_bar.progress((idx + 1) / len(uploaded_files))
+                if idx < len(uploaded_files) - 1:
+                    time.sleep(1)
+                
+            status_text.success("모든 서류의 스마트 분할 및 최적화가 완료되었습니다.")
+            st.session_state.analysis_results = results
+
+    if st.session_state.analysis_results:
+        st.markdown("---")
+        st.subheader("변환 완료된 서류 다운로드")
+        st.info("💡 병합된 PDF는 AI가 인식한 서류 단위로 분할되었습니다. 파일명을 수정한 후 다운로드할 수 있습니다.")
+        
+        zip_buffer = io.BytesIO()
+        final_downloads = []
+        
+        for idx, item in enumerate(st.session_state.analysis_results):
+            col1, col2, col3 = st.columns([3, 3, 2])
+            
+            with col1:
+                st.write(f"**원본/구간**: `{item['original_name']}`")
+                st.caption(f"{item['orig_kb']:.1f} KB ➡️ **{item['comp_kb']:.1f} KB**")
+                
+            with col2:
+                user_edited_name = st.text_input(
+                    "파일명", 
+                    value=item['suggested_filename'], 
+                    key=f"edit_{idx}_{item['original_name']}",
+                    label_visibility="collapsed"
+                )
+                final_downloads.append((user_edited_name, item['bytes'], item['mime']))
+                
+            with col3:
+                st.download_button("⬇️ 개별 다운로드", data=item['bytes'], file_name=user_edited_name, mime=item['mime'], key=f"dl_btn_{idx}")
+                
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            for fname, fbytes, _ in final_downloads:
+                zip_file.writestr(fname, fbytes)
+                
+        zip_buffer.seek(0)
+        today_str = datetime.date.today().strftime("%Y%m%d")
+        
+        st.markdown("---")
+        st.download_button(
+            "📦 전체 서류 ZIP 다운로드",
+            data=zip_buffer,
+            file_name=f"CRM_Documents_{today_str}.zip",
+            mime="application/zip",
+            type="primary",
+            use_container_width=True
+        )
+
+        st.markdown("---")
+        if st.button("🔄 전체 리셋", type="secondary", use_container_width=True):
+            for key in list(st.session_state.keys()):
+                if key != "password_correct":
+                    del st.session_state[key]
+            st.session_state.uploader_key = str(uuid.uuid4())
+            st.rerun()
