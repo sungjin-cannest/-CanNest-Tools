@@ -14,7 +14,7 @@ import os
 import datetime
 import time
 import uuid
-import re  # 💡 파일명 언어 판별을 위한 정규식 모듈 추가
+import re 
 from concurrent.futures import ThreadPoolExecutor
 
 # HEIC 이미지 지원 등록 및 고해상도 제한 해제
@@ -355,8 +355,9 @@ def fill_consent_letter(template_bytes, data):
             if not fname: continue
             fname_lower = fname.lower()
             
-            # 원치 않는 체크박스 강제 해제
-            if widget.field_type in [fitz.PDF_WIDGET_TYPE_CHECKBOX, fitz.PDF_WIDGET_TYPE_RADIO] or "check box" in fname_lower or "checkbox" in fname_lower:
+            # 💡 수정포인트: AttributeError 방지를 위해 버전 종속적인 상수 대신 범용 속성(문자열)으로 체크박스 검사
+            field_type_str = getattr(widget, "field_type_string", "").lower()
+            if "check" in field_type_str or "radio" in field_type_str or "check box" in fname_lower or "checkbox" in fname_lower:
                 widget.field_value = False
                 widget.update()
                 continue
@@ -638,7 +639,6 @@ elif app_mode == MENU_2:
             }
             pdf_out = fill_consent_letter(consent_template_bytes, data_consent)
             
-            # 💡 CRM 규칙에 따른 스마트 파일명 생성 로직
             crm_name = "NAME"
             if non_acc_name:
                 if re.search(r'[가-힣]', non_acc_name):
