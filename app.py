@@ -355,14 +355,10 @@ def fill_consent_letter(template_bytes, data):
             if not fname: continue
             fname_lower = fname.lower()
             
-            # 💡 수정 1: 모든 종류의 체크박스(alone, travel with 등)를 철저하게 탐지하고 "Off"로 강제 초기화
             field_type_str = getattr(widget, "field_type_string", "").lower()
-            is_checkbox = ("check" in field_type_str or "radio" in field_type_str or 
-                           "check box" in fname_lower or "checkbox" in fname_lower or 
-                           "alone" in fname_lower)
-            if is_checkbox:
+            if "check" in field_type_str or "radio" in field_type_str or "check box" in fname_lower or "checkbox" in fname_lower or "alone" in fname_lower:
                 try:
-                    widget.field_value = "Off"  # PDF 표준 체크 해제 값
+                    widget.field_value = "Off" 
                     widget.update()
                 except: pass
                 continue
@@ -382,13 +378,11 @@ def fill_consent_letter(template_bytes, data):
             elif fname == "email_2": val_to_set = data.get("trip_email", "")
             elif fname == "yyyymmdd_2": val_to_set = data.get("sign_date", "")
             
-            # 💡 수정 2: 숨겨진 Travel Date ("1_4" 등) 필드 이름 완벽 매핑
-            elif fname == "1_4" or "travel date" in fname_lower or fname_lower == "date": 
-                val_to_set = f"{data.get('trip_start', '')} ~ {data.get('trip_end', '')}"
-            elif "from" in fname_lower or "departure" in fname_lower or "start date" in fname_lower: 
-                val_to_set = data.get("trip_start", "")
+            # 💡 수정 포인트: 사용자가 자유롭게 입력한 텍스트를 그대로 PDF 폼에 매핑
+            elif fname == "1_4" or "travel date" in fname_lower or fname_lower == "date" or "from" in fname_lower or "departure" in fname_lower or "start date" in fname_lower: 
+                val_to_set = data.get("trip_date", "")
             elif fname_lower == "to" or "return" in fname_lower or "end date" in fname_lower: 
-                val_to_set = data.get("trip_end", "")
+                val_to_set = "" # 통짜 텍스트 하나로 처리하므로 To 필드는 비워둡니다.
                 
             else:
                 for idx, (name_key, dob_key) in enumerate(child_widgets):
@@ -631,9 +625,8 @@ elif app_mode == MENU_2:
     with ct1: trip_phone = st.text_input("현지 전화")
     with ct2: trip_email = st.text_input("현지 이메일")
     
-    cd1, cd2 = st.columns(2)
-    with cd1: trip_start = st.date_input("여행 시작일 (From)", datetime.date.today())
-    with cd2: trip_end = st.date_input("여행 종료일 (To)", datetime.date.today() + datetime.timedelta(days=30))
+    # 💡 Travel Date 자유 텍스트 입력칸으로 변경
+    trip_date = st.text_input("여행 기간 (Travel Date)", placeholder="예: 2026/09/01 ~ 2026/09/30 또는 August 2026")
     
     sign_date_str = st.date_input("서명일", datetime.date.today()).strftime("%Y/%m/%d")
 
@@ -645,7 +638,7 @@ elif app_mode == MENU_2:
                 "non_acc_name": non_acc_name, "non_acc_address": non_acc_address, "non_acc_phone": non_acc_phone, "non_acc_email": non_acc_email,
                 "children": final_children, "acc_name": acc_name, "acc_relationship": acc_rel, "acc_passport": acc_passport,
                 "trip_address": trip_address, "trip_phone": trip_phone, "trip_email": trip_email, 
-                "trip_start": trip_start.strftime("%Y/%m/%d"), "trip_end": trip_end.strftime("%Y/%m/%d"),
+                "trip_date": trip_date, # 자유 텍스트 데이터 전달
                 "sign_date": sign_date_str
             }
             pdf_out = fill_consent_letter(consent_template_bytes, data_consent)
