@@ -5,7 +5,7 @@ st.set_page_config(page_title="CanNest 통합 업무 시스템", layout="wide")
 
 import google.generativeai as genai
 import fitz  # PyMuPDF
-from PIL import Image
+from PIL import Image, ImageOps
 import pillow_heif  # HEIC 지원 라이브러리
 import io
 import zipfile
@@ -14,6 +14,7 @@ import os
 import datetime
 import time
 import uuid
+import re 
 from concurrent.futures import ThreadPoolExecutor
 
 # HEIC 이미지 지원 등록 및 고해상도 제한 해제
@@ -97,6 +98,7 @@ def process_uploaded_file_to_image(file_obj):
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     else:
         img = Image.open(file_obj)
+        img = ImageOps.exif_transpose(img)
         if img.mode != "RGB":
             img = img.convert("RGB")
     
@@ -118,7 +120,6 @@ def format_full_name(surname, given_name):
     if not g: return s
     return f"{g} {s}"
 
-# 💡 핵심 수정: Courier 폰트를 정확한 약어("Cour")로 지정하고 기본 10pt 사이즈 유지
 def set_smart_widget_value(widget, value, default_fontsize=11, min_fontsize=5.5):
     val_str = str(value) if value is not None else ""
     widget.field_value = val_str
@@ -127,7 +128,7 @@ def set_smart_widget_value(widget, value, default_fontsize=11, min_fontsize=5.5)
         widget.field_flags &= ~1 
         
     try:
-        widget.text_font = "Cour"  # PyMuPDF가 인식하는 정확한 타자기 폰트 코드
+        widget.text_font = "Cour"
     except:
         pass
         
@@ -135,7 +136,7 @@ def set_smart_widget_value(widget, value, default_fontsize=11, min_fontsize=5.5)
         box_width = widget.rect.width - 4 
         if box_width > 0:
             try:
-                font = fitz.Font("courier")  # 너비 계산용 폰트
+                font = fitz.Font("courier") 
                 len_at_default = font.text_length(val_str, fontsize=default_fontsize)
                 if len_at_default > box_width:
                     len_at_1 = font.text_length(val_str, fontsize=1)
@@ -203,13 +204,13 @@ def is_minor(dob_str):
         return True
 
 # ==========================================
-# 3. PDF 서식 채우기 로직 (Title Case 강제 적용)
+# 3. PDF 서식 채우기 로직
 # ==========================================
 def extract_imm5476_info(image):
     prompt = """
     Analyze this identity document (passport/permit/visa) carefully.
     Extract the following details into exact JSON structure:
-    - surname: Family name converted to Title Case (First letter capitalized, e.g., 'KIM' -> 'Kim', 'RODRIGUEZ CARDENAS' -> 'Rodriguez Cardenas')
+    - surname: Family name converted to Title Case (First letter capitalized, e.g., 'KIM' -> 'Kim')
     - given_name: Given names converted to Title Case (e.g., 'EUN SUN' -> 'Eun Sun')
     - dob: Date of birth in YYYY-MM-DD format
     - uci: UCI numbers only if present (10 digits or 8 digits), else empty string
@@ -229,11 +230,11 @@ def extract_all_passports_batch(has_non_acc, images):
     I am providing {len(images)} passport image(s) in exact order.
     Order structure:
     - {'Image 1 is the non-accompanying parent passport.' if has_non_acc else 'There is no non-accompanying parent passport provided.'}
-    - {'Remaining images (Image ' + ('2' if has_non_acc else '1') + f' to {len(images)}) are accompanying family members (parents or children).' if (len(images) > (1 if has_non_acc else 0)) else 'No family passports provided.'}
+    - {'Remaining images are accompanying family members.' if (len(images) > (1 if has_non_acc else 0)) else 'No family passports provided.'}
 
     For EACH passport image, extract:
-    - surname: Surname / Family name converted to Title Case (e.g., 'Kim')
-    - given_name: Given name(s) converted to Title Case (e.g., 'Eun Sun')
+    - surname: Surname / Family name converted to Title Case
+    - given_name: Given name(s) converted to Title Case
     - dob: Date of birth in YYYY-MM-DD format
     - passport_number: Passport number in uppercase alphanumeric
     - gender: Sex of the person, strictly "F" or "M"
@@ -261,17 +262,13 @@ def extract_case_prep_info(tmpl_bytes, client_files):
     prompt = """
     You are an expert Canadian immigration case prep assistant.
     The FIRST document is a BLANK reference IRCC IMM form template.
-    The REMAINING attached documents are client materials (intake questionnaire, passport, work/study permit, visitor record, resume, WES, etc.).
+    The REMAINING attached documents are client materials.
 
     CRITICAL RULE FOR NAMES (Title Case):
-    ALWAYS convert any ALL CAPS names to Title Case. (e.g., convert "EUN SUN JUNG" to "Eun Sun Jung", "ALEXIS ANTONIO" to "Alexis Antonio").
+    ALWAYS convert any ALL CAPS names to Title Case.
 
-    CRITICAL RULE FOR "Current country or territory of residence" (Section 7 in Personal Details):
-    - Status, From date, and To date in this section MUST be extracted directly from the client's CURRENT PERMIT / VISA document (Work Permit, Study Permit, Visitor Record).
-      * Country/Territory: Canada
-      * Status: Worker / Student / Visitor (based on current permit type)
-      * From: Permit Issue / Effective Date
-      * To: Permit Expiry Date
+    CRITICAL RULE FOR "Current country or territory of residence":
+    - Status, From date, and To date in this section MUST be extracted directly from the client's CURRENT PERMIT / VISA document.
 
     CRITICAL RULE FOR CROSS-DOCUMENT MISMATCH DETECTION:
     Compare information across ALL client documents carefully.
@@ -356,22 +353,43 @@ def fill_consent_letter(template_bytes, data):
         for widget in page.widgets():
             fname = widget.field_name.strip() if widget.field_name else ""
             if not fname: continue
+            fname_lower = fname.lower()
+            
+            # 💡 수정 1: 모든 종류의 체크박스(alone, travel with 등)를 철저하게 탐지하고 "Off"로 강제 초기화
+            field_type_str = getattr(widget, "field_type_string", "").lower()
+            is_checkbox = ("check" in field_type_str or "radio" in field_type_str or 
+                           "check box" in fname_lower or "checkbox" in fname_lower or 
+                           "alone" in fname_lower)
+            if is_checkbox:
+                try:
+                    widget.field_value = "Off"  # PDF 표준 체크 해제 값
+                    widget.update()
+                except: pass
+                continue
             
             val_to_set = None
             if fname == "1": val_to_set = data.get("non_acc_name", "")
             elif fname == "2": val_to_set = data.get("non_acc_address", "")
             elif fname == "3": val_to_set = data.get("non_acc_phone", "")
             elif fname == "email": val_to_set = data.get("non_acc_email", "")
-            elif fname == "Check Box1": val_to_set = "0"
             elif fname == "This child or these children hashave my or our consent to travel with": val_to_set = data.get("acc_name", "")
             elif fname == "Relationship with Children 1": val_to_set = data.get("acc_relationship", "")
             elif fname == "Relationship with Children 2": val_to_set = data.get("acc_passport", "")
             elif fname == "I give my consent for this child to travel to": val_to_set = "Canada"
-            elif fname == "2_4": val_to_set = data.get("acc_name", "")
+            elif fname == "2_4" or fname_lower == "to stay with": val_to_set = data.get("acc_name", "")
             elif fname == "At the following addresses 1": val_to_set = data.get("trip_address", "")
             elif fname == "At the following addresses 2": val_to_set = data.get("trip_phone", "")
             elif fname == "email_2": val_to_set = data.get("trip_email", "")
             elif fname == "yyyymmdd_2": val_to_set = data.get("sign_date", "")
+            
+            # 💡 수정 2: 숨겨진 Travel Date ("1_4" 등) 필드 이름 완벽 매핑
+            elif fname == "1_4" or "travel date" in fname_lower or fname_lower == "date": 
+                val_to_set = f"{data.get('trip_start', '')} ~ {data.get('trip_end', '')}"
+            elif "from" in fname_lower or "departure" in fname_lower or "start date" in fname_lower: 
+                val_to_set = data.get("trip_start", "")
+            elif fname_lower == "to" or "return" in fname_lower or "end date" in fname_lower: 
+                val_to_set = data.get("trip_end", "")
+                
             else:
                 for idx, (name_key, dob_key) in enumerate(child_widgets):
                     if idx < len(page_children):
@@ -393,6 +411,7 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
     
     if is_jpeg:
         img = Image.open(io.BytesIO(file_bytes))
+        img = ImageOps.exif_transpose(img)
         if img.mode != "RGB":
             img = img.convert("RGB")
             
@@ -448,6 +467,7 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
             target_dpi = 150
             quality = 65
             img = Image.open(io.BytesIO(file_bytes))
+            img = ImageOps.exif_transpose(img)
             if img.mode != "RGB":
                 img = img.convert("RGB")
                 
@@ -528,7 +548,6 @@ if app_mode == MENU_1:
                 pdf_out = fill_imm5476(template_5476_bytes, final_data)
                 st.download_button("📥 다운로드", pdf_out, file_name=f"IMM5476_{surname}_{given}.pdf", mime="application/pdf")
         
-        # 💡 메뉴 1: 전체 리셋 버튼 추가
         st.markdown("---")
         if st.button("🔄 전체 리셋", type="secondary", use_container_width=True, key="reset_btn_m1"):
             for key in list(st.session_state.keys()):
@@ -611,6 +630,11 @@ elif app_mode == MENU_2:
     ct1, ct2 = st.columns(2)
     with ct1: trip_phone = st.text_input("현지 전화")
     with ct2: trip_email = st.text_input("현지 이메일")
+    
+    cd1, cd2 = st.columns(2)
+    with cd1: trip_start = st.date_input("여행 시작일 (From)", datetime.date.today())
+    with cd2: trip_end = st.date_input("여행 종료일 (To)", datetime.date.today() + datetime.timedelta(days=30))
+    
     sign_date_str = st.date_input("서명일", datetime.date.today()).strftime("%Y/%m/%d")
 
     if st.button("문서 생성 및 다운로드", type="primary"):
@@ -620,12 +644,24 @@ elif app_mode == MENU_2:
             data_consent = {
                 "non_acc_name": non_acc_name, "non_acc_address": non_acc_address, "non_acc_phone": non_acc_phone, "non_acc_email": non_acc_email,
                 "children": final_children, "acc_name": acc_name, "acc_relationship": acc_rel, "acc_passport": acc_passport,
-                "trip_address": trip_address, "trip_phone": trip_phone, "trip_email": trip_email, "sign_date": sign_date_str
+                "trip_address": trip_address, "trip_phone": trip_phone, "trip_email": trip_email, 
+                "trip_start": trip_start.strftime("%Y/%m/%d"), "trip_end": trip_end.strftime("%Y/%m/%d"),
+                "sign_date": sign_date_str
             }
             pdf_out = fill_consent_letter(consent_template_bytes, data_consent)
-            st.download_button("📥 다운로드", pdf_out, f"Consent_{non_acc_name}.pdf", "application/pdf")
             
-    # 💡 메뉴 2: 전체 리셋 버튼 추가
+            crm_name = "NAME"
+            if non_acc_name:
+                if re.search(r'[가-힣]', non_acc_name):
+                    crm_name = non_acc_name.replace(" ", "")
+                else:
+                    parts = non_acc_name.strip().split()
+                    if parts: crm_name = parts[0].capitalize()
+            
+            download_file_name = f"{crm_name}_Consent Letter for Children Travelling Abroad.pdf"
+            
+            st.download_button("📥 다운로드", pdf_out, download_file_name, "application/pdf")
+            
     st.markdown("---")
     if st.button("🔄 전체 리셋", type="secondary", use_container_width=True, key="reset_btn_m2"):
         for key in list(st.session_state.keys()):
@@ -787,6 +823,7 @@ elif app_mode == MENU_4:
                 else:
                     if page_counter > 40: continue
                     img = Image.open(io.BytesIO(file_bytes))
+                    img = ImageOps.exif_transpose(img)
                     if img.mode != "RGB": img = img.convert("RGB")
                     
                     preview = img.copy()
@@ -817,9 +854,10 @@ elif app_mode == MENU_4:
             Your task:
             1. Read ALL pages carefully.
             2. GROUP the pages that logically belong to the SAME document type for the SAME client. 
-               *CRITICAL MERGE RULE*: If you see multiple pages of BANK STATEMENTS, PAYSTUBS, or UTILITY BILLS for the SAME client (even if they are from different months, e.g., Jan, Feb, Mar), YOU MUST MERGE THEM ALL INTO ONE SINGLE GROUP. Do NOT split them by month. Put all their page numbers into a single `page_indices` array (e.g., `[1, 2, 3, 4, 5, 6]`).
+               *CRITICAL MERGE RULE*: If you see multiple pages of BANK STATEMENTS, PAYSTUBS, or UTILITY BILLS for the SAME client (even if they are from different months), YOU MUST MERGE THEM ALL INTO ONE SINGLE GROUP. Put all their page numbers into a single `page_indices` array.
                If Page 7 is a completely different document (like a Passport), create a separate group for it.
-            3. For EACH grouped document, generate an EXACT filename using our CRM rules.
+            3. ROTATION CHECK: For EACH page, check if the text is upside down or sideways. Determine the CLOCKWISE rotation (0, 90, 180, or 270) needed to make the text upright.
+            4. For EACH grouped document, generate an EXACT filename using our CRM rules.
 
             [CRITICAL NAMING RULES]
             1. Client Name: Korean (Full Name, no spaces). Non-Korean (VERY FIRST WORD of Given Name, Title Case).
@@ -837,10 +875,13 @@ elif app_mode == MENU_4:
             - Bank Statement: {{Name}}_Bank Statement_{{Year YYYY}}
             - Paystub: {{Name}}_Paystub_{{CompanyInEnglish}}_{{StartDate-EndDate}}
             - Resume: {{Name}}_Resume_{{ReceivedDate YYYY.MM.DD}}
-            - (Any other matching standard documents from manual)
             
             Return ONLY a raw JSON object:
             {{
+              "rotations": {{
+                "1": 0,
+                "2": 90
+              }},
               "documents": [
                 {{
                   "client_name": "...",
@@ -862,6 +903,7 @@ elif app_mode == MENU_4:
                 clean_text = response.text.strip().replace('```json', '').replace('```', '')
                 data = json.loads(clean_text)
                 raw_docs_info = data.get("documents", [])
+                rotations = data.get("rotations", {})
                 
                 docs_info = []
                 for d in raw_docs_info:
@@ -888,8 +930,9 @@ elif app_mode == MENU_4:
             except Exception as e:
                 st.error(f"AI 분석 중 오류가 발생했습니다: {e}")
                 docs_info = []
+                rotations = {}
 
-            status_text.text("3. 분석된 정보를 바탕으로 최종 서류 결합 및 압축 중입니다...")
+            status_text.text("3. 분석된 정보를 바탕으로 최종 서류 결합 및 회전/압축 중입니다...")
             progress_step = 1 / max(len(docs_info), 1)
 
             for idx, doc_info in enumerate(docs_info):
@@ -919,6 +962,15 @@ elif app_mode == MENU_4:
                     src_doc = fitz.open(stream=group_pages[0]["file_bytes"], filetype="pdf")
                     pdf_indices = [p["pdf_page_idx"] for p in group_pages]
                     src_doc.select(pdf_indices)  
+                    
+                    for i, p_data in enumerate(group_pages):
+                        try:
+                            rot = int(rotations.get(str(p_data["global_idx"]), 0))
+                            if rot != 0:
+                                page = src_doc[i]
+                                page.set_rotation((page.rotation + rot) % 360)
+                        except: pass
+                        
                     merged_pdf_bytes = io.BytesIO()
                     src_doc.save(merged_pdf_bytes, garbage=4, deflate=True)
                     src_doc.close()
@@ -926,13 +978,22 @@ elif app_mode == MENU_4:
                 else:
                     new_doc = fitz.open()
                     for p_data in group_pages:
+                        rot = 0
+                        try: rot = int(rotations.get(str(p_data["global_idx"]), 0))
+                        except: pass
+                        
                         if "pdf" in p_data["mime_type"].lower():
                             src_doc = fitz.open(stream=p_data["file_bytes"], filetype="pdf")
                             new_doc.insert_pdf(src_doc, from_page=p_data["pdf_page_idx"], to_page=p_data["pdf_page_idx"])
+                            if rot != 0:
+                                page = new_doc[-1]
+                                page.set_rotation((page.rotation + rot) % 360)
                             src_doc.close()
                         else:
                             img = Image.open(io.BytesIO(p_data["file_bytes"]))
+                            img = ImageOps.exif_transpose(img) 
                             if img.mode != "RGB": img = img.convert("RGB")
+                            if rot != 0: img = img.rotate(-rot, expand=True) 
                             img_buf = io.BytesIO()
                             img.save(img_buf, format="JPEG", quality=95)
                             pdf_page = new_doc.new_page(width=img.width, height=img.height)
@@ -946,7 +1007,15 @@ elif app_mode == MENU_4:
                 
                 if is_jpeg and len(indices) == 1:
                     p_data = group_pages[0]
-                    comp_bytes, out_mime = process_and_compress_file(p_data["file_bytes"], p_data["mime_type"], final_name)
+                    img = Image.open(io.BytesIO(p_data["file_bytes"]))
+                    img = ImageOps.exif_transpose(img)
+                    try:
+                        rot = int(rotations.get(str(p_data["global_idx"]), 0))
+                        if rot != 0: img = img.rotate(-rot, expand=True)
+                    except: pass
+                    img_buf = io.BytesIO()
+                    img.save(img_buf, format="JPEG", quality=95)
+                    comp_bytes, out_mime = process_and_compress_file(img_buf.getvalue(), "image/jpeg", final_name)
                     orig_bytes_len = len(p_data["file_bytes"])
                 else:
                     comp_bytes, out_mime = process_and_compress_file(merged_pdf_bytes, "application/pdf", final_name)
@@ -971,7 +1040,7 @@ elif app_mode == MENU_4:
                 
                 progress_bar.progress(min((idx + 1) * progress_step, 1.0))
                 
-            status_text.success("모든 서류의 묶기/분할 및 최적화가 완료되었습니다.")
+            status_text.success("모든 서류의 묶기/분할 및 스마트 회전 최적화가 완료되었습니다.")
             st.session_state.analysis_results = results
 
     if st.session_state.analysis_results:
