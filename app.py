@@ -115,15 +115,14 @@ def format_full_name(surname, given_name):
     return f"{g} {s}"
 
 def set_smart_widget_value(widget, value, default_fontsize=10, min_fontsize=5.5):
-    """기본 글자 크기를 10pt로 유지하되, 긴 이메일/주소 등 칸을 넘어서는 텍스트만 자동 축소"""
     val_str = str(value) if value is not None else ""
     widget.field_value = val_str
     
     if hasattr(widget, "field_flags") and widget.field_flags:
-        widget.field_flags &= ~1  # Read-Only 해제 (수정 가능)
+        widget.field_flags &= ~1 
         
     if val_str and hasattr(widget, "rect"):
-        box_width = widget.rect.width - 4  # 좌우 여백 제외
+        box_width = widget.rect.width - 4 
         if box_width > 0:
             try:
                 font = fitz.Font("helv")
@@ -169,7 +168,6 @@ def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
                 return images
         except:
             pass
-    
     return [{"mime_type": mime_type, "data": file_bytes}]
 
 def batch_process_client_files(client_files):
@@ -382,26 +380,45 @@ def fill_consent_letter(template_bytes, data):
     return output_pdf
 
 # ==========================================
-# 4. CRM 서류 판별 및 압축 변환 엔진 (4번 툴)
+# 4. CRM 서류 판별 및 자동 분할(Split) 엔진 (4번 툴)
 # ==========================================
-def analyze_document_with_crm_rules(file_bytes, mime_type, original_filename):
+def split_pdf_bytes(file_bytes, start_page, end_page):
+    """1-indexed 페이지 번호를 받아 PDF를 자르고 반환합니다."""
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    new_doc = fitz.open()
+    
+    start_idx = max(0, start_page - 1)
+    end_idx = min(len(doc) - 1, end_page - 1)
+    
+    for i in range(start_idx, end_idx + 1):
+        new_doc.insert_pdf(doc, from_page=i, to_page=i)
+        
+    output_pdf = io.BytesIO()
+    new_doc.save(output_pdf)
+    new_doc.close()
+    doc.close()
+    output_pdf.seek(0)
+    return output_pdf.getvalue()
+
+def analyze_and_split_crm_document(file_bytes, mime_type, original_filename):
     prompt = """
     You are an expert AI document classifier for a Canadian immigration firm.
-    Read the provided document carefully and generate an EXACT filename according to our STRICT internal CRM rules.
+    The attached file may contain a SINGLE document, or it may be a MERGED file containing MULTIPLE different documents (e.g., Page 1 is a Passport, Pages 2-3 are a Study Permit).
+    
+    Analyze ALL pages. Group consecutive pages that belong to the SAME document.
+    For EACH distinct document you identify, generate an EXACT filename according to our STRICT internal CRM rules.
 
     [CRITICAL NAMING RULES]
     1. Client Name:
        - Korean client: Full Name in Korean with NO SPACES (e.g., 홍길동, 김영미).
-       - Non-Korean client: STRICTLY the VERY FIRST WORD of their Given Name / First Name in Title Case. (e.g., If the name is "Janani SARATH BABU", extract "Janani"). Look very closely at fields like "Client personal details", "Given names", or "Applicant".
-       - ONLY if the document has absolutely ZERO text (like a blank Digital Photo), use the word "NAME". Otherwise, try your best to find the name.
-    2. Dates:
-       - Format MUST be YYYY.MM.DD (e.g., 2022.01.02).
-       - Year ONLY where specified in the manual (e.g., COI, Emedical, Bank Statement). For Emedical, look for the examination year (e.g., 2026).
-    3. Delimiter: Always use underscore '_' between Name, Category, Details, and Dates.
-    4. Unlisted Documents: If the document does NOT match any category in the manual list below, look at the TOP of the document to find its exact title in English.
+       - Non-Korean client: STRICTLY the VERY FIRST WORD of their Given Name / First Name in Title Case. (e.g., If name is "Janani SARATH BABU", extract "Janani").
+       - ONLY if the document has ZERO text (like a blank Digital Photo), use the word "NAME".
+    2. Dates: YYYY.MM.DD (e.g., 2022.01.02). Year ONLY where specified in the manual.
+    3. Delimiter: Always use underscore '_'
+    4. Unlisted Documents: If it doesn't match the list below, use its exact title in English.
 
     [MANUAL CATEGORY & FORMAT SPECIFICATIONS]
-    - Digital Photo / Passport Photo: {Name}_Digital Photo.jpg (MUST use .jpg extension)
+    - Digital Photo / Passport Photo: {Name}_Digital Photo.jpg
     - Passport: {Name}_PP_{ExpiryDate YYYY.MM.DD}
     - Work Permit: {Name}_WP_{ExpiryDate YYYY.MM.DD}
     - Study Permit: {Name}_SP_{ExpiryDate YYYY.MM.DD}
@@ -427,57 +444,73 @@ def analyze_document_with_crm_rules(file_bytes, mime_type, original_filename):
     - Tuition Receipt: {Name}_Tuition Receipt_{SchoolName}
     - Confirmation of Enrollment: {Name}_Confirmation of Enrollment_{SchoolName}
 
-    Return ONLY a raw JSON object with this format:
+    Return ONLY a raw JSON object with an array of documents:
     {
-        "client_name": "Extracted name",
-        "doc_category": "Category from manual OR exact title",
-        "suggested_filename": "Full_Generated_Filename_With_Correct_Extension"
+        "documents": [
+            {
+                "client_name": "Extracted name",
+                "doc_category": "Category or exact title",
+                "suggested_filename": "Full_Generated_Filename_With_Extension",
+                "start_page": 1,
+                "end_page": 2
+            }
+        ]
     }
+    NOTE: start_page and end_page are 1-indexed. If it's a 1-page document, start_page and end_page are both the same number.
+    If you see a Passport on Page 1, and a Bank Statement on Pages 2-4, return TWO distinct objects in the array.
     """
     
-    img_data = None
+    contents = [prompt]
+    num_pages = 1
+    
     if "pdf" in mime_type.lower():
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
-            page = doc.load_page(0)
-            pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=70)
-            img_data = {"mime_type": "image/jpeg", "data": buf.getvalue()}
+            num_pages = len(doc)
+            max_pages = min(num_pages, 30) # AI 부하 방지용 최대 30페이지 제한
+            
+            for page_num in range(max_pages):
+                page = doc.load_page(page_num)
+                pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=70)
+                
+                contents.append(f"--- Page {page_num + 1} ---")
+                contents.append({"mime_type": "image/jpeg", "data": buf.getvalue()})
             doc.close()
         except Exception:
-            return {"client_name": "NAME", "doc_category": "기타", "suggested_filename": f"NAME_미분류_{original_filename}"}
+            pass
     else:
         try:
             img = Image.open(io.BytesIO(file_bytes))
-            if img.mode != "RGB":
-                img = img.convert("RGB")
+            if img.mode != "RGB": img = img.convert("RGB")
             buf = io.BytesIO()
             if img.width > 2000:
                 ratio = 2000 / img.width
                 img = img.resize((2000, int(img.height * ratio)), Image.Resampling.LANCZOS)
             img.save(buf, format="JPEG", quality=75)
-            img_data = {"mime_type": "image/jpeg", "data": buf.getvalue()}
+            contents.append("--- Page 1 ---")
+            contents.append({"mime_type": "image/jpeg", "data": buf.getvalue()})
         except Exception:
-            img_data = {"mime_type": mime_type, "data": file_bytes}
+            contents.append({"mime_type": mime_type, "data": file_bytes})
 
     try:
-        response = safe_generate_content([prompt, img_data])
+        response = safe_generate_content(contents)
         clean_text = response.text.strip().replace('```json', '').replace('```', '')
         data = json.loads(clean_text)
-        
-        filename = data.get("suggested_filename", "NAME_미분류_서류.pdf")
-        if not (filename.lower().endswith(".pdf") or filename.lower().endswith(".jpg") or filename.lower().endswith(".jpeg")):
-            filename += ".pdf"
-            
-        data["suggested_filename"] = filename
-        return data
-        
+        return data.get("documents", []), num_pages
     except Exception as e:
         st.error(f"서류 분석 중 오류가 발생했습니다 ({original_filename}): {e}")
         base_name = os.path.splitext(original_filename)[0]
-        return {"client_name": "NAME", "doc_category": "기타", "suggested_filename": f"NAME_{base_name}.pdf"}
+        fallback = [{
+            "client_name": "NAME", 
+            "doc_category": "기타", 
+            "suggested_filename": f"NAME_{base_name}.pdf",
+            "start_page": 1,
+            "end_page": num_pages
+        }]
+        return fallback, num_pages
 
 def process_and_compress_file(file_bytes, mime_type, target_filename):
     is_jpeg = target_filename.lower().endswith(('.jpg', '.jpeg'))
@@ -794,7 +827,7 @@ elif app_mode == "📋 이민서류 정보 정리 (Case File Prep)":
 # ------------------------------------------
 elif app_mode == "🏷️ CRM 파일명 자동 생성 및 최적화":
     st.title("🏷️ CRM 파일명 자동 생성 및 최적화 도구")
-    st.caption("고객 서류 업로드 시 AI가 파일명을 규칙에 맞게 자동 생성하고 즉시 압축 변환합니다.")
+    st.caption("고객 서류 업로드 시 AI가 파일명을 규칙에 맞게 자동 생성하고, 병합된 여러 서류를 분할 및 최적화합니다.")
 
     if "uploader_key" not in st.session_state:
         st.session_state.uploader_key = str(uuid.uuid4())
@@ -802,54 +835,77 @@ elif app_mode == "🏷️ CRM 파일명 자동 생성 및 최적화":
         st.session_state.analysis_results = None
 
     uploaded_files = st.file_uploader(
-        "서류 업로드 (복수 선택 가능)", 
+        "서류 업로드 (단일 또는 병합된 PDF 모두 가능)", 
         type=['jpg', 'jpeg', 'png', 'pdf', 'heic'], 
         accept_multiple_files=True,
         key=st.session_state.uploader_key
     )
 
     if uploaded_files:
-        if st.button("서류 분석 및 최적화 시작", type="primary", use_container_width=True):
+        if st.button("서류 분석 및 자동 분할/최적화 시작", type="primary", use_container_width=True):
             results = []
             progress_bar = st.progress(0)
             status_text = st.empty()
             
             for idx, file in enumerate(uploaded_files):
-                status_text.text(f"서류 분석 및 압축 중 ({idx+1}/{len(uploaded_files)}): {file.name} - 잠시만 기다려 주세요...")
+                status_text.text(f"서류 분석 및 분할 중 ({idx+1}/{len(uploaded_files)}): {file.name} - 잠시만 기다려 주세요...")
                 file_bytes = file.getvalue()
                 mime_type = file.type if file.type else "application/pdf"
                 
-                analysis = analyze_document_with_crm_rules(file_bytes, mime_type, file.name)
-                final_name = analysis.get("suggested_filename", file.name)
+                # 📌 AI를 통한 문서 파악 및 분할 범위 리스트 추출
+                docs_info, total_pages = analyze_and_split_crm_document(file_bytes, mime_type, file.name)
                 
-                compressed_bytes, out_mime = process_and_compress_file(file_bytes, mime_type, final_name)
-                
-                orig_kb = len(file_bytes) / 1024
-                comp_kb = len(compressed_bytes) / 1024
-                
-                results.append({
-                    "original_name": file.name,
-                    "suggested_filename": final_name,
-                    "category": analysis.get("doc_category", "기타"),
-                    "client_name": analysis.get("client_name", ""),
-                    "mime": out_mime,
-                    "orig_kb": orig_kb,
-                    "comp_kb": comp_kb,
-                    "bytes": compressed_bytes
-                })
+                for doc_info in docs_info:
+                    final_name = doc_info.get("suggested_filename", file.name)
+                    
+                    # 확장자 보정
+                    if not (final_name.lower().endswith(".pdf") or final_name.lower().endswith(".jpg") or final_name.lower().endswith(".jpeg")):
+                        if "pdf" in mime_type.lower(): final_name += ".pdf"
+                        else: final_name += ".jpg"
+                            
+                    start_p = doc_info.get("start_page", 1)
+                    end_p = doc_info.get("end_page", total_pages)
+                    
+                    # PDF인 경우 AI가 지시한 페이지 구간만 잘라내기
+                    if "pdf" in mime_type.lower():
+                        split_bytes = split_pdf_bytes(file_bytes, start_p, end_p)
+                        current_mime = "application/pdf"
+                    else:
+                        split_bytes = file_bytes
+                        current_mime = mime_type
+                        
+                    # 잘라낸 파일을 압축 최적화 엔진에 전달
+                    compressed_bytes, out_mime = process_and_compress_file(split_bytes, current_mime, final_name)
+                    
+                    orig_kb = len(split_bytes) / 1024
+                    comp_kb = len(compressed_bytes) / 1024
+                    
+                    # UI 식별을 위한 페이지 라벨 추가
+                    page_label = f" (p.{start_p}-{end_p})" if ("pdf" in mime_type.lower() and total_pages > 1) else ""
+                    display_name = file.name + page_label
+                    
+                    results.append({
+                        "original_name": display_name,
+                        "suggested_filename": final_name,
+                        "category": doc_info.get("doc_category", "기타"),
+                        "client_name": doc_info.get("client_name", ""),
+                        "mime": out_mime,
+                        "orig_kb": orig_kb,
+                        "comp_kb": comp_kb,
+                        "bytes": compressed_bytes
+                    })
                 
                 progress_bar.progress((idx + 1) / len(uploaded_files))
-
                 if idx < len(uploaded_files) - 1:
                     time.sleep(1)
                 
-            status_text.success("모든 서류의 분석 및 최적화가 완료되었습니다.")
+            status_text.success("모든 서류의 스마트 분할 및 최적화가 완료되었습니다.")
             st.session_state.analysis_results = results
 
     if st.session_state.analysis_results:
         st.markdown("---")
         st.subheader("변환 완료된 서류 다운로드")
-        st.info("💡 파일명이 잘못 설정된 경우, 다운로드 버튼 옆 텍스트 입력창에서 직접 수정한 후 다운로드할 수 있습니다.")
+        st.info("💡 병합된 PDF는 AI가 인식한 서류 단위로 분할되었습니다. 파일명을 수정한 후 다운로드할 수 있습니다.")
         
         zip_buffer = io.BytesIO()
         final_downloads = []
@@ -858,7 +914,7 @@ elif app_mode == "🏷️ CRM 파일명 자동 생성 및 최적화":
             col1, col2, col3 = st.columns([3, 3, 2])
             
             with col1:
-                st.write(f"**원본**: `{item['original_name']}`")
+                st.write(f"**원본/구간**: `{item['original_name']}`")
                 st.caption(f"{item['orig_kb']:.1f} KB ➡️ **{item['comp_kb']:.1f} KB**")
                 
             with col2:
@@ -891,7 +947,6 @@ elif app_mode == "🏷️ CRM 파일명 자동 생성 및 최적화":
         )
 
         st.markdown("---")
-        # 📌 수정된 전체 리셋 로직: password_correct 키는 지우지 않고 유지하여 로그인 유지
         if st.button("🔄 전체 리셋", type="secondary", use_container_width=True):
             for key in list(st.session_state.keys()):
                 if key != "password_correct":
