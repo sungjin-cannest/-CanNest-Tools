@@ -1,4 +1,8 @@
 import streamlit as st
+
+# 📌 가장 먼저 실행되어야 하는 Streamlit 페이지 설정
+st.set_page_config(page_title="CanNest 통합 업무 시스템", layout="wide")
+
 import google.generativeai as genai
 import fitz  # PyMuPDF
 from PIL import Image
@@ -17,10 +21,8 @@ pillow_heif.register_heif_opener()
 Image.MAX_IMAGE_PIXELS = None
 
 # ==========================================
-# 0. 페이지 설정 및 보안 비밀번호
+# 0. Secrets 안전 검사 및 보안 비밀번호 설정
 # ==========================================
-st.set_page_config(page_title="CanNest 통합 업무 시스템", layout="wide")
-
 if "APP_PASSWORD" not in st.secrets or "GEMINI_API_KEY" not in st.secrets:
     st.error("⚠️ Streamlit Cloud의 Secrets 설정이 필요합니다.")
     st.info("우측 하단 [Manage app] -> [Settings] -> [Secrets]에 GEMINI_API_KEY와 APP_PASSWORD를 입력해 주세요.")
@@ -195,7 +197,7 @@ def is_minor(dob_str):
         return True
 
 # ==========================================
-# 3. PDF 서식 채우기 로직 (1, 2, 3번 툴)
+# 3. PDF 서식 채우기 로직
 # ==========================================
 def extract_imm5476_info(image):
     prompt = """
@@ -375,7 +377,7 @@ def fill_consent_letter(template_bytes, data):
     return output_pdf
 
 # ==========================================
-# 4. CRM 스마트 압축 엔진 (디지털 원본 보호 기능 탑재)
+# 4. CRM 스마트 압축 엔진 
 # ==========================================
 def process_and_compress_file(file_bytes, mime_type, target_filename):
     is_jpeg = target_filename.lower().endswith(('.jpg', '.jpeg'))
@@ -406,12 +408,10 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
                 if total_text_len > 50:
                     break
             
-            # 디지털 원본(텍스트 존재)이면 압축 생략 (용량 폭발 및 화질 저하 방지)
             if total_text_len > 50:
                 doc.close()
                 return file_bytes, "application/pdf"
             
-            # 스캔본 이미지 PDF면 압축 진행
             new_doc = fitz.open()
             target_dpi = 150
             quality = 65
@@ -465,7 +465,7 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
             return output_pdf.getvalue(), "application/pdf"
 
 # ==========================================
-# 5. Streamlit 네비게이션 및 UI 구성 
+# 5. Streamlit 네비게이션 및 UI 구성
 # ==========================================
 MENU_1 = "🍁 IMM5476 자동 작성"
 MENU_2 = "✈️ 한부모 동의서 자동 작성"
@@ -706,11 +706,11 @@ elif app_mode == MENU_3:
                 st.rerun()
 
 # ------------------------------------------
-# 메뉴 4: CRM 파일명 자동 생성 및 스마트 분할/병합
+# 메뉴 4: CRM 파일명 자동 생성 및 묶기/분할
 # ------------------------------------------
 elif app_mode == MENU_4:
     st.title(MENU_4)
-    st.caption("개별 낱장 이미지, 여러 장짜리 PDF 등을 섞어서 올려도 AI가 알아서 문서 단위로 묶거나 분할하여 CRM 파일명으로 최적화합니다.")
+    st.caption("개별 낱장 이미지, 여러 장짜리 통짜 PDF 등을 섞어서 올려도 AI가 알아서 문서 단위로 묶거나 분할하여 CRM 파일명으로 최적화합니다.")
 
     if "uploader_key" not in st.session_state:
         st.session_state.uploader_key = str(uuid.uuid4())
@@ -725,7 +725,7 @@ elif app_mode == MENU_4:
     )
 
     if uploaded_files:
-        if st.button("서류 분석 및 스마트 묶기/분할 시작", type="primary", use_container_width=True):
+        if st.button("서류 분석 및 묶기/분할 시작", type="primary", use_container_width=True):
             results = []
             status_text = st.empty()
             progress_bar = st.progress(0)
@@ -785,16 +785,16 @@ elif app_mode == MENU_4:
 
             status_text.text("2. AI가 페이지별 문맥을 분석하여 연관 서류를 묶거나 나누는 중입니다...")
             
-            # 💡 수정 포인트 1: AI 프롬프트에 '다장짜리 서류 분할 금지' 힌트 추가
+            # 💡 수정 1: AI에게 다개월치 은행 서류/급여 명세서는 무조건 합치라고 강력 지시
             prompt = f"""
             You are an expert AI document classifier for a Canadian immigration firm.
             I am providing {len(global_pages)} pages of documents uploaded by a client. 
             
             Your task:
             1. Read ALL pages carefully.
-            2. GROUP the pages that logically belong to the SAME document. 
-               *CRITICAL FOR MULTI-PAGE DOCUMENTS*: Look for page numbers like 'Page 1 of 3', matching logos, or continuous text layout. If consecutive pages are part of the SAME Bank Statement, Questionnaire, or Resume, DO NOT SPLIT THEM. Put them all in a single `page_indices` array (e.g., `[1, 2, 3]`).
-               If Page 4 is a completely different document (like a Passport), create a separate group for it.
+            2. GROUP the pages that logically belong to the SAME document type for the SAME client. 
+               *CRITICAL MERGE RULE*: If you see multiple pages of BANK STATEMENTS, PAYSTUBS, or UTILITY BILLS for the SAME client (even if they are from different months, e.g., Jan, Feb, Mar), YOU MUST MERGE THEM ALL INTO ONE SINGLE GROUP. Do NOT split them by month. Put all their page numbers into a single `page_indices` array (e.g., `[1, 2, 3, 4, 5, 6]`).
+               If Page 7 is a completely different document (like a Passport), create a separate group for it.
             3. For EACH grouped document, generate an EXACT filename using our CRM rules.
 
             [CRITICAL NAMING RULES]
@@ -811,6 +811,7 @@ elif app_mode == MENU_4:
             - Questionnaire: {{Name}}_QA_{{Type}}_{{ReceivedDate YYYY.MM.DD}}
             - Police Certificate: {{Name}}_Police Cert_{{CountryNameInEnglish}}
             - Bank Statement: {{Name}}_Bank Statement_{{Year YYYY}}
+            - Paystub: {{Name}}_Paystub_{{CompanyInEnglish}}_{{StartDate-EndDate}}
             - Resume: {{Name}}_Resume_{{ReceivedDate YYYY.MM.DD}}
             - (Any other matching standard documents from manual)
             
@@ -836,7 +837,34 @@ elif app_mode == MENU_4:
                 response = safe_generate_content(contents)
                 clean_text = response.text.strip().replace('```json', '').replace('```', '')
                 data = json.loads(clean_text)
-                docs_info = data.get("documents", [])
+                raw_docs_info = data.get("documents", [])
+                
+                # 💡 수정 2: 강제 병합 방어막(Safety Net) 극대화 
+                # AI가 파일명을 살짝 다르게 지어도, 같은 고객 & 같은 카테고리(은행/급여)면 무조건 강제로 합침!
+                docs_info = []
+                for d in raw_docs_info:
+                    c_name = d.get("client_name", "").strip()
+                    c_cat = d.get("doc_category", "").strip()
+                    
+                    existing = None
+                    for item in docs_info:
+                        # 조건 A: 파일 이름이 완전히 똑같은 경우 병합
+                        name1 = item.get("suggested_filename", "").replace(".pdf", "").replace(".jpg", "").strip()
+                        name2 = d.get("suggested_filename", "").replace(".pdf", "").replace(".jpg", "").strip()
+                        if name1 == name2:
+                            existing = item
+                            break
+                        # 조건 B: 다개월치 정기 서류(Bank Statement, Paystub 등)인데 고객명과 카테고리가 일치하는 경우 강제 병합
+                        if c_name and c_cat and c_name == item.get("client_name", "").strip() and c_cat == item.get("doc_category", "").strip():
+                            if "bank statement" in c_cat.lower() or "paystub" in c_cat.lower() or "statement" in c_cat.lower():
+                                existing = item
+                                break
+                                
+                    if existing:
+                        existing["page_indices"] = sorted(list(set(existing.get("page_indices", []) + d.get("page_indices", []))))
+                    else:
+                        docs_info.append(d)
+                        
             except Exception as e:
                 st.error(f"AI 분석 중 오류가 발생했습니다: {e}")
                 docs_info = []
@@ -864,21 +892,18 @@ elif app_mode == MENU_4:
                         if p_data["original_name"] not in source_names:
                             source_names.append(p_data["original_name"])
 
-                # 💡 수정 포인트 2: 잘라낼 페이지들이 모두 '동일한 1개의 PDF 원본'에서 나온 경우
-                # insert_pdf(복사/붙여넣기) 대신 select(불필요한 페이지만 삭제)를 사용하여 원본 용량과 폰트 정보를 100% 보존
                 unique_src_files = list(set([p["original_name"] for p in group_pages]))
                 is_all_from_same_pdf = (len(unique_src_files) == 1 and "pdf" in group_pages[0]["mime_type"].lower())
                 
                 if is_all_from_same_pdf:
                     src_doc = fitz.open(stream=group_pages[0]["file_bytes"], filetype="pdf")
                     pdf_indices = [p["pdf_page_idx"] for p in group_pages]
-                    src_doc.select(pdf_indices)  # 핵심: 필요한 페이지만 쏙 남기고 나머지 삭제
+                    src_doc.select(pdf_indices)  
                     merged_pdf_bytes = io.BytesIO()
                     src_doc.save(merged_pdf_bytes, garbage=4, deflate=True)
                     src_doc.close()
                     merged_pdf_bytes = merged_pdf_bytes.getvalue()
                 else:
-                    # 서로 다른 파일이나 이미지를 병합하는 경우 (기존 로직 유지)
                     new_doc = fitz.open()
                     for p_data in group_pages:
                         if "pdf" in p_data["mime_type"].lower():
@@ -914,7 +939,7 @@ elif app_mode == MENU_4:
                 if len(src_display) > 30: src_display = src_display[:27] + "..."
                 
                 results.append({
-                    "original_name": f"AI 분석결과 ({src_display})",
+                    "original_name": f"분석결과 ({src_display})",
                     "suggested_filename": final_name,
                     "category": doc_info.get("doc_category", "기타"),
                     "client_name": doc_info.get("client_name", ""),
@@ -926,7 +951,7 @@ elif app_mode == MENU_4:
                 
                 progress_bar.progress(min((idx + 1) * progress_step, 1.0))
                 
-            status_text.success("모든 서류의 스마트 묶기/분할 및 최적화가 완료되었습니다.")
+            status_text.success("모든 서류의 묶기/분할 및 최적화가 완료되었습니다.")
             st.session_state.analysis_results = results
 
     if st.session_state.analysis_results:
