@@ -355,11 +355,16 @@ def fill_consent_letter(template_bytes, data):
             if not fname: continue
             fname_lower = fname.lower()
             
-            # 💡 수정포인트: AttributeError 방지를 위해 버전 종속적인 상수 대신 범용 속성(문자열)으로 체크박스 검사
+            # 💡 수정 1: 모든 종류의 체크박스(alone, travel with 등)를 철저하게 탐지하고 "Off"로 강제 초기화
             field_type_str = getattr(widget, "field_type_string", "").lower()
-            if "check" in field_type_str or "radio" in field_type_str or "check box" in fname_lower or "checkbox" in fname_lower:
-                widget.field_value = False
-                widget.update()
+            is_checkbox = ("check" in field_type_str or "radio" in field_type_str or 
+                           "check box" in fname_lower or "checkbox" in fname_lower or 
+                           "alone" in fname_lower)
+            if is_checkbox:
+                try:
+                    widget.field_value = "Off"  # PDF 표준 체크 해제 값
+                    widget.update()
+                except: pass
                 continue
             
             val_to_set = None
@@ -371,14 +376,20 @@ def fill_consent_letter(template_bytes, data):
             elif fname == "Relationship with Children 1": val_to_set = data.get("acc_relationship", "")
             elif fname == "Relationship with Children 2": val_to_set = data.get("acc_passport", "")
             elif fname == "I give my consent for this child to travel to": val_to_set = "Canada"
-            elif fname == "2_4": val_to_set = data.get("acc_name", "")
+            elif fname == "2_4" or fname_lower == "to stay with": val_to_set = data.get("acc_name", "")
             elif fname == "At the following addresses 1": val_to_set = data.get("trip_address", "")
             elif fname == "At the following addresses 2": val_to_set = data.get("trip_phone", "")
             elif fname == "email_2": val_to_set = data.get("trip_email", "")
             elif fname == "yyyymmdd_2": val_to_set = data.get("sign_date", "")
-            elif "from" in fname_lower or "departure" in fname_lower or "start date" in fname_lower: val_to_set = data.get("trip_start", "")
-            elif fname_lower == "to" or "return" in fname_lower or "end date" in fname_lower: val_to_set = data.get("trip_end", "")
-            elif "travel date" in fname_lower: val_to_set = f"{data.get('trip_start', '')} ~ {data.get('trip_end', '')}"
+            
+            # 💡 수정 2: 숨겨진 Travel Date ("1_4" 등) 필드 이름 완벽 매핑
+            elif fname == "1_4" or "travel date" in fname_lower or fname_lower == "date": 
+                val_to_set = f"{data.get('trip_start', '')} ~ {data.get('trip_end', '')}"
+            elif "from" in fname_lower or "departure" in fname_lower or "start date" in fname_lower: 
+                val_to_set = data.get("trip_start", "")
+            elif fname_lower == "to" or "return" in fname_lower or "end date" in fname_lower: 
+                val_to_set = data.get("trip_end", "")
+                
             else:
                 for idx, (name_key, dob_key) in enumerate(child_widgets):
                     if idx < len(page_children):
