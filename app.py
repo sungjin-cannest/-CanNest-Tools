@@ -891,8 +891,10 @@ elif app_mode == "🏷️ CRM 파일명 자동 생성 및 최적화":
         )
 
         st.markdown("---")
+        # 📌 수정된 전체 리셋 로직: password_correct 키는 지우지 않고 유지하여 로그인 유지
         if st.button("🔄 전체 리셋", type="secondary", use_container_width=True):
             for key in list(st.session_state.keys()):
-                del st.session_state[key]
+                if key != "password_correct":
+                    del st.session_state[key]
             st.session_state.uploader_key = str(uuid.uuid4())
             st.rerun()
