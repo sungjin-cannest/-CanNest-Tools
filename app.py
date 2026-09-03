@@ -470,7 +470,7 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
 MENU_1 = "🍁 IMM5476 자동 작성"
 MENU_2 = "✈️ 한부모 동의서 자동 작성"
 MENU_3 = "📋 IMM서류 정보 정리"
-MENU_4 = "🏷️ CRM 파일명 생성 및 스마트 묶기/분할"
+MENU_4 = "🏷️ CRM 파일명 생성 및 묶기/분할"
 
 st.sidebar.title("🦅 CanNest Tool")
 app_mode = st.sidebar.radio("원하시는 업무 도구를 선택하세요", [MENU_1, MENU_2, MENU_3, MENU_4])
@@ -710,7 +710,7 @@ elif app_mode == MENU_3:
 # ------------------------------------------
 elif app_mode == MENU_4:
     st.title(MENU_4)
-    st.caption("개별 낱장 이미지, 여러 장짜리 통짜 PDF 등을 섞어서 올려도 AI가 알아서 문서 단위로 묶거나 분할하여 CRM 파일명으로 최적화합니다.")
+    st.caption("개별 낱장 이미지, 여러 장짜리 PDF 등을 섞어서 올려도 AI가 알아서 문서 단위로 묶거나 분할하여 CRM 파일명으로 최적화합니다.")
 
     if "uploader_key" not in st.session_state:
         st.session_state.uploader_key = str(uuid.uuid4())
@@ -932,7 +932,6 @@ elif app_mode == MENU_4:
     if st.session_state.analysis_results:
         st.markdown("---")
         st.subheader("변환 완료된 서류 다운로드")
-        st.info("💡 흩어져 있던 사진 파일이나 통짜 PDF가 AI 분석을 통해 개별 서류로 묶이거나 분할되었습니다.")
         
         zip_buffer = io.BytesIO()
         final_downloads = []
