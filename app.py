@@ -5,7 +5,7 @@ st.set_page_config(page_title="CanNest 통합 업무 시스템", layout="wide")
 
 import google.generativeai as genai
 import fitz  # PyMuPDF
-from PIL import Image
+from PIL import Image, ImageOps  # 💡 스마트폰 사진 방향 자동 교정을 위한 ImageOps 추가
 import pillow_heif  # HEIC 지원 라이브러리
 import io
 import zipfile
@@ -97,6 +97,7 @@ def process_uploaded_file_to_image(file_obj):
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     else:
         img = Image.open(file_obj)
+        img = ImageOps.exif_transpose(img) # 💡 자동 방향 교정 (EXIF 활용)
         if img.mode != "RGB":
             img = img.convert("RGB")
     
@@ -118,18 +119,23 @@ def format_full_name(surname, given_name):
     if not g: return s
     return f"{g} {s}"
 
-def set_smart_widget_value(widget, value, default_fontsize=10, min_fontsize=5.5):
+def set_smart_widget_value(widget, value, default_fontsize=11, min_fontsize=5.5):
     val_str = str(value) if value is not None else ""
     widget.field_value = val_str
     
     if hasattr(widget, "field_flags") and widget.field_flags:
         widget.field_flags &= ~1 
         
+    try:
+        widget.text_font = "Cour"
+    except:
+        pass
+        
     if val_str and hasattr(widget, "rect"):
         box_width = widget.rect.width - 4 
         if box_width > 0:
             try:
-                font = fitz.Font("helv")
+                font = fitz.Font("courier") 
                 len_at_default = font.text_length(val_str, fontsize=default_fontsize)
                 if len_at_default > box_width:
                     len_at_1 = font.text_length(val_str, fontsize=1)
@@ -197,14 +203,14 @@ def is_minor(dob_str):
         return True
 
 # ==========================================
-# 3. PDF 서식 채우기 로직
+# 3. PDF 서식 채우기 로직 
 # ==========================================
 def extract_imm5476_info(image):
     prompt = """
     Analyze this identity document (passport/permit/visa) carefully.
     Extract the following details into exact JSON structure:
-    - surname: Family name in English uppercase
-    - given_name: Given names in English uppercase
+    - surname: Family name converted to Title Case (First letter capitalized, e.g., 'KIM' -> 'Kim')
+    - given_name: Given names converted to Title Case (e.g., 'EUN SUN' -> 'Eun Sun')
     - dob: Date of birth in YYYY-MM-DD format
     - uci: UCI numbers only if present (10 digits or 8 digits), else empty string
     Return ONLY raw valid JSON object without markdown or code formatting.
@@ -223,11 +229,11 @@ def extract_all_passports_batch(has_non_acc, images):
     I am providing {len(images)} passport image(s) in exact order.
     Order structure:
     - {'Image 1 is the non-accompanying parent passport.' if has_non_acc else 'There is no non-accompanying parent passport provided.'}
-    - {'Remaining images (Image ' + ('2' if has_non_acc else '1') + f' to {len(images)}) are accompanying family members (parents or children).' if (len(images) > (1 if has_non_acc else 0)) else 'No family passports provided.'}
+    - {'Remaining images are accompanying family members.' if (len(images) > (1 if has_non_acc else 0)) else 'No family passports provided.'}
 
     For EACH passport image, extract:
-    - surname: Surname / Family name in English uppercase
-    - given_name: Given name(s) in English uppercase
+    - surname: Surname / Family name converted to Title Case
+    - given_name: Given name(s) converted to Title Case
     - dob: Date of birth in YYYY-MM-DD format
     - passport_number: Passport number in uppercase alphanumeric
     - gender: Sex of the person, strictly "F" or "M"
@@ -255,14 +261,13 @@ def extract_case_prep_info(tmpl_bytes, client_files):
     prompt = """
     You are an expert Canadian immigration case prep assistant.
     The FIRST document is a BLANK reference IRCC IMM form template.
-    The REMAINING attached documents are client materials (intake questionnaire, passport, work/study permit, visitor record, resume, WES, etc.).
+    The REMAINING attached documents are client materials.
 
-    CRITICAL RULE FOR "Current country or territory of residence" (Section 7 in Personal Details):
-    - Status, From date, and To date in this section MUST be extracted directly from the client's CURRENT PERMIT / VISA document (Work Permit, Study Permit, Visitor Record).
-      * Country/Territory: Canada
-      * Status: Worker / Student / Visitor (based on current permit type)
-      * From: Permit Issue / Effective Date
-      * To: Permit Expiry Date
+    CRITICAL RULE FOR NAMES (Title Case):
+    ALWAYS convert any ALL CAPS names to Title Case.
+
+    CRITICAL RULE FOR "Current country or territory of residence":
+    - Status, From date, and To date in this section MUST be extracted directly from the client's CURRENT PERMIT / VISA document.
 
     CRITICAL RULE FOR CROSS-DOCUMENT MISMATCH DETECTION:
     Compare information across ALL client documents carefully.
@@ -327,7 +332,7 @@ def fill_imm5476(template_bytes, data):
                 if date_counter == 1: val_to_set = target_data["signDate"]
                 
             if val_to_set is not None:
-                set_smart_widget_value(widget, val_to_set, default_fontsize=10)
+                set_smart_widget_value(widget, val_to_set, default_fontsize=11)
 
     output_pdf = io.BytesIO()
     doc.save(output_pdf); doc.close(); output_pdf.seek(0)
@@ -370,20 +375,21 @@ def fill_consent_letter(template_bytes, data):
                         elif fname == dob_key: val_to_set = page_children[idx].get("dob", "")
             
             if val_to_set is not None:
-                set_smart_widget_value(widget, val_to_set, default_fontsize=10)
+                set_smart_widget_value(widget, val_to_set, default_fontsize=11)
 
     output_pdf = io.BytesIO()
     doc.save(output_pdf); doc.close(); output_pdf.seek(0)
     return output_pdf
 
 # ==========================================
-# 4. CRM 스마트 압축 엔진 
+# 4. CRM 스마트 압축 엔진
 # ==========================================
 def process_and_compress_file(file_bytes, mime_type, target_filename):
     is_jpeg = target_filename.lower().endswith(('.jpg', '.jpeg'))
     
     if is_jpeg:
         img = Image.open(io.BytesIO(file_bytes))
+        img = ImageOps.exif_transpose(img)
         if img.mode != "RGB":
             img = img.convert("RGB")
             
@@ -439,6 +445,7 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
             target_dpi = 150
             quality = 65
             img = Image.open(io.BytesIO(file_bytes))
+            img = ImageOps.exif_transpose(img)
             if img.mode != "RGB":
                 img = img.convert("RGB")
                 
@@ -518,6 +525,13 @@ if app_mode == MENU_1:
                 final_data = {"surname": surname, "given_name": given, "dob": dob, "uci": uci, "email": email, "signDate": sign_date.strftime("%Y-%m-%d")}
                 pdf_out = fill_imm5476(template_5476_bytes, final_data)
                 st.download_button("📥 다운로드", pdf_out, file_name=f"IMM5476_{surname}_{given}.pdf", mime="application/pdf")
+        
+        st.markdown("---")
+        if st.button("🔄 전체 리셋", type="secondary", use_container_width=True, key="reset_btn_m1"):
+            for key in list(st.session_state.keys()):
+                if key != "password_correct":
+                    del st.session_state[key]
+            st.rerun()
 
 # ------------------------------------------
 # 메뉴 2: 한부모 동의서 자동 작성
@@ -607,6 +621,13 @@ elif app_mode == MENU_2:
             }
             pdf_out = fill_consent_letter(consent_template_bytes, data_consent)
             st.download_button("📥 다운로드", pdf_out, f"Consent_{non_acc_name}.pdf", "application/pdf")
+            
+    st.markdown("---")
+    if st.button("🔄 전체 리셋", type="secondary", use_container_width=True, key="reset_btn_m2"):
+        for key in list(st.session_state.keys()):
+            if key != "password_correct":
+                del st.session_state[key]
+        st.rerun()
 
 # ------------------------------------------
 # 메뉴 3: 이민서류 정보 정리 (Case File Prep)
@@ -762,6 +783,7 @@ elif app_mode == MENU_4:
                 else:
                     if page_counter > 40: continue
                     img = Image.open(io.BytesIO(file_bytes))
+                    img = ImageOps.exif_transpose(img) # 💡 자동 방향 교정 (EXIF)
                     if img.mode != "RGB": img = img.convert("RGB")
                     
                     preview = img.copy()
@@ -783,9 +805,8 @@ elif app_mode == MENU_4:
             if page_counter > 40:
                 st.warning("⚠️ 업로드된 총 페이지 수가 40장을 초과하여, 앞의 40장까지만 분석 및 병합합니다.")
 
-            status_text.text("2. AI가 페이지별 문맥을 분석하여 연관 서류를 묶거나 나누는 중입니다...")
+            status_text.text("2. AI가 페이지별 문맥을 분석하여 연관 서류를 묶거나 방향을 바로잡는 중입니다...")
             
-            # 💡 수정 1: AI에게 다개월치 은행 서류/급여 명세서는 무조건 합치라고 강력 지시
             prompt = f"""
             You are an expert AI document classifier for a Canadian immigration firm.
             I am providing {len(global_pages)} pages of documents uploaded by a client. 
@@ -793,9 +814,9 @@ elif app_mode == MENU_4:
             Your task:
             1. Read ALL pages carefully.
             2. GROUP the pages that logically belong to the SAME document type for the SAME client. 
-               *CRITICAL MERGE RULE*: If you see multiple pages of BANK STATEMENTS, PAYSTUBS, or UTILITY BILLS for the SAME client (even if they are from different months, e.g., Jan, Feb, Mar), YOU MUST MERGE THEM ALL INTO ONE SINGLE GROUP. Do NOT split them by month. Put all their page numbers into a single `page_indices` array (e.g., `[1, 2, 3, 4, 5, 6]`).
-               If Page 7 is a completely different document (like a Passport), create a separate group for it.
-            3. For EACH grouped document, generate an EXACT filename using our CRM rules.
+               *CRITICAL MERGE RULE*: If you see multiple pages of BANK STATEMENTS, PAYSTUBS, or UTILITY BILLS for the SAME client (even if they are from different months), YOU MUST MERGE THEM ALL INTO ONE SINGLE GROUP. Put all their page numbers into a single `page_indices` array.
+            3. ROTATION CHECK: For EACH page, check if the text is upside down or sideways. Determine the CLOCKWISE rotation (0, 90, 180, or 270) needed to make the text upright.
+            4. For EACH grouped document, generate an EXACT filename using our CRM rules.
 
             [CRITICAL NAMING RULES]
             1. Client Name: Korean (Full Name, no spaces). Non-Korean (VERY FIRST WORD of Given Name, Title Case).
@@ -813,10 +834,13 @@ elif app_mode == MENU_4:
             - Bank Statement: {{Name}}_Bank Statement_{{Year YYYY}}
             - Paystub: {{Name}}_Paystub_{{CompanyInEnglish}}_{{StartDate-EndDate}}
             - Resume: {{Name}}_Resume_{{ReceivedDate YYYY.MM.DD}}
-            - (Any other matching standard documents from manual)
             
             Return ONLY a raw JSON object:
             {{
+              "rotations": {{
+                "1": 0,
+                "2": 90
+              }},
               "documents": [
                 {{
                   "client_name": "...",
@@ -838,9 +862,8 @@ elif app_mode == MENU_4:
                 clean_text = response.text.strip().replace('```json', '').replace('```', '')
                 data = json.loads(clean_text)
                 raw_docs_info = data.get("documents", [])
+                rotations = data.get("rotations", {})
                 
-                # 💡 수정 2: 강제 병합 방어막(Safety Net) 극대화 
-                # AI가 파일명을 살짝 다르게 지어도, 같은 고객 & 같은 카테고리(은행/급여)면 무조건 강제로 합침!
                 docs_info = []
                 for d in raw_docs_info:
                     c_name = d.get("client_name", "").strip()
@@ -848,13 +871,11 @@ elif app_mode == MENU_4:
                     
                     existing = None
                     for item in docs_info:
-                        # 조건 A: 파일 이름이 완전히 똑같은 경우 병합
                         name1 = item.get("suggested_filename", "").replace(".pdf", "").replace(".jpg", "").strip()
                         name2 = d.get("suggested_filename", "").replace(".pdf", "").replace(".jpg", "").strip()
                         if name1 == name2:
                             existing = item
                             break
-                        # 조건 B: 다개월치 정기 서류(Bank Statement, Paystub 등)인데 고객명과 카테고리가 일치하는 경우 강제 병합
                         if c_name and c_cat and c_name == item.get("client_name", "").strip() and c_cat == item.get("doc_category", "").strip():
                             if "bank statement" in c_cat.lower() or "paystub" in c_cat.lower() or "statement" in c_cat.lower():
                                 existing = item
@@ -868,8 +889,9 @@ elif app_mode == MENU_4:
             except Exception as e:
                 st.error(f"AI 분석 중 오류가 발생했습니다: {e}")
                 docs_info = []
+                rotations = {}
 
-            status_text.text("3. 분석된 정보를 바탕으로 최종 서류를 결합 및 압축 중입니다...")
+            status_text.text("3. 분석된 정보를 바탕으로 최종 서류 결합 및 회전/압축 중입니다...")
             progress_step = 1 / max(len(docs_info), 1)
 
             for idx, doc_info in enumerate(docs_info):
@@ -899,6 +921,16 @@ elif app_mode == MENU_4:
                     src_doc = fitz.open(stream=group_pages[0]["file_bytes"], filetype="pdf")
                     pdf_indices = [p["pdf_page_idx"] for p in group_pages]
                     src_doc.select(pdf_indices)  
+                    
+                    # 💡 AI 스마트 회전 적용
+                    for i, p_data in enumerate(group_pages):
+                        try:
+                            rot = int(rotations.get(str(p_data["global_idx"]), 0))
+                            if rot != 0:
+                                page = src_doc[i]
+                                page.set_rotation((page.rotation + rot) % 360)
+                        except: pass
+                        
                     merged_pdf_bytes = io.BytesIO()
                     src_doc.save(merged_pdf_bytes, garbage=4, deflate=True)
                     src_doc.close()
@@ -906,13 +938,22 @@ elif app_mode == MENU_4:
                 else:
                     new_doc = fitz.open()
                     for p_data in group_pages:
+                        rot = 0
+                        try: rot = int(rotations.get(str(p_data["global_idx"]), 0))
+                        except: pass
+                        
                         if "pdf" in p_data["mime_type"].lower():
                             src_doc = fitz.open(stream=p_data["file_bytes"], filetype="pdf")
                             new_doc.insert_pdf(src_doc, from_page=p_data["pdf_page_idx"], to_page=p_data["pdf_page_idx"])
+                            if rot != 0:
+                                page = new_doc[-1]
+                                page.set_rotation((page.rotation + rot) % 360)
                             src_doc.close()
                         else:
                             img = Image.open(io.BytesIO(p_data["file_bytes"]))
+                            img = ImageOps.exif_transpose(img) # EXIF 회전
                             if img.mode != "RGB": img = img.convert("RGB")
+                            if rot != 0: img = img.rotate(-rot, expand=True) # AI 회전 적용
                             img_buf = io.BytesIO()
                             img.save(img_buf, format="JPEG", quality=95)
                             pdf_page = new_doc.new_page(width=img.width, height=img.height)
@@ -926,7 +967,16 @@ elif app_mode == MENU_4:
                 
                 if is_jpeg and len(indices) == 1:
                     p_data = group_pages[0]
-                    comp_bytes, out_mime = process_and_compress_file(p_data["file_bytes"], p_data["mime_type"], final_name)
+                    # 이미지 회전 보정
+                    img = Image.open(io.BytesIO(p_data["file_bytes"]))
+                    img = ImageOps.exif_transpose(img)
+                    try:
+                        rot = int(rotations.get(str(p_data["global_idx"]), 0))
+                        if rot != 0: img = img.rotate(-rot, expand=True)
+                    except: pass
+                    img_buf = io.BytesIO()
+                    img.save(img_buf, format="JPEG", quality=95)
+                    comp_bytes, out_mime = process_and_compress_file(img_buf.getvalue(), "image/jpeg", final_name)
                     orig_bytes_len = len(p_data["file_bytes"])
                 else:
                     comp_bytes, out_mime = process_and_compress_file(merged_pdf_bytes, "application/pdf", final_name)
@@ -951,7 +1001,7 @@ elif app_mode == MENU_4:
                 
                 progress_bar.progress(min((idx + 1) * progress_step, 1.0))
                 
-            status_text.success("모든 서류의 묶기/분할 및 최적화가 완료되었습니다.")
+            status_text.success("모든 서류의 묶기/분할 및 스마트 회전 최적화가 완료되었습니다.")
             st.session_state.analysis_results = results
 
     if st.session_state.analysis_results:
