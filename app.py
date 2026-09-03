@@ -834,4 +834,149 @@ elif app_mode == MENU_4:
             
             try:
                 response = safe_generate_content(contents)
-                clean_text = response.text.strip().replace('```json', '').replace('
+                clean_text = response.text.strip().replace('```json', '').replace('```', '')
+                data = json.loads(clean_text)
+                docs_info = data.get("documents", [])
+            except Exception as e:
+                st.error(f"AI 분석 중 오류가 발생했습니다: {e}")
+                docs_info = []
+
+            status_text.text("3. 분석된 정보를 바탕으로 최종 서류를 결합 및 압축 중입니다...")
+            progress_step = 1 / max(len(docs_info), 1)
+
+            for idx, doc_info in enumerate(docs_info):
+                indices = doc_info.get("page_indices", [])
+                if not indices: continue
+                
+                final_name = doc_info.get("suggested_filename", f"Document_{idx+1}")
+                if not (final_name.lower().endswith(".pdf") or final_name.lower().endswith(".jpg") or final_name.lower().endswith(".jpeg")):
+                    if "photo" in final_name.lower() and len(indices) == 1:
+                        final_name += ".jpg"
+                    else:
+                        final_name += ".pdf"
+                        
+                source_names = []
+                group_pages = []
+                for p_idx in indices:
+                    p_data = next((p for p in global_pages if p['global_idx'] == p_idx), None)
+                    if p_data:
+                        group_pages.append(p_data)
+                        if p_data["original_name"] not in source_names:
+                            source_names.append(p_data["original_name"])
+
+                # 💡 수정 포인트 2: 잘라낼 페이지들이 모두 '동일한 1개의 PDF 원본'에서 나온 경우
+                # insert_pdf(복사/붙여넣기) 대신 select(불필요한 페이지만 삭제)를 사용하여 원본 용량과 폰트 정보를 100% 보존
+                unique_src_files = list(set([p["original_name"] for p in group_pages]))
+                is_all_from_same_pdf = (len(unique_src_files) == 1 and "pdf" in group_pages[0]["mime_type"].lower())
+                
+                if is_all_from_same_pdf:
+                    src_doc = fitz.open(stream=group_pages[0]["file_bytes"], filetype="pdf")
+                    pdf_indices = [p["pdf_page_idx"] for p in group_pages]
+                    src_doc.select(pdf_indices)  # 핵심: 필요한 페이지만 쏙 남기고 나머지 삭제
+                    merged_pdf_bytes = io.BytesIO()
+                    src_doc.save(merged_pdf_bytes, garbage=4, deflate=True)
+                    src_doc.close()
+                    merged_pdf_bytes = merged_pdf_bytes.getvalue()
+                else:
+                    # 서로 다른 파일이나 이미지를 병합하는 경우 (기존 로직 유지)
+                    new_doc = fitz.open()
+                    for p_data in group_pages:
+                        if "pdf" in p_data["mime_type"].lower():
+                            src_doc = fitz.open(stream=p_data["file_bytes"], filetype="pdf")
+                            new_doc.insert_pdf(src_doc, from_page=p_data["pdf_page_idx"], to_page=p_data["pdf_page_idx"])
+                            src_doc.close()
+                        else:
+                            img = Image.open(io.BytesIO(p_data["file_bytes"]))
+                            if img.mode != "RGB": img = img.convert("RGB")
+                            img_buf = io.BytesIO()
+                            img.save(img_buf, format="JPEG", quality=95)
+                            pdf_page = new_doc.new_page(width=img.width, height=img.height)
+                            pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
+                    merged_pdf_bytes = io.BytesIO()
+                    new_doc.save(merged_pdf_bytes)
+                    new_doc.close()
+                    merged_pdf_bytes = merged_pdf_bytes.getvalue()
+                
+                is_jpeg = final_name.lower().endswith(('.jpg', '.jpeg'))
+                
+                if is_jpeg and len(indices) == 1:
+                    p_data = group_pages[0]
+                    comp_bytes, out_mime = process_and_compress_file(p_data["file_bytes"], p_data["mime_type"], final_name)
+                    orig_bytes_len = len(p_data["file_bytes"])
+                else:
+                    comp_bytes, out_mime = process_and_compress_file(merged_pdf_bytes, "application/pdf", final_name)
+                    orig_bytes_len = len(merged_pdf_bytes)
+                    
+                orig_kb = orig_bytes_len / 1024
+                comp_kb = len(comp_bytes) / 1024
+                
+                src_display = ", ".join(source_names)
+                if len(src_display) > 30: src_display = src_display[:27] + "..."
+                
+                results.append({
+                    "original_name": f"AI 분석결과 ({src_display})",
+                    "suggested_filename": final_name,
+                    "category": doc_info.get("doc_category", "기타"),
+                    "client_name": doc_info.get("client_name", ""),
+                    "mime": out_mime,
+                    "orig_kb": orig_kb,
+                    "comp_kb": comp_kb,
+                    "bytes": comp_bytes
+                })
+                
+                progress_bar.progress(min((idx + 1) * progress_step, 1.0))
+                
+            status_text.success("모든 서류의 스마트 묶기/분할 및 최적화가 완료되었습니다.")
+            st.session_state.analysis_results = results
+
+    if st.session_state.analysis_results:
+        st.markdown("---")
+        st.subheader("변환 완료된 서류 다운로드")
+        st.info("💡 흩어져 있던 사진 파일이나 통짜 PDF가 AI 분석을 통해 개별 서류로 묶이거나 분할되었습니다.")
+        
+        zip_buffer = io.BytesIO()
+        final_downloads = []
+        
+        for idx, item in enumerate(st.session_state.analysis_results):
+            col1, col2, col3 = st.columns([3, 3, 2])
+            
+            with col1:
+                st.write(f"**출처**: `{item['original_name']}`")
+                st.caption(f"{item['orig_kb']:.1f} KB ➡️ **{item['comp_kb']:.1f} KB**")
+                
+            with col2:
+                user_edited_name = st.text_input(
+                    "파일명", 
+                    value=item['suggested_filename'], 
+                    key=f"edit_{idx}",
+                    label_visibility="collapsed"
+                )
+                final_downloads.append((user_edited_name, item['bytes'], item['mime']))
+                
+            with col3:
+                st.download_button("⬇️ 개별 다운로드", data=item['bytes'], file_name=user_edited_name, mime=item['mime'], key=f"dl_btn_{idx}")
+                
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            for fname, fbytes, _ in final_downloads:
+                zip_file.writestr(fname, fbytes)
+                
+        zip_buffer.seek(0)
+        today_str = datetime.date.today().strftime("%Y%m%d")
+        
+        st.markdown("---")
+        st.download_button(
+            "📦 전체 서류 ZIP 다운로드",
+            data=zip_buffer,
+            file_name=f"CRM_Documents_{today_str}.zip",
+            mime="application/zip",
+            type="primary",
+            use_container_width=True
+        )
+
+        st.markdown("---")
+        if st.button("🔄 전체 리셋", type="secondary", use_container_width=True):
+            for key in list(st.session_state.keys()):
+                if key != "password_correct":
+                    del st.session_state[key]
+            st.session_state.uploader_key = str(uuid.uuid4())
+            st.rerun()
