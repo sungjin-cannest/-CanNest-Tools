@@ -14,6 +14,7 @@ import os
 import datetime
 import time
 import uuid
+import re  # 💡 파일명 언어 판별을 위한 정규식 모듈 추가
 from concurrent.futures import ThreadPoolExecutor
 
 # HEIC 이미지 지원 등록 및 고해상도 제한 해제
@@ -352,13 +353,19 @@ def fill_consent_letter(template_bytes, data):
         for widget in page.widgets():
             fname = widget.field_name.strip() if widget.field_name else ""
             if not fname: continue
+            fname_lower = fname.lower()
+            
+            # 원치 않는 체크박스 강제 해제
+            if widget.field_type in [fitz.PDF_WIDGET_TYPE_CHECKBOX, fitz.PDF_WIDGET_TYPE_RADIO] or "check box" in fname_lower or "checkbox" in fname_lower:
+                widget.field_value = False
+                widget.update()
+                continue
             
             val_to_set = None
             if fname == "1": val_to_set = data.get("non_acc_name", "")
             elif fname == "2": val_to_set = data.get("non_acc_address", "")
             elif fname == "3": val_to_set = data.get("non_acc_phone", "")
             elif fname == "email": val_to_set = data.get("non_acc_email", "")
-            elif fname == "Check Box1": val_to_set = "0"
             elif fname == "This child or these children hashave my or our consent to travel with": val_to_set = data.get("acc_name", "")
             elif fname == "Relationship with Children 1": val_to_set = data.get("acc_relationship", "")
             elif fname == "Relationship with Children 2": val_to_set = data.get("acc_passport", "")
@@ -368,9 +375,9 @@ def fill_consent_letter(template_bytes, data):
             elif fname == "At the following addresses 2": val_to_set = data.get("trip_phone", "")
             elif fname == "email_2": val_to_set = data.get("trip_email", "")
             elif fname == "yyyymmdd_2": val_to_set = data.get("sign_date", "")
-            # 💡 새롭게 추가된 여행 날짜 매핑 (from / to 인식)
-            elif fname.lower() in ["from", "date of departure"]: val_to_set = data.get("trip_start", "")
-            elif fname.lower() in ["to", "date of return"]: val_to_set = data.get("trip_end", "")
+            elif "from" in fname_lower or "departure" in fname_lower or "start date" in fname_lower: val_to_set = data.get("trip_start", "")
+            elif fname_lower == "to" or "return" in fname_lower or "end date" in fname_lower: val_to_set = data.get("trip_end", "")
+            elif "travel date" in fname_lower: val_to_set = f"{data.get('trip_start', '')} ~ {data.get('trip_end', '')}"
             else:
                 for idx, (name_key, dob_key) in enumerate(child_widgets):
                     if idx < len(page_children):
@@ -612,7 +619,6 @@ elif app_mode == MENU_2:
     with ct1: trip_phone = st.text_input("현지 전화")
     with ct2: trip_email = st.text_input("현지 이메일")
     
-    # 💡 신규 추가: 여행 시작일(From) / 종료일(To)
     cd1, cd2 = st.columns(2)
     with cd1: trip_start = st.date_input("여행 시작일 (From)", datetime.date.today())
     with cd2: trip_end = st.date_input("여행 종료일 (To)", datetime.date.today() + datetime.timedelta(days=30))
@@ -627,11 +633,23 @@ elif app_mode == MENU_2:
                 "non_acc_name": non_acc_name, "non_acc_address": non_acc_address, "non_acc_phone": non_acc_phone, "non_acc_email": non_acc_email,
                 "children": final_children, "acc_name": acc_name, "acc_relationship": acc_rel, "acc_passport": acc_passport,
                 "trip_address": trip_address, "trip_phone": trip_phone, "trip_email": trip_email, 
-                "trip_start": trip_start.strftime("%Y/%m/%d"), "trip_end": trip_end.strftime("%Y/%m/%d"), # 날짜 데이터 전달
+                "trip_start": trip_start.strftime("%Y/%m/%d"), "trip_end": trip_end.strftime("%Y/%m/%d"),
                 "sign_date": sign_date_str
             }
             pdf_out = fill_consent_letter(consent_template_bytes, data_consent)
-            st.download_button("📥 다운로드", pdf_out, f"Consent_{non_acc_name}.pdf", "application/pdf")
+            
+            # 💡 CRM 규칙에 따른 스마트 파일명 생성 로직
+            crm_name = "NAME"
+            if non_acc_name:
+                if re.search(r'[가-힣]', non_acc_name):
+                    crm_name = non_acc_name.replace(" ", "")
+                else:
+                    parts = non_acc_name.strip().split()
+                    if parts: crm_name = parts[0].capitalize()
+            
+            download_file_name = f"{crm_name}_Consent Letter for Children Travelling Abroad.pdf"
+            
+            st.download_button("📥 다운로드", pdf_out, download_file_name, "application/pdf")
             
     st.markdown("---")
     if st.button("🔄 전체 리셋", type="secondary", use_container_width=True, key="reset_btn_m2"):
