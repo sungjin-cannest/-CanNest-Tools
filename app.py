@@ -5,7 +5,7 @@ st.set_page_config(page_title="CanNest 통합 업무 시스템", layout="wide")
 
 import google.generativeai as genai
 import fitz  # PyMuPDF
-from PIL import Image, ImageOps  # 💡 스마트폰 사진 방향 자동 교정을 위한 ImageOps 추가
+from PIL import Image, ImageOps
 import pillow_heif  # HEIC 지원 라이브러리
 import io
 import zipfile
@@ -97,7 +97,7 @@ def process_uploaded_file_to_image(file_obj):
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     else:
         img = Image.open(file_obj)
-        img = ImageOps.exif_transpose(img) # 💡 자동 방향 교정 (EXIF 활용)
+        img = ImageOps.exif_transpose(img)
         if img.mode != "RGB":
             img = img.convert("RGB")
     
@@ -203,7 +203,7 @@ def is_minor(dob_str):
         return True
 
 # ==========================================
-# 3. PDF 서식 채우기 로직 
+# 3. PDF 서식 채우기 로직
 # ==========================================
 def extract_imm5476_info(image):
     prompt = """
@@ -368,6 +368,9 @@ def fill_consent_letter(template_bytes, data):
             elif fname == "At the following addresses 2": val_to_set = data.get("trip_phone", "")
             elif fname == "email_2": val_to_set = data.get("trip_email", "")
             elif fname == "yyyymmdd_2": val_to_set = data.get("sign_date", "")
+            # 💡 새롭게 추가된 여행 날짜 매핑 (from / to 인식)
+            elif fname.lower() in ["from", "date of departure"]: val_to_set = data.get("trip_start", "")
+            elif fname.lower() in ["to", "date of return"]: val_to_set = data.get("trip_end", "")
             else:
                 for idx, (name_key, dob_key) in enumerate(child_widgets):
                     if idx < len(page_children):
@@ -608,6 +611,12 @@ elif app_mode == MENU_2:
     ct1, ct2 = st.columns(2)
     with ct1: trip_phone = st.text_input("현지 전화")
     with ct2: trip_email = st.text_input("현지 이메일")
+    
+    # 💡 신규 추가: 여행 시작일(From) / 종료일(To)
+    cd1, cd2 = st.columns(2)
+    with cd1: trip_start = st.date_input("여행 시작일 (From)", datetime.date.today())
+    with cd2: trip_end = st.date_input("여행 종료일 (To)", datetime.date.today() + datetime.timedelta(days=30))
+    
     sign_date_str = st.date_input("서명일", datetime.date.today()).strftime("%Y/%m/%d")
 
     if st.button("문서 생성 및 다운로드", type="primary"):
@@ -617,7 +626,9 @@ elif app_mode == MENU_2:
             data_consent = {
                 "non_acc_name": non_acc_name, "non_acc_address": non_acc_address, "non_acc_phone": non_acc_phone, "non_acc_email": non_acc_email,
                 "children": final_children, "acc_name": acc_name, "acc_relationship": acc_rel, "acc_passport": acc_passport,
-                "trip_address": trip_address, "trip_phone": trip_phone, "trip_email": trip_email, "sign_date": sign_date_str
+                "trip_address": trip_address, "trip_phone": trip_phone, "trip_email": trip_email, 
+                "trip_start": trip_start.strftime("%Y/%m/%d"), "trip_end": trip_end.strftime("%Y/%m/%d"), # 날짜 데이터 전달
+                "sign_date": sign_date_str
             }
             pdf_out = fill_consent_letter(consent_template_bytes, data_consent)
             st.download_button("📥 다운로드", pdf_out, f"Consent_{non_acc_name}.pdf", "application/pdf")
@@ -783,7 +794,7 @@ elif app_mode == MENU_4:
                 else:
                     if page_counter > 40: continue
                     img = Image.open(io.BytesIO(file_bytes))
-                    img = ImageOps.exif_transpose(img) # 💡 자동 방향 교정 (EXIF)
+                    img = ImageOps.exif_transpose(img)
                     if img.mode != "RGB": img = img.convert("RGB")
                     
                     preview = img.copy()
@@ -805,7 +816,7 @@ elif app_mode == MENU_4:
             if page_counter > 40:
                 st.warning("⚠️ 업로드된 총 페이지 수가 40장을 초과하여, 앞의 40장까지만 분석 및 병합합니다.")
 
-            status_text.text("2. AI가 페이지별 문맥을 분석하여 연관 서류를 묶거나 방향을 바로잡는 중입니다...")
+            status_text.text("2. AI가 페이지별 문맥을 분석하여 연관 서류를 묶거나 나누는 중입니다...")
             
             prompt = f"""
             You are an expert AI document classifier for a Canadian immigration firm.
@@ -815,6 +826,7 @@ elif app_mode == MENU_4:
             1. Read ALL pages carefully.
             2. GROUP the pages that logically belong to the SAME document type for the SAME client. 
                *CRITICAL MERGE RULE*: If you see multiple pages of BANK STATEMENTS, PAYSTUBS, or UTILITY BILLS for the SAME client (even if they are from different months), YOU MUST MERGE THEM ALL INTO ONE SINGLE GROUP. Put all their page numbers into a single `page_indices` array.
+               If Page 7 is a completely different document (like a Passport), create a separate group for it.
             3. ROTATION CHECK: For EACH page, check if the text is upside down or sideways. Determine the CLOCKWISE rotation (0, 90, 180, or 270) needed to make the text upright.
             4. For EACH grouped document, generate an EXACT filename using our CRM rules.
 
@@ -922,7 +934,6 @@ elif app_mode == MENU_4:
                     pdf_indices = [p["pdf_page_idx"] for p in group_pages]
                     src_doc.select(pdf_indices)  
                     
-                    # 💡 AI 스마트 회전 적용
                     for i, p_data in enumerate(group_pages):
                         try:
                             rot = int(rotations.get(str(p_data["global_idx"]), 0))
@@ -951,9 +962,9 @@ elif app_mode == MENU_4:
                             src_doc.close()
                         else:
                             img = Image.open(io.BytesIO(p_data["file_bytes"]))
-                            img = ImageOps.exif_transpose(img) # EXIF 회전
+                            img = ImageOps.exif_transpose(img) 
                             if img.mode != "RGB": img = img.convert("RGB")
-                            if rot != 0: img = img.rotate(-rot, expand=True) # AI 회전 적용
+                            if rot != 0: img = img.rotate(-rot, expand=True) 
                             img_buf = io.BytesIO()
                             img.save(img_buf, format="JPEG", quality=95)
                             pdf_page = new_doc.new_page(width=img.width, height=img.height)
@@ -967,7 +978,6 @@ elif app_mode == MENU_4:
                 
                 if is_jpeg and len(indices) == 1:
                     p_data = group_pages[0]
-                    # 이미지 회전 보정
                     img = Image.open(io.BytesIO(p_data["file_bytes"]))
                     img = ImageOps.exif_transpose(img)
                     try:
