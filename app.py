@@ -373,7 +373,7 @@ def fill_consent_letter(template_bytes, data):
     return output_pdf
 
 # ==========================================
-# 4. CRM 압축 엔진 
+# 4. CRM 스마트 압축 엔진 (디지털 원본 보호 기능 탑재)
 # ==========================================
 def process_and_compress_file(file_bytes, mime_type, target_filename):
     is_jpeg = target_filename.lower().endswith(('.jpg', '.jpeg'))
@@ -393,13 +393,29 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
         return buf.getvalue(), "image/jpeg"
         
     else:
-        output_pdf = io.BytesIO()
-        target_dpi = 150
-        quality = 65
-        
+        # PDF의 경우: 디지털 텍스트 원본인지, 이미지 스캔본인지 스마트 판별
         if "pdf" in mime_type.lower():
             doc = fitz.open(stream=file_bytes, filetype="pdf")
+            total_text_len = 0
+            
+            # 페이지 내 텍스트 유무 스캔 (초반부 페이지만 검사)
+            for page_idx in range(min(len(doc), 5)):
+                page = doc.load_page(page_idx)
+                text = page.get_text("text").strip()
+                total_text_len += len(text)
+                if total_text_len > 50:
+                    break
+            
+            # 💡 텍스트가 50자 이상 발견된 경우 (은행 서류, 이력서 등 디지털 원본)
+            # -> 픽셀화로 인한 용량 폭발 및 화질 저하를 막기 위해 이미지화 과정을 완전히 건너뛰고 바이패스!
+            if total_text_len > 50:
+                doc.close()
+                return file_bytes, "application/pdf"
+            
+            # 💡 글자가 없는 스캔본(사진)인 경우 -> 기존대로 용량 다이어트 실행
             new_doc = fitz.open()
+            target_dpi = 150
+            quality = 65
             
             for page in doc:
                 zoom = target_dpi / 72.0
@@ -413,10 +429,17 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
                 pdf_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
                 pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
                 
+            output_pdf = io.BytesIO()
             new_doc.save(output_pdf, deflate=True, garbage=4)
             new_doc.close()
             doc.close()
+            output_pdf.seek(0)
+            return output_pdf.getvalue(), "application/pdf"
+            
         else:
+            # 단일 이미지 -> PDF 변환 과정
+            target_dpi = 150
+            quality = 65
             img = Image.open(io.BytesIO(file_bytes))
             if img.mode != "RGB":
                 img = img.convert("RGB")
@@ -436,11 +459,12 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
             
             pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
             
+            output_pdf = io.BytesIO()
             new_doc.save(output_pdf)
             new_doc.close()
             
-        output_pdf.seek(0)
-        return output_pdf.getvalue(), "application/pdf"
+            output_pdf.seek(0)
+            return output_pdf.getvalue(), "application/pdf"
 
 # ==========================================
 # 5. Streamlit 네비게이션 및 UI 구성 (4개 툴 통합)
@@ -884,6 +908,7 @@ elif app_mode == "🏷️ CRM 파일명 생성 및 스마트 묶기/분할":
                     comp_bytes, out_mime = process_and_compress_file(p_data["file_bytes"], p_data["mime_type"], final_name)
                     orig_bytes_len = len(p_data["file_bytes"])
                 else:
+                    # 스마트 압축 엔진 통과 (디지털 원본인지 스캔본인지 스스로 판단)
                     comp_bytes, out_mime = process_and_compress_file(merged_pdf_bytes, "application/pdf", final_name)
                     orig_bytes_len = len(merged_pdf_bytes)
                     
