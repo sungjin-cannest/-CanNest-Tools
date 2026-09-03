@@ -1,6 +1,6 @@
 import streamlit as st
 
-# 📌 가장 먼저 실행되어야 하는 Streamlit 페이지 설정 (안정성 극대화)
+# 📌 가장 먼저 실행되어야 하는 Streamlit 페이지 설정
 st.set_page_config(page_title="CanNest 통합 업무 시스템", layout="wide")
 
 import google.generativeai as genai
@@ -118,18 +118,24 @@ def format_full_name(surname, given_name):
     if not g: return s
     return f"{g} {s}"
 
-def set_smart_widget_value(widget, value, default_fontsize=10, min_fontsize=5.5):
+# 💡 수정포인트: Courier 폰트 강제 적용 및 너비 계산 보완
+def set_smart_widget_value(widget, value, default_fontsize=11, min_fontsize=5.5):
     val_str = str(value) if value is not None else ""
     widget.field_value = val_str
     
     if hasattr(widget, "field_flags") and widget.field_flags:
         widget.field_flags &= ~1 
         
+    try:
+        widget.text_font = "Courier"  # IRCC 타자기 폰트 고정
+    except:
+        pass
+        
     if val_str and hasattr(widget, "rect"):
         box_width = widget.rect.width - 4 
         if box_width > 0:
             try:
-                font = fitz.Font("helv")
+                font = fitz.Font("Courier")  # 너비 계산도 Courier 기준으로 변경
                 len_at_default = font.text_length(val_str, fontsize=default_fontsize)
                 if len_at_default > box_width:
                     len_at_1 = font.text_length(val_str, fontsize=1)
@@ -197,14 +203,14 @@ def is_minor(dob_str):
         return True
 
 # ==========================================
-# 3. PDF 서식 채우기 로직 (수정가능 & 스마트 폰트)
+# 3. PDF 서식 채우기 로직 (Title Case 강제 적용)
 # ==========================================
 def extract_imm5476_info(image):
     prompt = """
     Analyze this identity document (passport/permit/visa) carefully.
     Extract the following details into exact JSON structure:
-    - surname: Family name in English uppercase
-    - given_name: Given names in English uppercase
+    - surname: Family name converted to Title Case (First letter capitalized, e.g., 'KIM' -> 'Kim', 'RODRIGUEZ CARDENAS' -> 'Rodriguez Cardenas')
+    - given_name: Given names converted to Title Case (e.g., 'EUN SUN' -> 'Eun Sun')
     - dob: Date of birth in YYYY-MM-DD format
     - uci: UCI numbers only if present (10 digits or 8 digits), else empty string
     Return ONLY raw valid JSON object without markdown or code formatting.
@@ -226,8 +232,8 @@ def extract_all_passports_batch(has_non_acc, images):
     - {'Remaining images (Image ' + ('2' if has_non_acc else '1') + f' to {len(images)}) are accompanying family members (parents or children).' if (len(images) > (1 if has_non_acc else 0)) else 'No family passports provided.'}
 
     For EACH passport image, extract:
-    - surname: Surname / Family name in English uppercase
-    - given_name: Given name(s) in English uppercase
+    - surname: Surname / Family name converted to Title Case (e.g., 'Kim')
+    - given_name: Given name(s) converted to Title Case (e.g., 'Eun Sun')
     - dob: Date of birth in YYYY-MM-DD format
     - passport_number: Passport number in uppercase alphanumeric
     - gender: Sex of the person, strictly "F" or "M"
@@ -256,6 +262,9 @@ def extract_case_prep_info(tmpl_bytes, client_files):
     You are an expert Canadian immigration case prep assistant.
     The FIRST document is a BLANK reference IRCC IMM form template.
     The REMAINING attached documents are client materials (intake questionnaire, passport, work/study permit, visitor record, resume, WES, etc.).
+
+    CRITICAL RULE FOR NAMES (Title Case):
+    ALWAYS convert any ALL CAPS names to Title Case. (e.g., convert "EUN SUN JUNG" to "Eun Sun Jung", "ALEXIS ANTONIO" to "Alexis Antonio").
 
     CRITICAL RULE FOR "Current country or territory of residence" (Section 7 in Personal Details):
     - Status, From date, and To date in this section MUST be extracted directly from the client's CURRENT PERMIT / VISA document (Work Permit, Study Permit, Visitor Record).
@@ -327,7 +336,8 @@ def fill_imm5476(template_bytes, data):
                 if date_counter == 1: val_to_set = target_data["signDate"]
                 
             if val_to_set is not None:
-                set_smart_widget_value(widget, val_to_set, default_fontsize=10)
+                # 💡 기본 크기를 11로 상향 조정
+                set_smart_widget_value(widget, val_to_set, default_fontsize=11)
 
     output_pdf = io.BytesIO()
     doc.save(output_pdf); doc.close(); output_pdf.seek(0)
@@ -370,14 +380,14 @@ def fill_consent_letter(template_bytes, data):
                         elif fname == dob_key: val_to_set = page_children[idx].get("dob", "")
             
             if val_to_set is not None:
-                set_smart_widget_value(widget, val_to_set, default_fontsize=10)
+                set_smart_widget_value(widget, val_to_set, default_fontsize=11)
 
     output_pdf = io.BytesIO()
     doc.save(output_pdf); doc.close(); output_pdf.seek(0)
     return output_pdf
 
 # ==========================================
-# 4. CRM 스마트 압축 엔진 (디지털 원본 보호 기능 탑재)
+# 4. CRM 스마트 압축 엔진
 # ==========================================
 def process_and_compress_file(file_bytes, mime_type, target_filename):
     is_jpeg = target_filename.lower().endswith(('.jpg', '.jpeg'))
@@ -465,8 +475,7 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
             return output_pdf.getvalue(), "application/pdf"
 
 # ==========================================
-# 5. Streamlit 네비게이션 및 UI 구성 
-# (💡 변수로 묶어 메뉴 이름 불일치로 인한 백화현상 완벽 차단)
+# 5. Streamlit 네비게이션 및 UI 구성
 # ==========================================
 MENU_1 = "🍁 IMM5476 자동 작성"
 MENU_2 = "✈️ 한부모 동의서 자동 작성"
@@ -707,7 +716,7 @@ elif app_mode == MENU_3:
                 st.rerun()
 
 # ------------------------------------------
-# 메뉴 4: CRM 파일명 자동 생성 및 스마트 분할/병합
+# 메뉴 4: CRM 파일명 자동 생성 및 묶기/분할
 # ------------------------------------------
 elif app_mode == MENU_4:
     st.title(MENU_4)
@@ -726,7 +735,7 @@ elif app_mode == MENU_4:
     )
 
     if uploaded_files:
-        if st.button("서류 분석 및 스마트 묶기/분할 시작", type="primary", use_container_width=True):
+        if st.button("서류 분석 및 묶기/분할 시작", type="primary", use_container_width=True):
             results = []
             status_text = st.empty()
             progress_bar = st.progress(0)
@@ -789,21 +798,19 @@ elif app_mode == MENU_4:
             prompt = f"""
             You are an expert AI document classifier for a Canadian immigration firm.
             I am providing {len(global_pages)} pages of documents uploaded by a client. 
-            These pages are scattered: some might be single-page images (like 3 photos of a bank statement), and some are from PDFs.
             
             Your task:
-            1. Read and analyze ALL provided pages carefully.
-            2. GROUP the pages that logically belong to the SAME document (e.g., Pages 1, 2, 3 are the same Bank Statement -> Group them together. Page 4 is a Passport -> Separate group).
-            3. For EACH grouped document, generate an EXACT filename using our strict CRM rules.
+            1. Read ALL pages carefully.
+            2. GROUP the pages that logically belong to the SAME document type for the SAME client. 
+               *CRITICAL MERGE RULE*: If you see multiple pages of BANK STATEMENTS, PAYSTUBS, or UTILITY BILLS for the SAME client (even if they are from different months, e.g., Jan, Feb, Mar), YOU MUST MERGE THEM ALL INTO ONE SINGLE GROUP. Do NOT split them by month. Put all their page numbers into a single `page_indices` array (e.g., `[1, 2, 3, 4, 5, 6]`).
+               If Page 7 is a completely different document (like a Passport), create a separate group for it.
+            3. For EACH grouped document, generate an EXACT filename using our CRM rules.
 
             [CRITICAL NAMING RULES]
-            1. Client Name:
-               - Korean: Full Name NO SPACES (e.g., 홍길동).
-               - Non-Korean: VERY FIRST WORD of Given Name in Title Case (e.g., "Janani").
-            2. Dates: YYYY.MM.DD (e.g., 2022.01.02).
+            1. Client Name: Korean (Full Name, no spaces). Non-Korean (VERY FIRST WORD of Given Name, Title Case).
+            2. Dates: YYYY.MM.DD
             3. Delimiter: Underscore '_'
-            4. Unlisted: Use exact title in English.
-
+            
             [CATEGORIES]
             - Digital Photo / Passport Photo: {{Name}}_Digital Photo.jpg
             - Passport: {{Name}}_PP_{{ExpiryDate YYYY.MM.DD}}
@@ -812,20 +819,10 @@ elif app_mode == MENU_4:
             - Visitor Record: {{Name}}_VR_{{ExpiryDate YYYY.MM.DD}}
             - Questionnaire: {{Name}}_QA_{{Type}}_{{ReceivedDate YYYY.MM.DD}}
             - Police Certificate: {{Name}}_Police Cert_{{CountryNameInEnglish}}
-            - LOE / Employment Letter: {{Name}}_LOE_{{CompanyInEnglish}}_{{한글/영문/공증}}
-            - Paystub: {{Name}}_Paystub_{{CompanyInEnglish}}_{{StartDate-EndDate}}
-            - Degree/Diploma: {{Name}}_{{Diploma/Bachelor/Highschool/Master/Certificate}}_{{SchoolName}}
-            - WES: {{Name}}_WES
-            - Certificate of Income: {{Name}}_COI_{{Year YYYY}}
-            - Language Test: {{Name}}_{{IELTS/CELPIP}}_{{TestDate YYYY.MM.DD}}
-            - Resume: {{Name}}_Resume_{{ReceivedDate YYYY.MM.DD}}
-            - Medical Exam: {{Name}}_Emedical_{{Year YYYY}}
-            - Marriage Cert: {{Name}}_Marriage Cert_{{IssueDate YYYY.MM.DD}}
-            - Transcript: {{Name}}_Transcript_{{SchoolName}}
             - Bank Statement: {{Name}}_Bank Statement_{{Year YYYY}}
-            - Family Cert: {{Name}}_Family Cert_{{IssueDate YYYY.MM.DD}}
-            - Basic Cert: {{Name}}_Basic Cert
-            - Birth Cert: {{Name}}_Birth Cert
+            - Paystub: {{Name}}_Paystub_{{CompanyInEnglish}}_{{StartDate-EndDate}}
+            - Resume: {{Name}}_Resume_{{ReceivedDate YYYY.MM.DD}}
+            - (Any other matching standard documents from manual)
             
             Return ONLY a raw JSON object:
             {{
@@ -838,7 +835,6 @@ elif app_mode == MENU_4:
                 }}
               ]
             }}
-            NOTE: `page_indices` MUST precisely match the "--- Page X ---" headers.
             """
             
             contents = [prompt]
@@ -850,12 +846,35 @@ elif app_mode == MENU_4:
                 response = safe_generate_content(contents)
                 clean_text = response.text.strip().replace('```json', '').replace('```', '')
                 data = json.loads(clean_text)
-                docs_info = data.get("documents", [])
+                raw_docs_info = data.get("documents", [])
+                
+                docs_info = []
+                for d in raw_docs_info:
+                    c_name = d.get("client_name", "").strip()
+                    c_cat = d.get("doc_category", "").strip()
+                    
+                    existing = None
+                    for item in docs_info:
+                        name1 = item.get("suggested_filename", "").replace(".pdf", "").replace(".jpg", "").strip()
+                        name2 = d.get("suggested_filename", "").replace(".pdf", "").replace(".jpg", "").strip()
+                        if name1 == name2:
+                            existing = item
+                            break
+                        if c_name and c_cat and c_name == item.get("client_name", "").strip() and c_cat == item.get("doc_category", "").strip():
+                            if "bank statement" in c_cat.lower() or "paystub" in c_cat.lower() or "statement" in c_cat.lower():
+                                existing = item
+                                break
+                                
+                    if existing:
+                        existing["page_indices"] = sorted(list(set(existing.get("page_indices", []) + d.get("page_indices", []))))
+                    else:
+                        docs_info.append(d)
+                        
             except Exception as e:
                 st.error(f"AI 분석 중 오류가 발생했습니다: {e}")
                 docs_info = []
 
-            status_text.text("3. 분석된 정보를 바탕으로 최종 서류를 결합 및 압축 중입니다...")
+            status_text.text("3. 분석된 정보를 바탕으로 최종 서류 결합 및 압축 중입니다...")
             progress_step = 1 / max(len(docs_info), 1)
 
             for idx, doc_info in enumerate(docs_info):
@@ -863,45 +882,55 @@ elif app_mode == MENU_4:
                 if not indices: continue
                 
                 final_name = doc_info.get("suggested_filename", f"Document_{idx+1}")
-                
                 if not (final_name.lower().endswith(".pdf") or final_name.lower().endswith(".jpg") or final_name.lower().endswith(".jpeg")):
                     if "photo" in final_name.lower() and len(indices) == 1:
                         final_name += ".jpg"
                     else:
                         final_name += ".pdf"
                         
-                new_doc = fitz.open()
                 source_names = []
-                
+                group_pages = []
                 for p_idx in indices:
                     p_data = next((p for p in global_pages if p['global_idx'] == p_idx), None)
-                    if not p_data: continue
-                    
-                    if p_data["original_name"] not in source_names:
-                        source_names.append(p_data["original_name"])
-                        
-                    if "pdf" in p_data["mime_type"].lower():
-                        src_doc = fitz.open(stream=p_data["file_bytes"], filetype="pdf")
-                        new_doc.insert_pdf(src_doc, from_page=p_data["pdf_page_idx"], to_page=p_data["pdf_page_idx"])
-                        src_doc.close()
-                    else:
-                        img = Image.open(io.BytesIO(p_data["file_bytes"]))
-                        if img.mode != "RGB": img = img.convert("RGB")
-                        img_buf = io.BytesIO()
-                        img.save(img_buf, format="JPEG", quality=95)
-                        
-                        pdf_page = new_doc.new_page(width=img.width, height=img.height)
-                        pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
-                        
-                merged_pdf_bytes = io.BytesIO()
-                new_doc.save(merged_pdf_bytes)
-                new_doc.close()
-                merged_pdf_bytes = merged_pdf_bytes.getvalue()
+                    if p_data:
+                        group_pages.append(p_data)
+                        if p_data["original_name"] not in source_names:
+                            source_names.append(p_data["original_name"])
+
+                unique_src_files = list(set([p["original_name"] for p in group_pages]))
+                is_all_from_same_pdf = (len(unique_src_files) == 1 and "pdf" in group_pages[0]["mime_type"].lower())
+                
+                if is_all_from_same_pdf:
+                    src_doc = fitz.open(stream=group_pages[0]["file_bytes"], filetype="pdf")
+                    pdf_indices = [p["pdf_page_idx"] for p in group_pages]
+                    src_doc.select(pdf_indices)  
+                    merged_pdf_bytes = io.BytesIO()
+                    src_doc.save(merged_pdf_bytes, garbage=4, deflate=True)
+                    src_doc.close()
+                    merged_pdf_bytes = merged_pdf_bytes.getvalue()
+                else:
+                    new_doc = fitz.open()
+                    for p_data in group_pages:
+                        if "pdf" in p_data["mime_type"].lower():
+                            src_doc = fitz.open(stream=p_data["file_bytes"], filetype="pdf")
+                            new_doc.insert_pdf(src_doc, from_page=p_data["pdf_page_idx"], to_page=p_data["pdf_page_idx"])
+                            src_doc.close()
+                        else:
+                            img = Image.open(io.BytesIO(p_data["file_bytes"]))
+                            if img.mode != "RGB": img = img.convert("RGB")
+                            img_buf = io.BytesIO()
+                            img.save(img_buf, format="JPEG", quality=95)
+                            pdf_page = new_doc.new_page(width=img.width, height=img.height)
+                            pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
+                    merged_pdf_bytes = io.BytesIO()
+                    new_doc.save(merged_pdf_bytes)
+                    new_doc.close()
+                    merged_pdf_bytes = merged_pdf_bytes.getvalue()
                 
                 is_jpeg = final_name.lower().endswith(('.jpg', '.jpeg'))
                 
                 if is_jpeg and len(indices) == 1:
-                    p_data = next((p for p in global_pages if p['global_idx'] == indices[0]), None)
+                    p_data = group_pages[0]
                     comp_bytes, out_mime = process_and_compress_file(p_data["file_bytes"], p_data["mime_type"], final_name)
                     orig_bytes_len = len(p_data["file_bytes"])
                 else:
@@ -915,7 +944,7 @@ elif app_mode == MENU_4:
                 if len(src_display) > 30: src_display = src_display[:27] + "..."
                 
                 results.append({
-                    "original_name": f"AI 묶음 ({src_display})",
+                    "original_name": f"분석결과 ({src_display})",
                     "suggested_filename": final_name,
                     "category": doc_info.get("doc_category", "기타"),
                     "client_name": doc_info.get("client_name", ""),
@@ -927,13 +956,12 @@ elif app_mode == MENU_4:
                 
                 progress_bar.progress(min((idx + 1) * progress_step, 1.0))
                 
-            status_text.success("모든 서류의 스마트 묶기/분할 및 최적화가 완료되었습니다.")
+            status_text.success("모든 서류의 묶기/분할 및 최적화가 완료되었습니다.")
             st.session_state.analysis_results = results
 
     if st.session_state.analysis_results:
         st.markdown("---")
         st.subheader("변환 완료된 서류 다운로드")
-        st.info("💡 흩어져 있던 사진 파일이나 통짜 PDF가 AI 분석을 통해 개별 서류로 묶이거나 분할되었습니다.")
         
         zip_buffer = io.BytesIO()
         final_downloads = []
