@@ -118,7 +118,7 @@ def format_full_name(surname, given_name):
     if not g: return s
     return f"{g} {s}"
 
-# 💡 수정포인트: Courier 폰트 강제 적용 및 너비 계산 보완
+# 💡 핵심 수정: Courier 폰트를 정확한 약어("Cour")로 지정하고 기본 10pt 사이즈 유지
 def set_smart_widget_value(widget, value, default_fontsize=11, min_fontsize=5.5):
     val_str = str(value) if value is not None else ""
     widget.field_value = val_str
@@ -127,7 +127,7 @@ def set_smart_widget_value(widget, value, default_fontsize=11, min_fontsize=5.5)
         widget.field_flags &= ~1 
         
     try:
-        widget.text_font = "Courier"  # IRCC 타자기 폰트 고정
+        widget.text_font = "Cour"  # PyMuPDF가 인식하는 정확한 타자기 폰트 코드
     except:
         pass
         
@@ -135,7 +135,7 @@ def set_smart_widget_value(widget, value, default_fontsize=11, min_fontsize=5.5)
         box_width = widget.rect.width - 4 
         if box_width > 0:
             try:
-                font = fitz.Font("Courier")  # 너비 계산도 Courier 기준으로 변경
+                font = fitz.Font("courier")  # 너비 계산용 폰트
                 len_at_default = font.text_length(val_str, fontsize=default_fontsize)
                 if len_at_default > box_width:
                     len_at_1 = font.text_length(val_str, fontsize=1)
@@ -336,7 +336,6 @@ def fill_imm5476(template_bytes, data):
                 if date_counter == 1: val_to_set = target_data["signDate"]
                 
             if val_to_set is not None:
-                # 💡 기본 크기를 11로 상향 조정
                 set_smart_widget_value(widget, val_to_set, default_fontsize=11)
 
     output_pdf = io.BytesIO()
@@ -528,6 +527,14 @@ if app_mode == MENU_1:
                 final_data = {"surname": surname, "given_name": given, "dob": dob, "uci": uci, "email": email, "signDate": sign_date.strftime("%Y-%m-%d")}
                 pdf_out = fill_imm5476(template_5476_bytes, final_data)
                 st.download_button("📥 다운로드", pdf_out, file_name=f"IMM5476_{surname}_{given}.pdf", mime="application/pdf")
+        
+        # 💡 메뉴 1: 전체 리셋 버튼 추가
+        st.markdown("---")
+        if st.button("🔄 전체 리셋", type="secondary", use_container_width=True, key="reset_btn_m1"):
+            for key in list(st.session_state.keys()):
+                if key != "password_correct":
+                    del st.session_state[key]
+            st.rerun()
 
 # ------------------------------------------
 # 메뉴 2: 한부모 동의서 자동 작성
@@ -617,6 +624,14 @@ elif app_mode == MENU_2:
             }
             pdf_out = fill_consent_letter(consent_template_bytes, data_consent)
             st.download_button("📥 다운로드", pdf_out, f"Consent_{non_acc_name}.pdf", "application/pdf")
+            
+    # 💡 메뉴 2: 전체 리셋 버튼 추가
+    st.markdown("---")
+    if st.button("🔄 전체 리셋", type="secondary", use_container_width=True, key="reset_btn_m2"):
+        for key in list(st.session_state.keys()):
+            if key != "password_correct":
+                del st.session_state[key]
+        st.rerun()
 
 # ------------------------------------------
 # 메뉴 3: 이민서류 정보 정리 (Case File Prep)
