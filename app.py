@@ -712,7 +712,7 @@ elif app_mode == "📋 이민서류 정보 정리 (Case File Prep)":
         "IMM5710 (WP-INSIDE)": "imm5710.pdf"
     }
     
-    selected_form = st.selectbox("📌 템플릿 서식 선택 (GitHub 박제본)", list(form_map.keys()))
+    selected_form = st.selectbox("📌 템플릿 서식 선택", list(form_map.keys()))
     
     tmpl_bytes = None
     
