@@ -306,9 +306,10 @@ def fill_imm5476(template_bytes, data):
     target_data = {
         "surname": data.get("surname", ""), "given": data.get("given_name", ""),
         "dob": data.get("dob", ""), "email": data.get("email", ""),
+        "address_phone": data.get("address_phone", ""), # 💡 주소/전화번호 데이터 추가
         "uci": data.get("uci", "").replace("-", ""), "signDate": data.get("signDate", "")  
     }
-    flags = {"surname": False, "given": False, "dob": False, "email": False, "uci": False}
+    flags = {"surname": False, "given": False, "dob": False, "email": False, "address_phone": False, "uci": False}
     
     page_date_counters = {}
     
@@ -328,11 +329,15 @@ def fill_imm5476(template_bytes, data):
                 val_to_set = target_data["dob"]; flags["dob"] = True
             elif "email" in fname_lower and not flags["email"]:
                 val_to_set = target_data["email"]; flags["email"] = True
+            # 💡 Section A 3번 항목: 이메일 대신 주소/전화번호 입력 칸 매핑
+            elif ("telephone" in fname_lower or "address" in fname_lower) and page_idx == 0 and not flags["address_phone"]:
+                val_to_set = target_data["address_phone"]; flags["address_phone"] = True
             elif ("uci" in fname_lower or "unique client identifier" in fname_lower) and not flags["uci"]:
                 val_to_set = target_data["uci"]; flags["uci"] = True
             elif "date" in fname_lower and "birth" not in fname_lower:
                 page_date_counters[page_idx] += 1
                 
+                # 9번 및 12번 서명일만 정밀 타겟팅
                 if page_idx == 2 and page_date_counters[page_idx] == 1:
                     val_to_set = target_data["signDate"]
                 elif page_idx == 3 and page_date_counters[page_idx] == 1:
@@ -538,17 +543,24 @@ if app_mode == MENU_1:
         with c1:
             surname = st.text_input("성 (Surname)", data.get("surname", ""))
             dob = st.text_input("생년월일", data.get("dob", ""))
-            email = st.text_input("이메일", "")
+            email = st.text_input("이메일 주소", "")
         with c2:
             given = st.text_input("이름 (Given Name)", data.get("given_name", ""))
             uci = st.text_input("UCI", data.get("uci", ""))
             sign_date = st.date_input("서명날짜", datetime.date.today())
 
+        # 💡 신규 추가: 이메일이 없는 미성년자/신청자용 주소/전화번호 입력 칸 (Section A 3번)
+        address_phone = st.text_input("주소 또는 전화번호 (이메일이 없는 미성년자/신청자용)", placeholder="예: 2301-6658 Dow Ave, Burnaby BC V5H 0C7")
+
         if st.button("문서 생성 및 다운로드", type="primary"):
             if not template_5476_bytes:
                 st.error("템플릿 파일이 없습니다.")
             else:
-                final_data = {"surname": surname, "given_name": given, "dob": dob, "uci": uci, "email": email, "signDate": sign_date.strftime("%Y-%m-%d")}
+                final_data = {
+                    "surname": surname, "given_name": given, "dob": dob, "uci": uci, 
+                    "email": email, "address_phone": address_phone, 
+                    "signDate": sign_date.strftime("%Y-%m-%d")
+                }
                 pdf_out = fill_imm5476(template_5476_bytes, final_data)
                 st.download_button("📥 다운로드", pdf_out, file_name=f"IMM5476_{surname}_{given}.pdf", mime="application/pdf")
         
@@ -849,37 +861,54 @@ elif app_mode == MENU_4:
 
             status_text.text("2. AI가 페이지별 문맥을 분석하여 연관 서류를 묶거나 나누는 중입니다...")
             
+            # 💡 2단계 Fallback 예외처리 지침 추가된 프롬프트
             prompt = f"""
             You are an expert AI document classifier for a Canadian immigration firm.
             I am providing {len(global_pages)} pages of documents uploaded by a client. 
-            
+
             Your task:
             1. Read ALL pages carefully.
             2. GROUP the pages that logically belong to the SAME document type for the SAME client. 
-               *CRITICAL MERGE RULE*: If you see multiple pages of BANK STATEMENTS, PAYSTUBS, or UTILITY BILLS for the SAME client (even if they are from different months), YOU MUST MERGE THEM ALL INTO ONE SINGLE GROUP. Put all their page numbers into a single `page_indices` array.
-               If Page 7 is a completely different document (like a Passport), create a separate group for it.
-            3. ROTATION CHECK: For EACH page, check if the text is upside down or sideways. Determine the CLOCKWISE rotation (0, 90, 180, or 270) needed to make the text upright.
-            4. For EACH grouped document, generate an EXACT filename using our CRM rules.
+               *CRITICAL MERGE RULE*: If you see multiple pages of BANK STATEMENTS, PAYSTUBS, or UTILITY BILLS for the SAME client (even if from different months), MERGE THEM ALL into a single group.
+            3. ROTATION CHECK: Check if text is upside down or sideways (0, 90, 180, or 270).
+            4. For EACH grouped document, generate an EXACT filename using our strict CRM manual rules provided below.
 
-            [CRITICAL NAMING RULES]
-            1. Client Name: Korean (Full Name, no spaces). Non-Korean (VERY FIRST WORD of Given Name, Title Case).
-            2. Dates: YYYY.MM.DD
-            3. Delimiter: Underscore '_'
-            
-            [CATEGORIES]
-            - Digital Photo / Passport Photo: {{Name}}_Digital Photo.jpg
-            - Passport: {{Name}}_PP_{{ExpiryDate YYYY.MM.DD}}
-            - Work Permit: {{Name}}_WP_{{ExpiryDate YYYY.MM.DD}}
-            - Study Permit: {{Name}}_SP_{{ExpiryDate YYYY.MM.DD}}
-            - Visitor Record: {{Name}}_VR_{{ExpiryDate YYYY.MM.DD}}
-            - Questionnaire: {{Name}}_QA_{{Type}}_{{ReceivedDate YYYY.MM.DD}}
-            - Police Certificate: {{Name}}_Police Cert_{{CountryNameInEnglish}}
-            - Bank Statement: {{Name}}_Bank Statement_{{Year YYYY}}
-            - Paystub: {{Name}}_Paystub_{{CompanyInEnglish}}_{{StartDate-EndDate}}
-            - Resume: {{Name}}_Resume_{{ReceivedDate YYYY.MM.DD}}
-            - Employment Letter / Confirmation of Employment / Certificate of Employment: {{Name}}_LOE_{{CompanyInEnglish}} (CRITICAL: Use EXACTLY 'LOE', NEVER 'Employment Letter')
-            - (Any other matching standard documents from manual)
-            
+            [STRICT CRM MANUAL FILENAME RULES]
+            Rule 1 (Name): Korean client -> Full Korean Name without spaces (e.g. 홍길동). Foreign client -> VERY FIRST WORD of English Given Name in Title Case (e.g. Richard, Pham).
+            Rule 2 (Dates): MUST be YYYY.MM.DD (e.g. 2022.01.02). Use dots '.' as delimiters.
+            Rule 3 (Delimiter): Underscore '_' between Name, Document Category, and Date/Company.
+            Rule 4 (Date Range): Use hyphen '-' for ranges (e.g. 2022.04.22-2022.05.22).
+            Rule 5 (Capitalization): Every English word MUST be Title Case (Capitalize First Letter).
+
+            [CATEGORIES & CMS SUFFIX RULES]
+            1. Passport: {{Name}}_PP_{{ExpiryDate YYYY.MM.DD}}
+            2. Work Permit / Study Permit / Visitor Record / Coop / PGWP / BOWP: {{Name}}_{{WP/SP/VR/Coop/PGWP/BOWP}}_{{ExpiryDate YYYY.MM.DD}}
+            3. Questionnaire: {{Name}}_QA_{{Type}}_{{ReceivedDate YYYY.MM.DD}}
+            4. Police Certificate: {{Name}}_Police Cert_{{CountryInEnglish}}
+            5. Employment Letter / Certificate of Employment / Confirmation of Employment: {{Name}}_LOE_{{CompanyInEnglish}} (CRITICAL: MUST use 'LOE', NEVER 'Employment Letter')
+            6. Paystub: {{Name}}_Paystub_{{CompanyInEnglish}}_{{StartDate-EndDate}}
+            7. Education Certificate / WES: {{Name}}_{{Diploma/Bachelor/Master/Highschool/Certificate/WES}}_{{SchoolName}} (If WES: {{Name}}_WES)
+            8. Certificate of Income: {{Name}}_COI_{{Year YYYY}}
+            9. Official English Score: {{Name}}_{{IELTS/CELPIP}}_{{Date YYYY.MM.DD}}
+            10. Resume: {{Name}}_Resume_{{ReceivedDate YYYY.MM.DD}}
+            11. Medical Exam / Emedical: {{Name}}_Emedical_{{Year YYYY}}
+            12. Marriage Certificate: {{Name}}_Marriage Cert_{{IssueDate YYYY.MM.DD}}
+            13. Transcript: {{Name}}_Transcript_{{SchoolName}}
+            14. Bank Statement: {{Name}}_Bank Statement_{{Year YYYY}}
+            15. Family Certificate (가족관계증명서): {{Name}}_Family Cert_{{IssueDate YYYY.MM.DD}} (CRITICAL: MUST use 'Family Cert')
+            16. Basic Certificate (기본증명서): {{Name}}_Basic Cert
+            17. Birth Certificate (출생증명서): {{Name}}_Birth Cert
+            18. Travel Consent (한부모동의서): {{ChildName}}_Travel Consent
+            19. ECE License: {{Name}}_ECE License_{{Province}}
+            20. Letter of Acceptance (입학허가서): {{Name}}_LOA_{{SchoolName}}
+            21. Tuition Receipt: {{Name}}_Tuition Receipt_{{SchoolName}}
+            22. Confirmation of Enrollment: {{Name}}_Confirmation of Enrollment_{{SchoolName}}
+            23. Digital Photo / Passport Photo: {{Name}}_Digital Photo.jpg
+
+            [CRITICAL FALLBACK RULE FOR UNKNOWN DOCUMENTS]
+            - Step 1: If a document does NOT match any of the 23 categories above, extract the official document title printed at the top of the document (in English, Title Case) and format as: {{Name}}_{{DocumentTitleInEnglish}}.
+            - Step 2: If the document title/type is completely ambiguous, unreadable, or unclassified, set suggested_filename as {{Name}}_Unclassified_확인필요.pdf and set "is_unclassified": true.
+
             Return ONLY a raw JSON object:
             {{
               "rotations": {{
@@ -891,7 +920,8 @@ elif app_mode == MENU_4:
                   "client_name": "...",
                   "doc_category": "...",
                   "suggested_filename": "...",
-                  "page_indices": [1, 2, 3] 
+                  "page_indices": [1, 2, 3],
+                  "is_unclassified": false
                 }}
               ]
             }}
@@ -939,7 +969,6 @@ elif app_mode == MENU_4:
             status_text.text("3. 분석된 정보를 바탕으로 최종 서류 결합 및 회전/압축 중입니다...")
             progress_step = 1 / max(len(docs_info), 1)
 
-            # 💡 수정 포인트: 실패한 파일명을 담을 리스트 선언
             failed_docs = []
 
             for idx, doc_info in enumerate(docs_info):
@@ -947,6 +976,8 @@ elif app_mode == MENU_4:
                 if not indices: continue
                 
                 final_name = doc_info.get("suggested_filename", f"Document_{idx+1}")
+                is_unclassified = doc_info.get("is_unclassified", False) or "확인필요" in final_name
+                
                 if not (final_name.lower().endswith(".pdf") or final_name.lower().endswith(".jpg") or final_name.lower().endswith(".jpeg")):
                     if "photo" in final_name.lower() and len(indices) == 1:
                         final_name += ".jpg"
@@ -967,7 +998,6 @@ elif app_mode == MENU_4:
                 
                 needs_rotation = any(int(rotations.get(str(p["global_idx"]), 0)) != 0 for p in group_pages)
                 
-                # 💡 수정 포인트: 개별 서류 처리 구간을 try-except로 묶어 에러 발생 시 건너뛰기
                 try:
                     if is_all_from_same_pdf:
                         src_doc = fitz.open(stream=group_pages[0]["file_bytes"], filetype="pdf")
@@ -1057,16 +1087,15 @@ elif app_mode == MENU_4:
                         "mime": out_mime,
                         "orig_kb": orig_kb,
                         "comp_kb": comp_kb,
-                        "bytes": comp_bytes
+                        "bytes": comp_bytes,
+                        "is_unclassified": is_unclassified # 💡 미분류 상태 기록
                     })
                 
                 except Exception as e:
-                    # 💡 실패한 파일명 기록 및 전체 멈춤 방지
                     failed_docs.append(final_name)
                 
                 progress_bar.progress(min((idx + 1) * progress_step, 1.0))
                 
-            # 💡 수정 포인트: 에러 발생 유무에 따른 결과 메시지 출력
             if failed_docs:
                 status_text.warning("일부 서류 처리에 실패했지만, 나머지 서류의 최적화는 완료되었습니다.")
                 st.warning("⚠️ **아래 서류는 파일 손상 또는 변환 중 오류가 발생하여 제외되었습니다. 원본 파일을 직접 확인해 주세요:**\n\n" + "\n".join([f"- {f}" for f in failed_docs]))
@@ -1088,6 +1117,9 @@ elif app_mode == MENU_4:
             with col1:
                 st.write(f"**출처**: `{item['original_name']}`")
                 st.caption(f"{item['orig_kb']:.1f} KB ➡️ **{item['comp_kb']:.1f} KB**")
+                # 💡 규칙 미확인 서류에 시각적 경고 태그 표시
+                if item.get("is_unclassified"):
+                    st.warning("⚠️ 규칙 미확인 서류 (파일명 수동 확인 필요)")
                 
             with col2:
                 user_edited_name = st.text_input(
