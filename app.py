@@ -309,7 +309,6 @@ def fill_imm5476(template_bytes, data):
         "uci": data.get("uci", "").replace("-", ""), "signDate": data.get("signDate", "")  
     }
     flags = {"surname": False, "given": False, "dob": False, "email": False, "uci": False}
-    date_counter = 0
     
     for page in doc:
         for widget in page.widgets():
@@ -329,8 +328,8 @@ def fill_imm5476(template_bytes, data):
             elif ("uci" in fname_lower or "unique client identifier" in fname_lower) and not flags["uci"]:
                 val_to_set = target_data["uci"]; flags["uci"] = True
             elif "date" in fname_lower and "birth" not in fname_lower:
-                date_counter += 1
-                if date_counter == 1: val_to_set = target_data["signDate"]
+                # 💡 핵심 수정: date_counter 제한을 없애고 생년월일이 아닌 모든 Date 칸(SECTION D, E)에 서명일 입력
+                val_to_set = target_data["signDate"]
                 
             if val_to_set is not None:
                 set_smart_widget_value(widget, val_to_set, default_fontsize=11)
@@ -355,14 +354,10 @@ def fill_consent_letter(template_bytes, data):
             if not fname: continue
             fname_lower = fname.lower()
             
-            # 💡 수정 1: 모든 종류의 체크박스(alone, travel with 등)를 철저하게 탐지하고 "Off"로 강제 초기화
             field_type_str = getattr(widget, "field_type_string", "").lower()
-            is_checkbox = ("check" in field_type_str or "radio" in field_type_str or 
-                           "check box" in fname_lower or "checkbox" in fname_lower or 
-                           "alone" in fname_lower)
-            if is_checkbox:
+            if "check" in field_type_str or "radio" in field_type_str or "check box" in fname_lower or "checkbox" in fname_lower or "alone" in fname_lower:
                 try:
-                    widget.field_value = "Off"  # PDF 표준 체크 해제 값
+                    widget.field_value = "Off" 
                     widget.update()
                 except: pass
                 continue
@@ -381,15 +376,10 @@ def fill_consent_letter(template_bytes, data):
             elif fname == "At the following addresses 2": val_to_set = data.get("trip_phone", "")
             elif fname == "email_2": val_to_set = data.get("trip_email", "")
             elif fname == "yyyymmdd_2": val_to_set = data.get("sign_date", "")
-            
-            # 💡 수정 2: 숨겨진 Travel Date ("1_4" 등) 필드 이름 완벽 매핑
-            elif fname == "1_4" or "travel date" in fname_lower or fname_lower == "date": 
-                val_to_set = f"{data.get('trip_start', '')} ~ {data.get('trip_end', '')}"
-            elif "from" in fname_lower or "departure" in fname_lower or "start date" in fname_lower: 
-                val_to_set = data.get("trip_start", "")
+            elif fname == "1_4" or "travel date" in fname_lower or fname_lower == "date" or "from" in fname_lower or "departure" in fname_lower or "start date" in fname_lower: 
+                val_to_set = data.get("trip_date", "")
             elif fname_lower == "to" or "return" in fname_lower or "end date" in fname_lower: 
-                val_to_set = data.get("trip_end", "")
-                
+                val_to_set = "" 
             else:
                 for idx, (name_key, dob_key) in enumerate(child_widgets):
                     if idx < len(page_children):
@@ -460,8 +450,12 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
             new_doc.save(output_pdf, deflate=True, garbage=4)
             new_doc.close()
             doc.close()
-            output_pdf.seek(0)
-            return output_pdf.getvalue(), "application/pdf"
+            
+            compressed_bytes = output_pdf.getvalue()
+            if len(compressed_bytes) >= len(file_bytes):
+                return file_bytes, "application/pdf"
+                
+            return compressed_bytes, "application/pdf"
             
         else:
             target_dpi = 150
@@ -490,8 +484,11 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
             new_doc.save(output_pdf)
             new_doc.close()
             
-            output_pdf.seek(0)
-            return output_pdf.getvalue(), "application/pdf"
+            compressed_bytes = output_pdf.getvalue()
+            if len(compressed_bytes) >= len(file_bytes):
+                return file_bytes, "application/pdf"
+                
+            return compressed_bytes, "application/pdf"
 
 # ==========================================
 # 5. Streamlit 네비게이션 및 UI 구성
@@ -631,9 +628,7 @@ elif app_mode == MENU_2:
     with ct1: trip_phone = st.text_input("현지 전화")
     with ct2: trip_email = st.text_input("현지 이메일")
     
-    cd1, cd2 = st.columns(2)
-    with cd1: trip_start = st.date_input("여행 시작일 (From)", datetime.date.today())
-    with cd2: trip_end = st.date_input("여행 종료일 (To)", datetime.date.today() + datetime.timedelta(days=30))
+    trip_date = st.text_input("여행 기간 (Travel Date)", placeholder="예: 2026/09/01 ~ 2026/09/30 또는 August 2026")
     
     sign_date_str = st.date_input("서명일", datetime.date.today()).strftime("%Y/%m/%d")
 
@@ -645,7 +640,7 @@ elif app_mode == MENU_2:
                 "non_acc_name": non_acc_name, "non_acc_address": non_acc_address, "non_acc_phone": non_acc_phone, "non_acc_email": non_acc_email,
                 "children": final_children, "acc_name": acc_name, "acc_relationship": acc_rel, "acc_passport": acc_passport,
                 "trip_address": trip_address, "trip_phone": trip_phone, "trip_email": trip_email, 
-                "trip_start": trip_start.strftime("%Y/%m/%d"), "trip_end": trip_end.strftime("%Y/%m/%d"),
+                "trip_date": trip_date, 
                 "sign_date": sign_date_str
             }
             pdf_out = fill_consent_letter(consent_template_bytes, data_consent)
@@ -875,6 +870,8 @@ elif app_mode == MENU_4:
             - Bank Statement: {{Name}}_Bank Statement_{{Year YYYY}}
             - Paystub: {{Name}}_Paystub_{{CompanyInEnglish}}_{{StartDate-EndDate}}
             - Resume: {{Name}}_Resume_{{ReceivedDate YYYY.MM.DD}}
+            - Employment Letter / Confirmation of Employment / Certificate of Employment: {{Name}}_LOE_{{CompanyInEnglish}} (CRITICAL: Use EXACTLY 'LOE', NEVER 'Employment Letter')
+            - (Any other matching standard documents from manual)
             
             Return ONLY a raw JSON object:
             {{
@@ -958,23 +955,28 @@ elif app_mode == MENU_4:
                 unique_src_files = list(set([p["original_name"] for p in group_pages]))
                 is_all_from_same_pdf = (len(unique_src_files) == 1 and "pdf" in group_pages[0]["mime_type"].lower())
                 
+                needs_rotation = any(int(rotations.get(str(p["global_idx"]), 0)) != 0 for p in group_pages)
+                
                 if is_all_from_same_pdf:
                     src_doc = fitz.open(stream=group_pages[0]["file_bytes"], filetype="pdf")
                     pdf_indices = [p["pdf_page_idx"] for p in group_pages]
-                    src_doc.select(pdf_indices)  
                     
-                    for i, p_data in enumerate(group_pages):
-                        try:
-                            rot = int(rotations.get(str(p_data["global_idx"]), 0))
-                            if rot != 0:
-                                page = src_doc[i]
-                                page.set_rotation((page.rotation + rot) % 360)
-                        except: pass
-                        
-                    merged_pdf_bytes = io.BytesIO()
-                    src_doc.save(merged_pdf_bytes, garbage=4, deflate=True)
-                    src_doc.close()
-                    merged_pdf_bytes = merged_pdf_bytes.getvalue()
+                    if len(pdf_indices) == len(src_doc) and not needs_rotation and pdf_indices == list(range(len(src_doc))):
+                        merged_pdf_bytes = group_pages[0]["file_bytes"]
+                        src_doc.close()
+                    else:
+                        src_doc.select(pdf_indices)  
+                        for i, p_data in enumerate(group_pages):
+                            try:
+                                rot = int(rotations.get(str(p_data["global_idx"]), 0))
+                                if rot != 0:
+                                    page = src_doc[i]
+                                    page.set_rotation((page.rotation + rot) % 360)
+                            except: pass
+                        merged_pdf_bytes_io = io.BytesIO()
+                        src_doc.save(merged_pdf_bytes_io, deflate=True) 
+                        src_doc.close()
+                        merged_pdf_bytes = merged_pdf_bytes_io.getvalue()
                 else:
                     new_doc = fitz.open()
                     for p_data in group_pages:
@@ -998,12 +1000,13 @@ elif app_mode == MENU_4:
                             img.save(img_buf, format="JPEG", quality=95)
                             pdf_page = new_doc.new_page(width=img.width, height=img.height)
                             pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
-                    merged_pdf_bytes = io.BytesIO()
-                    new_doc.save(merged_pdf_bytes)
+                    merged_pdf_bytes_io = io.BytesIO()
+                    new_doc.save(merged_pdf_bytes_io)
                     new_doc.close()
-                    merged_pdf_bytes = merged_pdf_bytes.getvalue()
+                    merged_pdf_bytes = merged_pdf_bytes_io.getvalue()
                 
                 is_jpeg = final_name.lower().endswith(('.jpg', '.jpeg'))
+                orig_total_bytes = sum([len(p["file_bytes"]) for p in group_pages])
                 
                 if is_jpeg and len(indices) == 1:
                     p_data = group_pages[0]
@@ -1016,12 +1019,10 @@ elif app_mode == MENU_4:
                     img_buf = io.BytesIO()
                     img.save(img_buf, format="JPEG", quality=95)
                     comp_bytes, out_mime = process_and_compress_file(img_buf.getvalue(), "image/jpeg", final_name)
-                    orig_bytes_len = len(p_data["file_bytes"])
                 else:
                     comp_bytes, out_mime = process_and_compress_file(merged_pdf_bytes, "application/pdf", final_name)
-                    orig_bytes_len = len(merged_pdf_bytes)
                     
-                orig_kb = orig_bytes_len / 1024
+                orig_kb = orig_total_bytes / 1024
                 comp_kb = len(comp_bytes) / 1024
                 
                 src_display = ", ".join(source_names)
