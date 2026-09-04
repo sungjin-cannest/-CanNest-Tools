@@ -310,7 +310,6 @@ def fill_imm5476(template_bytes, data):
     }
     flags = {"surname": False, "given": False, "dob": False, "email": False, "uci": False}
     
-    # 💡 페이지별 Date 입력칸 개수를 추적하는 딕셔너리
     page_date_counters = {}
     
     for page_idx, page in enumerate(doc):
@@ -334,16 +333,12 @@ def fill_imm5476(template_bytes, data):
             elif "date" in fname_lower and "birth" not in fname_lower:
                 page_date_counters[page_idx] += 1
                 
-                # 💡 수정 1: 9번 및 12번 서명일에만 정밀 타겟팅
-                # 3페이지(index 2)의 첫 번째 Date: 9. Your representative's declaration
-                # 4페이지(index 3)의 첫 번째 Date: 12. Your declaration
                 if page_idx == 2 and page_date_counters[page_idx] == 1:
                     val_to_set = target_data["signDate"]
                 elif page_idx == 3 and page_date_counters[page_idx] == 1:
                     val_to_set = target_data["signDate"]
                 
             if val_to_set is not None:
-                # 💡 수정 2: IMM5476 폼에만 글씨 크기를 2단계 축소 (11pt -> 9pt)
                 set_smart_widget_value(widget, val_to_set, default_fontsize=9)
 
     output_pdf = io.BytesIO()
@@ -399,7 +394,6 @@ def fill_consent_letter(template_bytes, data):
                         elif fname == dob_key: val_to_set = page_children[idx].get("dob", "")
             
             if val_to_set is not None:
-                # 동의서는 기존 11pt 크기 유지
                 set_smart_widget_value(widget, val_to_set, default_fontsize=11)
 
     output_pdf = io.BytesIO()
@@ -945,6 +939,9 @@ elif app_mode == MENU_4:
             status_text.text("3. 분석된 정보를 바탕으로 최종 서류 결합 및 회전/압축 중입니다...")
             progress_step = 1 / max(len(docs_info), 1)
 
+            # 💡 수정 포인트: 실패한 파일명을 담을 리스트 선언
+            failed_docs = []
+
             for idx, doc_info in enumerate(docs_info):
                 indices = doc_info.get("page_indices", [])
                 if not indices: continue
@@ -970,91 +967,112 @@ elif app_mode == MENU_4:
                 
                 needs_rotation = any(int(rotations.get(str(p["global_idx"]), 0)) != 0 for p in group_pages)
                 
-                if is_all_from_same_pdf:
-                    src_doc = fitz.open(stream=group_pages[0]["file_bytes"], filetype="pdf")
-                    pdf_indices = [p["pdf_page_idx"] for p in group_pages]
-                    
-                    if len(pdf_indices) == len(src_doc) and not needs_rotation and pdf_indices == list(range(len(src_doc))):
-                        merged_pdf_bytes = group_pages[0]["file_bytes"]
-                        src_doc.close()
-                    else:
-                        src_doc.select(pdf_indices)  
-                        for i, p_data in enumerate(group_pages):
-                            try:
-                                rot = int(rotations.get(str(p_data["global_idx"]), 0))
-                                if rot != 0:
-                                    page = src_doc[i]
-                                    page.set_rotation((page.rotation + rot) % 360)
-                            except: pass
-                        merged_pdf_bytes_io = io.BytesIO()
-                        src_doc.save(merged_pdf_bytes_io, deflate=True) 
-                        src_doc.close()
-                        merged_pdf_bytes = merged_pdf_bytes_io.getvalue()
-                else:
-                    new_doc = fitz.open()
-                    for p_data in group_pages:
-                        rot = 0
-                        try: rot = int(rotations.get(str(p_data["global_idx"]), 0))
-                        except: pass
+                # 💡 수정 포인트: 개별 서류 처리 구간을 try-except로 묶어 에러 발생 시 건너뛰기
+                try:
+                    if is_all_from_same_pdf:
+                        src_doc = fitz.open(stream=group_pages[0]["file_bytes"], filetype="pdf")
+                        pdf_indices = [p["pdf_page_idx"] for p in group_pages]
                         
+                        if len(pdf_indices) == len(src_doc) and not needs_rotation and pdf_indices == list(range(len(src_doc))):
+                            merged_pdf_bytes = group_pages[0]["file_bytes"]
+                            src_doc.close()
+                        else:
+                            src_doc.select(pdf_indices)  
+                            for i, p_data in enumerate(group_pages):
+                                try:
+                                    rot = int(rotations.get(str(p_data["global_idx"]), 0))
+                                    if rot != 0:
+                                        page = src_doc[i]
+                                        page.set_rotation((page.rotation + rot) % 360)
+                                except: pass
+                            merged_pdf_bytes_io = io.BytesIO()
+                            src_doc.save(merged_pdf_bytes_io, deflate=True) 
+                            src_doc.close()
+                            merged_pdf_bytes = merged_pdf_bytes_io.getvalue()
+                    else:
+                        new_doc = fitz.open()
+                        for p_data in group_pages:
+                            rot = 0
+                            try: rot = int(rotations.get(str(p_data["global_idx"]), 0))
+                            except: pass
+                            
+                            if "pdf" in p_data["mime_type"].lower():
+                                src_doc = fitz.open(stream=p_data["file_bytes"], filetype="pdf")
+                                new_doc.insert_pdf(src_doc, from_page=p_data["pdf_page_idx"], to_page=p_data["pdf_page_idx"])
+                                if rot != 0:
+                                    page = new_doc[-1]
+                                    page.set_rotation((page.rotation + rot) % 360)
+                                src_doc.close()
+                            else:
+                                img = Image.open(io.BytesIO(p_data["file_bytes"]))
+                                img = ImageOps.exif_transpose(img) 
+                                if img.mode != "RGB": img = img.convert("RGB")
+                                if rot != 0: img = img.rotate(-rot, expand=True) 
+                                img_buf = io.BytesIO()
+                                img.save(img_buf, format="JPEG", quality=95)
+                                pdf_page = new_doc.new_page(width=img.width, height=img.height)
+                                pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
+                        merged_pdf_bytes_io = io.BytesIO()
+                        new_doc.save(merged_pdf_bytes_io)
+                        new_doc.close()
+                        merged_pdf_bytes = merged_pdf_bytes_io.getvalue()
+                    
+                    is_jpeg = final_name.lower().endswith(('.jpg', '.jpeg'))
+                    orig_total_bytes = sum([len(p["file_bytes"]) for p in group_pages])
+                    
+                    if is_jpeg and len(indices) == 1:
+                        p_data = group_pages[0]
                         if "pdf" in p_data["mime_type"].lower():
                             src_doc = fitz.open(stream=p_data["file_bytes"], filetype="pdf")
-                            new_doc.insert_pdf(src_doc, from_page=p_data["pdf_page_idx"], to_page=p_data["pdf_page_idx"])
-                            if rot != 0:
-                                page = new_doc[-1]
-                                page.set_rotation((page.rotation + rot) % 360)
+                            page = src_doc.load_page(p_data["pdf_page_idx"])
+                            pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+                            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                             src_doc.close()
                         else:
                             img = Image.open(io.BytesIO(p_data["file_bytes"]))
-                            img = ImageOps.exif_transpose(img) 
-                            if img.mode != "RGB": img = img.convert("RGB")
-                            if rot != 0: img = img.rotate(-rot, expand=True) 
-                            img_buf = io.BytesIO()
-                            img.save(img_buf, format="JPEG", quality=95)
-                            pdf_page = new_doc.new_page(width=img.width, height=img.height)
-                            pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
-                    merged_pdf_bytes_io = io.BytesIO()
-                    new_doc.save(merged_pdf_bytes_io)
-                    new_doc.close()
-                    merged_pdf_bytes = merged_pdf_bytes_io.getvalue()
-                
-                is_jpeg = final_name.lower().endswith(('.jpg', '.jpeg'))
-                orig_total_bytes = sum([len(p["file_bytes"]) for p in group_pages])
-                
-                if is_jpeg and len(indices) == 1:
-                    p_data = group_pages[0]
-                    img = Image.open(io.BytesIO(p_data["file_bytes"]))
-                    img = ImageOps.exif_transpose(img)
-                    try:
-                        rot = int(rotations.get(str(p_data["global_idx"]), 0))
-                        if rot != 0: img = img.rotate(-rot, expand=True)
-                    except: pass
-                    img_buf = io.BytesIO()
-                    img.save(img_buf, format="JPEG", quality=95)
-                    comp_bytes, out_mime = process_and_compress_file(img_buf.getvalue(), "image/jpeg", final_name)
-                else:
-                    comp_bytes, out_mime = process_and_compress_file(merged_pdf_bytes, "application/pdf", final_name)
+                            img = ImageOps.exif_transpose(img)
+                            
+                        try:
+                            rot = int(rotations.get(str(p_data["global_idx"]), 0))
+                            if rot != 0: img = img.rotate(-rot, expand=True)
+                        except: pass
+                        
+                        img_buf = io.BytesIO()
+                        img.save(img_buf, format="JPEG", quality=95)
+                        comp_bytes, out_mime = process_and_compress_file(img_buf.getvalue(), "image/jpeg", final_name)
+                    else:
+                        comp_bytes, out_mime = process_and_compress_file(merged_pdf_bytes, "application/pdf", final_name)
+                        
+                    orig_kb = orig_total_bytes / 1024
+                    comp_kb = len(comp_bytes) / 1024
                     
-                orig_kb = orig_total_bytes / 1024
-                comp_kb = len(comp_bytes) / 1024
+                    src_display = ", ".join(source_names)
+                    if len(src_display) > 30: src_display = src_display[:27] + "..."
+                    
+                    results.append({
+                        "original_name": f"분석결과 ({src_display})",
+                        "suggested_filename": final_name,
+                        "category": doc_info.get("doc_category", "기타"),
+                        "client_name": doc_info.get("client_name", ""),
+                        "mime": out_mime,
+                        "orig_kb": orig_kb,
+                        "comp_kb": comp_kb,
+                        "bytes": comp_bytes
+                    })
                 
-                src_display = ", ".join(source_names)
-                if len(src_display) > 30: src_display = src_display[:27] + "..."
-                
-                results.append({
-                    "original_name": f"분석결과 ({src_display})",
-                    "suggested_filename": final_name,
-                    "category": doc_info.get("doc_category", "기타"),
-                    "client_name": doc_info.get("client_name", ""),
-                    "mime": out_mime,
-                    "orig_kb": orig_kb,
-                    "comp_kb": comp_kb,
-                    "bytes": comp_bytes
-                })
+                except Exception as e:
+                    # 💡 실패한 파일명 기록 및 전체 멈춤 방지
+                    failed_docs.append(final_name)
                 
                 progress_bar.progress(min((idx + 1) * progress_step, 1.0))
                 
-            status_text.success("모든 서류의 묶기/분할 및 스마트 회전 최적화가 완료되었습니다.")
+            # 💡 수정 포인트: 에러 발생 유무에 따른 결과 메시지 출력
+            if failed_docs:
+                status_text.warning("일부 서류 처리에 실패했지만, 나머지 서류의 최적화는 완료되었습니다.")
+                st.warning("⚠️ **아래 서류는 파일 손상 또는 변환 중 오류가 발생하여 제외되었습니다. 원본 파일을 직접 확인해 주세요:**\n\n" + "\n".join([f"- {f}" for f in failed_docs]))
+            else:
+                status_text.success("모든 서류의 묶기/분할 및 스마트 회전 최적화가 완료되었습니다.")
+                
             st.session_state.analysis_results = results
 
     if st.session_state.analysis_results:
