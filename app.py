@@ -262,7 +262,7 @@ def extract_case_prep_info(tmpl_bytes, client_files):
     prompt = """
     You are an expert Canadian immigration case prep assistant.
     The FIRST document is a BLANK reference IRCC IMM form template (such as IMM5710, IMM5709, IMM1294, IMM1295, IMM5708).
-    The REMAINING attached documents are client materials (intake questionnaire, passport, work/study permit, visitor record, resume, WES, transcripts, employment letters, marriage certificate, police certificate, etc.).
+    The REMAINING attached documents are client materials.
 
     Carefully scan ALL attached client documents to extract all required information matching the IMM form fields.
 
@@ -280,24 +280,22 @@ def extract_case_prep_info(tmpl_bytes, client_files):
        - Previous Marital Status: Has client been previously married/common-law? (Yes/No). If Yes, extract Previous Spouse Full Name, Relationship Type, From Date (YYYY-MM-DD), To Date (YYYY-MM-DD), Previous Spouse Date of Birth (YYYY-MM-DD).
 
     4. EDUCATION (ALL Post-Secondary Entries):
-       - DO NOT extract only the highest level. Extract ALL post-secondary education history found in questionnaires, WES, transcripts, or resumes (needed for additional information sheets).
-       - For EACH education entry, extract:
-         * From Date (YYYY-MM) & To Date (YYYY-MM) (MUST include both Year and Month)
-         * Field and Level of Study (e.g. Diploma in Hospitality Management)
+       - DO NOT extract only the highest level. Extract ALL post-secondary education history found in questionnaires, WES, transcripts, or resumes.
+       - For EACH education entry, format fields with entry labels like 'Education Entry 1 - Dates', 'Education Entry 1 - Field & Level of Study', 'Education Entry 1 - School Name', 'Education Entry 1 - Location'.
+       - For EACH entry, extract:
+         * From Date (YYYY-MM) & To Date (YYYY-MM)
+         * Field and Level of Study
          * School / Facility Name
-         * City/Town
-         * Country or Territory
-         * Province/State (if applicable)
+         * City/Town, Country or Territory, Province/State (if applicable)
 
     5. EMPLOYMENT (10-Year History with Full Location):
        - Extract ALL employment/activity entries for the past 10 years.
+       - For EACH entry, format fields with entry labels like 'Employment Entry 1 - Dates', 'Employment Entry 1 - Job Title', 'Employment Entry 1 - Company Name', 'Employment Entry 1 - Location'.
        - For EACH entry, extract:
          * From Date (YYYY-MM) & To Date (YYYY-MM)
          * Activity / Occupation / Job Title
          * Company / Employer Name
-         * City/Town
-         * Country or Territory
-         * Province/State
+         * City/Town, Country or Territory, Province/State
 
     6. BACKGROUND INFORMATION (Refusals, Criminality, Military, Medical):
        - Refusal / Visa History (Q2): Has client ever overstayed status, been refused a visa/permit, or been denied entry/ordered to leave Canada or any other country? (Yes/No). Provide full details/explanation if Yes.
@@ -785,10 +783,25 @@ elif app_mode == MENU_3:
                 full_text_list.append(f"[{sec_name}]")
 
                 table_data = []
+                prev_group = None
                 for f in sec.get("fields", []):
                     field_lbl = f.get("field", "")
                     val = f.get("value", "")
                     src = f.get("source", "")
+
+                    # 💡 Entry 단위(Entry 1, Entry 2 등) 구분선 및 줄바꿈 추가
+                    group_match = re.match(r'^(.*?\bEntry\s*\d+)', field_lbl, re.IGNORECASE)
+                    curr_group = group_match.group(1).strip() if group_match else None
+
+                    if prev_group and curr_group and prev_group != curr_group:
+                        table_data.append({
+                            "항목 (Field)": "──────────",
+                            "추출값 (Value)": "──────────",
+                            "출처 (Source)": "──────────"
+                        })
+                        full_text_list.append("")
+
+                    prev_group = curr_group
 
                     if not val:
                         display_val = "⚠️ 확인 필요 (미발견)"
