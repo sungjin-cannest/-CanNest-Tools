@@ -310,7 +310,11 @@ def fill_imm5476(template_bytes, data):
     }
     flags = {"surname": False, "given": False, "dob": False, "email": False, "uci": False}
     
-    for page in doc:
+    # 💡 페이지별 Date 입력칸 개수를 추적하는 딕셔너리
+    page_date_counters = {}
+    
+    for page_idx, page in enumerate(doc):
+        page_date_counters[page_idx] = 0
         for widget in page.widgets():
             field_name = widget.field_name
             if not field_name: continue
@@ -328,11 +332,19 @@ def fill_imm5476(template_bytes, data):
             elif ("uci" in fname_lower or "unique client identifier" in fname_lower) and not flags["uci"]:
                 val_to_set = target_data["uci"]; flags["uci"] = True
             elif "date" in fname_lower and "birth" not in fname_lower:
-                # 💡 핵심 수정: date_counter 제한을 없애고 생년월일이 아닌 모든 Date 칸(SECTION D, E)에 서명일 입력
-                val_to_set = target_data["signDate"]
+                page_date_counters[page_idx] += 1
+                
+                # 💡 수정 1: 9번 및 12번 서명일에만 정밀 타겟팅
+                # 3페이지(index 2)의 첫 번째 Date: 9. Your representative's declaration
+                # 4페이지(index 3)의 첫 번째 Date: 12. Your declaration
+                if page_idx == 2 and page_date_counters[page_idx] == 1:
+                    val_to_set = target_data["signDate"]
+                elif page_idx == 3 and page_date_counters[page_idx] == 1:
+                    val_to_set = target_data["signDate"]
                 
             if val_to_set is not None:
-                set_smart_widget_value(widget, val_to_set, default_fontsize=11)
+                # 💡 수정 2: IMM5476 폼에만 글씨 크기를 2단계 축소 (11pt -> 9pt)
+                set_smart_widget_value(widget, val_to_set, default_fontsize=9)
 
     output_pdf = io.BytesIO()
     doc.save(output_pdf); doc.close(); output_pdf.seek(0)
@@ -387,6 +399,7 @@ def fill_consent_letter(template_bytes, data):
                         elif fname == dob_key: val_to_set = page_children[idx].get("dob", "")
             
             if val_to_set is not None:
+                # 동의서는 기존 11pt 크기 유지
                 set_smart_widget_value(widget, val_to_set, default_fontsize=11)
 
     output_pdf = io.BytesIO()
