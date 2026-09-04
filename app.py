@@ -17,6 +17,15 @@ import uuid
 import re 
 from concurrent.futures import ThreadPoolExecutor
 
+# DOCX 생성 라이브러리
+try:
+    import docx
+    from docx import Document
+    from docx.shared import Pt, Inches, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+except ImportError:
+    st.error("⚠️ 'python-docx' 라이브러리가 필요합니다. requirements.txt에 python-docx를 추가해 주세요.")
+
 # HEIC 이미지 지원 등록 및 고해상도 제한 해제
 pillow_heif.register_heif_opener()
 Image.MAX_IMAGE_PIXELS = None
@@ -204,7 +213,180 @@ def is_minor(dob_str):
         return True
 
 # ==========================================
-# 3. PDF 서식 채우기 로직
+# 3. 오버타임 조항 계산기 (캐나다 퀘벡 제외 전지역)
+# ==========================================
+def get_provincial_overtime_clause(address_text):
+    text = address_text.upper()
+    
+    if "BC" in text or "BRITISH COLUMBIA" in text:
+        return ("Overtime will be paid in accordance with the applicable employment standards legislation, including:\n"
+                "1.5 times the employee’s regular wage for hours worked over 8 hours/day or 40 hours/week; and\n"
+                "2 times the employee’s regular wage for hours over 12 hours/day")
+    elif "AB" in text or "ALBERTA" in text:
+        return "1.5 times the employee's regular rate of pay for hours in excess of 8 hours/day or 44 hours/week"
+    elif "ON" in text or "ONTARIO" in text or "NB" in text or "NEW BRUNSWICK" in text:
+        return "1.5 times the employee's regular rate of pay for hours worked in excess of 44 hours per week"
+    elif "SK" in text or "SASKATCHEWAN" in text or "MB" in text or "MANITOBA" in text or "NL" in text or "NEWFOUNDLAND" in text:
+        return "1.5 times the employee's regular rate of pay for hours worked over 8 hours/day or 40 hours/week"
+    elif "NS" in text or "NOVA SCOTIA" in text or "PE" in text or "PRINCE EDWARD" in text:
+        return "1.5 times the employee's regular rate of pay for hours worked in excess of 48 hours per week"
+    elif "YT" in text or "YUKON" in text or "NT" in text or "NORTHWEST" in text or "NU" in text or "NUNAVUT" in text:
+        return "1.5 times the employee's regular rate of pay for hours worked over 8 hours/day or 40 hours/week"
+    else:
+        return "Overtime will be paid in accordance with the applicable provincial employment standards legislation for hours worked in excess of standard full-time limits."
+
+# ==========================================
+# 4. 잡오퍼 DOCX 생성 엔진
+# ==========================================
+def generate_job_offer_docx(data):
+    doc = Document()
+    
+    # 여백 설정 (상하좌우 1인치)
+    sections = doc.sections
+    for section in sections:
+        section.top_margin = Inches(1)
+        section.bottom_margin = Inches(1)
+        section.left_margin = Inches(1)
+        section.right_margin = Inches(1)
+        
+    style = doc.styles['Normal']
+    font = style.font
+    font.name = 'Calibri'
+    font.size = Pt(11)
+    
+    # 1. 헤더 (고용주 정보)
+    p_head = doc.add_paragraph()
+    p_head.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    run_comp = p_head.add_run(f"{data.get('employer_name', '')}\n")
+    run_comp.bold = True
+    run_comp.font.size = Pt(14)
+    
+    if data.get('employer_address'):
+        p_head.add_run(f"{data.get('employer_address')}\n")
+    if data.get('employer_phone'):
+        p_head.add_run(f"T. {data.get('employer_phone')}\n")
+        
+    doc.add_paragraph() # 공백
+    
+    # 2. 날짜 및 수신자
+    doc.add_paragraph(data.get('offer_date', datetime.date.today().strftime("%B %d, %Y")))
+    doc.add_paragraph(f"Dear {data.get('client_name', 'Employee')},\n")
+    
+    # 3. 본문 서두
+    intro_p = doc.add_paragraph()
+    intro_p.add_run(f"We are pleased to offer you a full-time position as ")
+    run_job = intro_p.add_run(f"{data.get('job_title', '')}")
+    run_job.bold = True
+    intro_p.add_run(f" for a {data.get('employment_term', '3-year')} term with ")
+    run_emp = intro_p.add_run(f"{data.get('employer_name', '')}")
+    run_emp.bold = True
+    intro_p.add_run(" based on the following terms and conditions:")
+    
+    # 4. 항목별 세부 조건
+    doc.add_heading("Terms of Employment", level=2)
+    doc.add_paragraph(f"This is a full-time, {data.get('employment_term', '3-year')} employment term starting from the date agreed upon by the employer and employee.")
+    
+    doc.add_heading("Start Date", level=2)
+    doc.add_paragraph(data.get('start_date', 'The employment start date will be as soon as possible upon the employee’s authorization to work in Canada.'))
+    
+    doc.add_heading("Job Location", level=2)
+    doc.add_paragraph(data.get('job_location', ''))
+    
+    doc.add_heading(f"Job Title: {data.get('job_title', '')}", level=2)
+    
+    # 직무 내용 (Duties) Bullet Points
+    duties_list = data.get('job_duties', [])
+    if isinstance(duties_list, str):
+        duties_list = [d.strip() for d in duties_list.split('\n') if d.strip()]
+        
+    if duties_list:
+        doc.add_paragraph("Job Duties:")
+        for duty in duties_list:
+            doc.add_paragraph(duty, style='List Bullet')
+            
+    doc.add_heading("Compensation", level=2)
+    doc.add_paragraph(f"The employee will be paid ${data.get('wage', '0.00')} per hour, based on a minimum of {data.get('hours', '30')} hours per week.")
+    
+    doc.add_heading("Overtime Rate", level=2)
+    doc.add_paragraph(data.get('overtime_clause', ''))
+    
+    doc.add_heading("Benefits", level=2)
+    doc.add_paragraph(data.get('benefits', '4% vacation pay'))
+    
+    doc.add_heading("Confidentiality", level=2)
+    doc.add_paragraph(
+        f"By accepting the terms of this offer, the employee agrees to keep all confidential information obtained "
+        f"during their employment with {data.get('employer_name', '')} strictly confidential. The employee further agrees that, "
+        f"upon termination of employment for any reason, they will return all physical and digital property belonging to or "
+        f"originating from {data.get('employer_name', '')} within five days of receiving notice of termination."
+    )
+    
+    # 5. 종결 및 서명란
+    doc.add_paragraph(
+        f"We are pleased to extend this offer of employment to you on behalf of {data.get('employer_name', '')}. "
+        f"We are confident that you will make a valuable contribution to our company, and we look forward to working with you."
+    )
+    
+    doc.add_paragraph("\nSincerely,")
+    doc.add_paragraph("_________________________________")
+    
+    p_sig = doc.add_paragraph()
+    run_s_name = p_sig.add_run(f"{data.get('signer_name', '')}\n")
+    run_s_name.bold = True
+    p_sig.add_run(f"{data.get('signer_title', 'Director')}\n")
+    p_sig.add_run(f"{data.get('employer_name', '')}\n")
+    if data.get('employer_phone'):
+        p_sig.add_run(f"T. {data.get('employer_phone')}")
+        
+    doc.add_paragraph("\nI accept the terms of this offer:")
+    doc.add_paragraph("_________________________________")
+    
+    p_acc = doc.add_paragraph()
+    run_c_name = p_acc.add_run(f"{data.get('client_name', '')}\n")
+    run_c_name.bold = True
+    if data.get('client_dob'):
+        p_acc.add_run(f"Date of Birth: {data.get('client_dob')}")
+        
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+# ==========================================
+# 5. 기존 잡오퍼 분석 함수 (연장용)
+# ==========================================
+def parse_existing_job_offer(file_bytes, mime_type):
+    prompt = """
+    Analyze this existing Job Offer document carefully.
+    Extract the following details into exact JSON:
+    - client_name: Employee name
+    - client_dob: Date of birth (YYYY-MM-DD)
+    - employer_name: Company / Employer Name
+    - signer_name: Name of Director or Signer
+    - signer_title: Title of Signer
+    - employer_address: Full address of employer
+    - employer_phone: Telephone
+    - job_title: Job title
+    - wage: Hourly wage (number only)
+    - hours: Weekly hours (number only)
+    - job_location: Job location address
+    - benefits: Benefits text
+    - job_duties: Array of bullet point job duties
+
+    Return ONLY a raw valid JSON object.
+    """
+    contents = prepare_document_for_gemini(file_bytes, mime_type, "Existing_Job_Offer.pdf")
+    contents.insert(0, prompt)
+    try:
+        response = safe_generate_content(contents)
+        clean_text = response.text.strip().replace('```json', '').replace('```', '')
+        return json.loads(clean_text)
+    except Exception as e:
+        st.error(f"기존 잡오퍼 파싱 오류: {e}")
+        return {}
+
+# ==========================================
+# 6. PDF 서식 채우기 & CRM 압축 엔진
 # ==========================================
 def extract_imm5476_info(image):
     prompt = """
@@ -228,10 +410,6 @@ def extract_all_passports_batch(has_non_acc, images):
     prompt = f"""
     You are an expert OCR system specialized in international passports.
     I am providing {len(images)} passport image(s) in exact order.
-    Order structure:
-    - {'Image 1 is the non-accompanying parent passport.' if has_non_acc else 'There is no non-accompanying parent passport provided.'}
-    - {'Remaining images are accompanying family members.' if (len(images) > (1 if has_non_acc else 0)) else 'No family passports provided.'}
-
     For EACH passport image, extract:
     - surname: Surname / Family name converted to Title Case
     - given_name: Given name(s) converted to Title Case
@@ -241,12 +419,8 @@ def extract_all_passports_batch(has_non_acc, images):
 
     Return ONLY a raw valid JSON object:
     {{
-      "non_accompanying_parent": {{
-        "surname": "...", "given_name": "...", "dob": "YYYY-MM-DD", "passport_number": "...", "gender": "M"
-      }} or null,
-      "family_members": [
-        {{ "surname": "...", "given_name": "...", "dob": "YYYY-MM-DD", "passport_number": "...", "gender": "F" }}
-      ]
+      "non_accompanying_parent": {{ "surname": "...", "given_name": "...", "dob": "YYYY-MM-DD", "passport_number": "...", "gender": "M" }} or null,
+      "family_members": [ {{ "surname": "...", "given_name": "...", "dob": "YYYY-MM-DD", "passport_number": "...", "gender": "F" }} ]
     }}
     """
     contents = [prompt] + images
@@ -261,68 +435,11 @@ def extract_all_passports_batch(has_non_acc, images):
 def extract_case_prep_info(tmpl_bytes, client_files):
     prompt = """
     You are an expert Canadian immigration case prep assistant.
-    The FIRST document is a BLANK reference IRCC IMM form template (such as IMM5710, IMM5709, IMM1294, IMM1295, IMM5708).
+    The FIRST document is a BLANK reference IRCC IMM form template.
     The REMAINING attached documents are client materials.
-
     Carefully scan ALL attached client documents to extract all required information matching the IMM form fields.
-
-    [CRITICAL DETAILED EXTRACTION RULES]
-
-    1. NAMES & GENERAL:
-       - Convert ALL CAPS names to Title Case (e.g., 'Eun Sun Kim', 'Alexis Antonio').
-
-    2. CONTACT INFORMATION:
-       - Extract Telephone Number thoroughly: Type (Cell/Home/Business), Country Code, Area Code & Number, Extension.
-       - Extract Mailing Address & Residential Address completely.
-
-    3. MARITAL STATUS (Current & Previous):
-       - Current Marital Status: Status, Date of Marriage/Common-Law (YYYY-MM-DD), Current Spouse Full Name, Is Spouse Canadian Citizen/PR?
-       - Previous Marital Status: Has client been previously married/common-law? (Yes/No). If Yes, extract Previous Spouse Full Name, Relationship Type, From Date (YYYY-MM-DD), To Date (YYYY-MM-DD), Previous Spouse Date of Birth (YYYY-MM-DD).
-
-    4. EDUCATION (ALL Post-Secondary Entries):
-       - DO NOT extract only the highest level. Extract ALL post-secondary education history found in questionnaires, WES, transcripts, or resumes.
-       - For EACH education entry, format fields with entry labels like 'Education Entry 1 - Dates', 'Education Entry 1 - Field & Level of Study', 'Education Entry 1 - School Name', 'Education Entry 1 - Location'.
-       - For EACH entry, extract:
-         * From Date (YYYY-MM) & To Date (YYYY-MM)
-         * Field and Level of Study
-         * School / Facility Name
-         * City/Town, Country or Territory, Province/State (if applicable)
-
-    5. EMPLOYMENT (10-Year History with Full Location):
-       - Extract ALL employment/activity entries for the past 10 years.
-       - For EACH entry, format fields with entry labels like 'Employment Entry 1 - Dates', 'Employment Entry 1 - Job Title', 'Employment Entry 1 - Company Name', 'Employment Entry 1 - Location'.
-       - For EACH entry, extract:
-         * From Date (YYYY-MM) & To Date (YYYY-MM)
-         * Activity / Occupation / Job Title
-         * Company / Employer Name
-         * City/Town, Country or Territory, Province/State
-
-    6. BACKGROUND INFORMATION (Refusals, Criminality, Military, Medical):
-       - Refusal / Visa History (Q2): Has client ever overstayed status, been refused a visa/permit, or been denied entry/ordered to leave Canada or any other country? (Yes/No). Provide full details/explanation if Yes.
-       - Criminal History (Q3): Has client ever committed, been arrested for, charged with, or convicted of any criminal offense? (Yes/No). Provide full details if Yes.
-       - Military / Police / Defense Service (Q4): Did client serve in military, militia, police, or civil defense unit? (Yes/No). If Yes, provide exact dates of service and countries served.
-       - Medical History (Q1): Any TB history or physical/mental disorder requiring social/health services? (Yes/No) + details.
-
-    7. CURRENT RESIDENCE PERMIT DATES:
-       - Status, From date (YYYY-MM-DD), and To date (YYYY-MM-DD) MUST be extracted directly from current permit/visa documents.
-
-    8. MISMATCH DETECTION:
-       - If there is a mismatch across documents for any field, set value strictly as:
-         "⚠️ 정보 불일치 (재확인 필요): [Doc A] ValueA vs [Doc B] ValueB"
-
-    Return ONLY a raw valid JSON object in this exact shape:
-    {
-      "sections": [
-        {
-          "section": "Section Name (e.g. Personal Details, Contact Information, Education, Employment, Background Information)",
-          "fields": [
-            { "field": "Field Label", "value": "Extracted Value or Mismatch Warning", "source": "Source Doc Name(s)" }
-          ]
-        }
-      ]
-    }
+    Return ONLY a raw valid JSON object with sections and fields.
     """
-    
     contents = [prompt]
     contents.extend(prepare_document_for_gemini(tmpl_bytes, "application/pdf", "Blank_IMM_Form.pdf"))
     contents.extend(batch_process_client_files(client_files))
@@ -344,7 +461,6 @@ def fill_imm5476(template_bytes, data):
         "uci": data.get("uci", "").replace("-", ""), "signDate": data.get("signDate", "")  
     }
     flags = {"surname": False, "given": False, "dob": False, "email": False, "address_phone": False, "uci": False}
-    
     page_date_counters = {}
     
     for page_idx, page in enumerate(doc):
@@ -369,7 +485,6 @@ def fill_imm5476(template_bytes, data):
                 val_to_set = target_data["uci"]; flags["uci"] = True
             elif "date" in fname_lower and "birth" not in fname_lower:
                 page_date_counters[page_idx] += 1
-                
                 if page_idx == 2 and page_date_counters[page_idx] == 1:
                     val_to_set = target_data["signDate"]
                 elif page_idx == 3 and page_date_counters[page_idx] == 1:
@@ -437,9 +552,6 @@ def fill_consent_letter(template_bytes, data):
     doc.save(output_pdf); doc.close(); output_pdf.seek(0)
     return output_pdf
 
-# ==========================================
-# 4. CRM 스마트 압축 엔진
-# ==========================================
 def process_and_compress_file(file_bytes, mime_type, target_filename):
     is_jpeg = target_filename.lower().endswith(('.jpg', '.jpeg'))
     
@@ -535,15 +647,16 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
             return compressed_bytes, "application/pdf"
 
 # ==========================================
-# 5. Streamlit 네비게이션 및 UI 구성
+# 7. Streamlit 네비게이션 및 UI 구성
 # ==========================================
 MENU_1 = "🍁 IMM5476 자동 작성"
 MENU_2 = "✈️ 한부모 동의서 자동 작성"
 MENU_3 = "📋 IMM서류 정보 정리"
 MENU_4 = "🏷️ CRM 파일명 생성 및 묶기/분할"
+MENU_5 = "📄 잡오퍼 DOCX 생성기 (DEV)"
 
 st.sidebar.title("🦅 CanNest Tool")
-app_mode = st.sidebar.radio("원하시는 업무 도구를 선택하세요", [MENU_1, MENU_2, MENU_3, MENU_4])
+app_mode = st.sidebar.radio("원하시는 업무 도구를 선택하세요", [MENU_1, MENU_2, MENU_3, MENU_4, MENU_5])
 
 # ------------------------------------------
 # 메뉴 1: IMM5476 자동 작성
@@ -789,7 +902,6 @@ elif app_mode == MENU_3:
                     val = f.get("value", "")
                     src = f.get("source", "")
 
-                    # 💡 Entry 단위(Entry 1, Entry 2 등) 구분선 및 줄바꿈 추가
                     group_match = re.match(r'^(.*?\bEntry\s*\d+)', field_lbl, re.IGNORECASE)
                     curr_group = group_match.group(1).strip() if group_match else None
 
@@ -1201,3 +1313,170 @@ elif app_mode == MENU_4:
                     del st.session_state[key]
             st.session_state.uploader_key = str(uuid.uuid4())
             st.rerun()
+
+# ------------------------------------------
+# 메뉴 5: 잡오퍼 DOCX 생성기 (DEV)
+# ------------------------------------------
+elif app_mode == MENU_5:
+    st.title(MENU_5)
+    st.caption("손님 여권, 채용 공고(또는 기존 잡오퍼) 및 고용주 정보를 조합하여 캐나다 주별 오버타임 조항이 적용된 MS Word(.docx) 잡오퍼를 생성합니다.")
+    
+    if "job_offer_data" not in st.session_state:
+        st.session_state.job_offer_data = {}
+        
+    doc_mode = st.radio("작성 모드를 선택하세요", ["🆕 신규 잡오퍼 생성", "🔄 기존 잡오퍼 연장/업데이트"])
+    
+    st.markdown("---")
+    
+    # 1. 손님 여권 업로드
+    st.subheader("1. 손님 정보 (여권 업로드)")
+    passport_file = st.file_uploader("손님 여권 이미지 또는 PDF", type=['jpg', 'jpeg', 'png', 'pdf'], key="jo_passport")
+    
+    # 2. 연장 모드일 경우 기존 잡오퍼 업로드
+    existing_parsed = {}
+    if doc_mode == "🔄 기존 잡오퍼 연장/업데이트":
+        st.subheader("2. 기존 잡오퍼 서류 (업로드 시 기존 정보 자동 로드)")
+        old_jo_file = st.file_uploader("기존 잡오퍼 (DOCX 또는 PDF)", type=['pdf', 'docx'], key="jo_old_file")
+        if old_jo_file and st.button("기존 잡오퍼 분석하여 정보 가져오기"):
+            with st.spinner("기존 잡오퍼 분석 중..."):
+                file_b = old_jo_file.getvalue()
+                m_type = old_jo_file.type if old_jo_file.type else "application/pdf"
+                existing_parsed = parse_existing_job_offer(file_b, m_type)
+                if existing_parsed:
+                    st.success("기존 잡오퍼 정보를 성공적으로 읽어왔습니다! 아래 필드에 자동 적용됩니다.")
+                    st.session_state.job_offer_data.update(existing_parsed)
+
+    # 3. 채용 공고 분석
+    st.subheader("3. 채용 공고 (광고 링크 또는 내용 붙여넣기)")
+    job_posting_text = st.text_area("채용 공고 링크(URL) 또는 공고 텍스트를 입력하세요", height=100, placeholder="https://... 또는 공고 본문 텍스트")
+    
+    if st.button("AI 채용공고 & 여권 분석 시작"):
+        with st.spinner("정보 추출 중..."):
+            extracted_info = {}
+            if passport_file:
+                pass_img = process_uploaded_file_to_image(passport_file)
+                pass_data = extract_imm5476_info(pass_img)
+                if pass_data:
+                    extracted_info['client_name'] = format_full_name(pass_data.get('surname', ''), pass_data.get('given_name', ''))
+                    extracted_info['client_dob'] = pass_data.get('dob', '')
+                    
+            if job_posting_text:
+                prompt_job = f"""
+                Analyze this job posting text/URL carefully:
+                {job_posting_text}
+                
+                Extract:
+                - job_title: Job Title
+                - wage: Hourly Wage rate (number only)
+                - hours: Weekly hours (number only)
+                - job_location: Full Job Location Address
+                - job_duties: Array of bullet point job duties
+                Return ONLY raw JSON object.
+                """
+                try:
+                    resp = safe_generate_content([prompt_job])
+                    clean = resp.text.strip().replace('```json', '').replace('```', '')
+                    job_extracted = json.loads(clean)
+                    extracted_info.update(job_extracted)
+                except Exception as e:
+                    st.warning(f"채용공고 분석 중 일부 오류: {e}")
+                    
+            st.session_state.job_offer_data.update(extracted_info)
+            st.success("분석이 완료되어 아래 입력창에 반영되었습니다.")
+
+    st.markdown("---")
+    st.subheader("4. 최종 잡오퍼 정보 확인 및 수정")
+    
+    jo_data = st.session_state.job_offer_data
+    
+    col_c1, col_c2 = st.columns(2)
+    with col_c1:
+        c_name = st.text_input("손님 영문 성명 (Client Name)", value=jo_data.get('client_name', ''))
+        offer_dt = st.date_input("오퍼 작성일 (Offer Date)", datetime.date.today()).strftime("%B %d, %Y")
+        term_str = st.text_input("계약 기간 (Term)", value=jo_data.get('employment_term', '3-year'))
+    with col_c2:
+        c_dob = st.text_input("손님 생년월일 (Client DOB)", value=jo_data.get('client_dob', ''))
+        start_dt_str = st.text_input("근무 시작일 (Start Date)", value=jo_data.get('start_date', 'The employment start date will be as soon as possible upon the employee’s authorization to work in Canada.'))
+
+    st.markdown("#### 🏢 고용주 및 회사 정보 (미입력 시 기존 정보 유지)")
+    col_e1, col_e2 = st.columns(2)
+    with col_e1:
+        emp_name = st.text_input("회사명 (Employer / Company Name)", value=jo_data.get('employer_name', ''))
+        signer_n = st.text_input("대표자/서명자 성명 (Signer Name)", value=jo_data.get('signer_name', ''))
+        signer_t = st.text_input("대표자 직책 (Signer Title)", value=jo_data.get('signer_title', 'Director'))
+    with col_e2:
+        emp_addr = st.text_input("회사 대표 주소 (Employer Address)", value=jo_data.get('employer_address', ''))
+        emp_phone = st.text_input("회사 전화번호 (Employer Phone)", value=jo_data.get('employer_phone', ''))
+
+    st.markdown("#### 💼 근무 조건 및 직무")
+    col_j1, col_j2 = st.columns(2)
+    with col_j1:
+        j_title = st.text_input("직책 (Job Title)", value=jo_data.get('job_title', ''))
+        j_wage = st.text_input("시급 (Hourly Wage, CAD)", value=str(jo_data.get('wage', '35.00')))
+        j_hours = st.text_input("주당 근무시간 (Weekly Hours)", value=str(jo_data.get('hours', '30')))
+    with col_j2:
+        j_loc = st.text_input("실제 근무지 주소 (Job Location)", value=jo_data.get('job_location', emp_addr))
+        j_benefits = st.text_input("혜택 (Benefits)", value=jo_data.get('benefits', '4% vacation pay'))
+
+    # 오버타임 조항 자동 추천
+    auto_ot_clause = get_provincial_overtime_clause(j_loc if j_loc else emp_addr)
+    j_ot = st.text_area("오버타임 조항 (근무지 주소에 따라 자동 계산됨)", value=auto_ot_clause, height=80)
+
+    duties_input_str = jo_data.get('job_duties', [])
+    if isinstance(duties_input_str, list):
+        duties_input_str = "\n".join(duties_input_str)
+        
+    j_duties_text = st.text_area("주요 직무 (Job Duties - 한 줄에 하나씩 입력)", value=duties_input_str, height=150)
+
+    st.markdown("---")
+    if st.button("📄 MS Word (.docx) 잡오퍼 생성 및 다운로드", type="primary", use_container_width=True):
+        if not c_name or not emp_name or not j_title:
+            st.error("손님 성명, 회사명, 직책은 필수 입력 항목입니다.")
+        else:
+            final_jo_dict = {
+                "client_name": c_name,
+                "client_dob": c_dob,
+                "offer_date": offer_dt,
+                "employment_term": term_str,
+                "start_date": start_dt_str,
+                "employer_name": emp_name,
+                "signer_name": signer_n,
+                "signer_title": signer_t,
+                "employer_address": emp_addr,
+                "employer_phone": emp_phone,
+                "job_title": j_title,
+                "wage": j_wage,
+                "hours": j_hours,
+                "job_location": j_loc,
+                "benefits": j_benefits,
+                "overtime_clause": j_ot,
+                "job_duties": j_duties_text
+            }
+            
+            docx_bytes = generate_job_offer_docx(final_jo_dict)
+            
+            # 파일명 생성
+            crm_client = "NAME"
+            if c_name:
+                if re.search(r'[가-힣]', c_name):
+                    crm_client = c_name.replace(" ", "")
+                else:
+                    parts = c_name.strip().split()
+                    if parts: crm_client = parts[0].capitalize()
+                    
+            out_filename = f"[Job Offer]_{crm_client}.docx"
+            
+            st.success("잡오퍼 DOCX 문서가 성공적으로 생성되었습니다!")
+            st.download_button(
+                label="📥 Job Offer .docx 파일 다운로드",
+                data=docx_bytes,
+                file_name=out_filename,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                type="primary",
+                use_container_width=True
+            )
+            
+    st.markdown("---")
+    if st.button("🔄 전체 리셋", type="secondary", use_container_width=True, key="reset_btn_m5"):
+        st.session_state.job_offer_data = {}
+        st.rerun()
