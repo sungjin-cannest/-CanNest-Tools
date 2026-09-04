@@ -261,28 +261,62 @@ def extract_all_passports_batch(has_non_acc, images):
 def extract_case_prep_info(tmpl_bytes, client_files):
     prompt = """
     You are an expert Canadian immigration case prep assistant.
-    The FIRST document is a BLANK reference IRCC IMM form template.
+    The FIRST document is a BLANK reference IRCC IMM form template (such as IMM5710, IMM5709, IMM1294, IMM1295, IMM5708).
     The REMAINING attached documents are client materials.
 
-    CRITICAL RULE FOR NAMES (Title Case):
-    ALWAYS convert any ALL CAPS names to Title Case.
+    Carefully scan ALL attached client documents to extract all required information matching the IMM form fields.
 
-    CRITICAL RULE FOR "Current country or territory of residence":
-    - Status, From date, and To date in this section MUST be extracted directly from the client's CURRENT PERMIT / VISA document.
+    [CRITICAL DETAILED EXTRACTION RULES]
 
-    CRITICAL RULE FOR CROSS-DOCUMENT MISMATCH DETECTION:
-    Compare information across ALL client documents carefully.
-    If there is a mismatch between documents:
-       Set the "value" field strictly as:
-       "⚠️ 정보 불일치 (재확인 필요): [DocType A] ValueA vs [DocType B] ValueB"
+    1. NAMES & GENERAL:
+       - Convert ALL CAPS names to Title Case (e.g., 'Eun Sun Kim', 'Alexis Antonio').
 
-    Return ONLY a raw JSON object in this exact shape:
+    2. CONTACT INFORMATION:
+       - Extract Telephone Number thoroughly: Type (Cell/Home/Business), Country Code, Area Code & Number, Extension.
+       - Extract Mailing Address & Residential Address completely.
+
+    3. MARITAL STATUS (Current & Previous):
+       - Current Marital Status: Status, Date of Marriage/Common-Law (YYYY-MM-DD), Current Spouse Full Name, Is Spouse Canadian Citizen/PR?
+       - Previous Marital Status: Has client been previously married/common-law? (Yes/No). If Yes, extract Previous Spouse Full Name, Relationship Type, From Date (YYYY-MM-DD), To Date (YYYY-MM-DD), Previous Spouse Date of Birth (YYYY-MM-DD).
+
+    4. EDUCATION (ALL Post-Secondary Entries):
+       - DO NOT extract only the highest level. Extract ALL post-secondary education history found in questionnaires, WES, transcripts, or resumes.
+       - For EACH education entry, format fields with entry labels like 'Education Entry 1 - Dates', 'Education Entry 1 - Field & Level of Study', 'Education Entry 1 - School Name', 'Education Entry 1 - Location'.
+       - For EACH entry, extract:
+         * From Date (YYYY-MM) & To Date (YYYY-MM)
+         * Field and Level of Study
+         * School / Facility Name
+         * City/Town, Country or Territory, Province/State (if applicable)
+
+    5. EMPLOYMENT (10-Year History with Full Location):
+       - Extract ALL employment/activity entries for the past 10 years.
+       - For EACH entry, format fields with entry labels like 'Employment Entry 1 - Dates', 'Employment Entry 1 - Job Title', 'Employment Entry 1 - Company Name', 'Employment Entry 1 - Location'.
+       - For EACH entry, extract:
+         * From Date (YYYY-MM) & To Date (YYYY-MM)
+         * Activity / Occupation / Job Title
+         * Company / Employer Name
+         * City/Town, Country or Territory, Province/State
+
+    6. BACKGROUND INFORMATION (Refusals, Criminality, Military, Medical):
+       - Refusal / Visa History (Q2): Has client ever overstayed status, been refused a visa/permit, or been denied entry/ordered to leave Canada or any other country? (Yes/No). Provide full details/explanation if Yes.
+       - Criminal History (Q3): Has client ever committed, been arrested for, charged with, or convicted of any criminal offense? (Yes/No). Provide full details if Yes.
+       - Military / Police / Defense Service (Q4): Did client serve in military, militia, police, or civil defense unit? (Yes/No). If Yes, provide exact dates of service and countries served.
+       - Medical History (Q1): Any TB history or physical/mental disorder requiring social/health services? (Yes/No) + details.
+
+    7. CURRENT RESIDENCE PERMIT DATES:
+       - Status, From date (YYYY-MM-DD), and To date (YYYY-MM-DD) MUST be extracted directly from current permit/visa documents.
+
+    8. MISMATCH DETECTION:
+       - If there is a mismatch across documents for any field, set value strictly as:
+         "⚠️ 정보 불일치 (재확인 필요): [Doc A] ValueA vs [Doc B] ValueB"
+
+    Return ONLY a raw valid JSON object in this exact shape:
     {
       "sections": [
         {
-          "section": "short section name from the form",
+          "section": "Section Name (e.g. Personal Details, Contact Information, Education, Employment, Background Information)",
           "fields": [
-            { "field": "field label", "value": "extracted value or mismatch warning", "source": "source document name(s)" }
+            { "field": "Field Label", "value": "Extracted Value or Mismatch Warning", "source": "Source Doc Name(s)" }
           ]
         }
       ]
@@ -306,7 +340,7 @@ def fill_imm5476(template_bytes, data):
     target_data = {
         "surname": data.get("surname", ""), "given": data.get("given_name", ""),
         "dob": data.get("dob", ""), "email": data.get("email", ""),
-        "address_phone": data.get("address_phone", ""), # 💡 주소/전화번호 데이터 추가
+        "address_phone": data.get("address_phone", ""),
         "uci": data.get("uci", "").replace("-", ""), "signDate": data.get("signDate", "")  
     }
     flags = {"surname": False, "given": False, "dob": False, "email": False, "address_phone": False, "uci": False}
@@ -329,7 +363,6 @@ def fill_imm5476(template_bytes, data):
                 val_to_set = target_data["dob"]; flags["dob"] = True
             elif "email" in fname_lower and not flags["email"]:
                 val_to_set = target_data["email"]; flags["email"] = True
-            # 💡 Section A 3번 항목: 이메일 대신 주소/전화번호 입력 칸 매핑
             elif ("telephone" in fname_lower or "address" in fname_lower) and page_idx == 0 and not flags["address_phone"]:
                 val_to_set = target_data["address_phone"]; flags["address_phone"] = True
             elif ("uci" in fname_lower or "unique client identifier" in fname_lower) and not flags["uci"]:
@@ -337,7 +370,6 @@ def fill_imm5476(template_bytes, data):
             elif "date" in fname_lower and "birth" not in fname_lower:
                 page_date_counters[page_idx] += 1
                 
-                # 9번 및 12번 서명일만 정밀 타겟팅
                 if page_idx == 2 and page_date_counters[page_idx] == 1:
                     val_to_set = target_data["signDate"]
                 elif page_idx == 3 and page_date_counters[page_idx] == 1:
@@ -549,7 +581,6 @@ if app_mode == MENU_1:
             uci = st.text_input("UCI", data.get("uci", ""))
             sign_date = st.date_input("서명날짜", datetime.date.today())
 
-        # 💡 신규 추가: 이메일이 없는 미성년자/신청자용 주소/전화번호 입력 칸 (Section A 3번)
         address_phone = st.text_input("주소 또는 전화번호 (이메일이 없는 미성년자/신청자용)", placeholder="예: 2301-6658 Dow Ave, Burnaby BC V5H 0C7")
 
         if st.button("문서 생성 및 다운로드", type="primary"):
@@ -752,10 +783,25 @@ elif app_mode == MENU_3:
                 full_text_list.append(f"[{sec_name}]")
 
                 table_data = []
+                prev_group = None
                 for f in sec.get("fields", []):
                     field_lbl = f.get("field", "")
                     val = f.get("value", "")
                     src = f.get("source", "")
+
+                    # 💡 Entry 단위(Entry 1, Entry 2 등) 구분선 및 줄바꿈 추가
+                    group_match = re.match(r'^(.*?\bEntry\s*\d+)', field_lbl, re.IGNORECASE)
+                    curr_group = group_match.group(1).strip() if group_match else None
+
+                    if prev_group and curr_group and prev_group != curr_group:
+                        table_data.append({
+                            "항목 (Field)": "──────────",
+                            "추출값 (Value)": "──────────",
+                            "출처 (Source)": "──────────"
+                        })
+                        full_text_list.append("")
+
+                    prev_group = curr_group
 
                     if not val:
                         display_val = "⚠️ 확인 필요 (미발견)"
@@ -861,7 +907,6 @@ elif app_mode == MENU_4:
 
             status_text.text("2. AI가 페이지별 문맥을 분석하여 연관 서류를 묶거나 나누는 중입니다...")
             
-            # 💡 2단계 Fallback 예외처리 지침 추가된 프롬프트
             prompt = f"""
             You are an expert AI document classifier for a Canadian immigration firm.
             I am providing {len(global_pages)} pages of documents uploaded by a client. 
@@ -1088,7 +1133,7 @@ elif app_mode == MENU_4:
                         "orig_kb": orig_kb,
                         "comp_kb": comp_kb,
                         "bytes": comp_bytes,
-                        "is_unclassified": is_unclassified # 💡 미분류 상태 기록
+                        "is_unclassified": is_unclassified
                     })
                 
                 except Exception as e:
@@ -1117,7 +1162,6 @@ elif app_mode == MENU_4:
             with col1:
                 st.write(f"**출처**: `{item['original_name']}`")
                 st.caption(f"{item['orig_kb']:.1f} KB ➡️ **{item['comp_kb']:.1f} KB**")
-                # 💡 규칙 미확인 서류에 시각적 경고 태그 표시
                 if item.get("is_unclassified"):
                     st.warning("⚠️ 규칙 미확인 서류 (파일명 수동 확인 필요)")
                 
