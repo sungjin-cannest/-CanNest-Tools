@@ -4,3 +4,4 @@ PyMuPDF
 pypdf
 Pillow
 pillow-heif
+python-docx
