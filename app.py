@@ -15,13 +15,14 @@ import datetime
 import time
 import uuid
 import re 
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 # DOCX 생성 라이브러리
 try:
     import docx
     from docx import Document
-    from docx.shared import Pt, Inches, RGBColor
+    from docx.shared import Pt, Inches
     from docx.enum.text import WD_ALIGN_PARAGRAPH
 except ImportError:
     st.error("⚠️ 'python-docx' 라이브러리가 필요합니다. requirements.txt에 python-docx를 추가해 주세요.")
@@ -83,7 +84,33 @@ def safe_generate_content(contents):
     raise last_error
 
 # ==========================================
-# 2. 공통 캐싱 및 스마트 글자 크기 조절 함수
+# 2. 실시간 웹페이지 텍스트 크롤러 (URL 분석용)
+# ==========================================
+def fetch_url_content(url):
+    target_url = url.strip()
+    if not target_url.startswith("http://") and not target_url.startswith("https://"):
+        target_url = "https://" + target_url
+    try:
+        req = urllib.request.Request(
+            target_url, 
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+        )
+        with urllib.request.urlopen(req, timeout=12) as response:
+            html = response.read().decode('utf-8', errors='ignore')
+            
+            # Script 및 Style 태그 제거
+            text = re.sub(r'<script\b[^<]*(?:(?!</script>)<[^<]*)*</script>', '', html, flags=re.IGNORECASE)
+            text = re.sub(r'<style\b[^<]*(?:(?!</style>)<[^<]*)*</style>', '', html, flags=re.IGNORECASE)
+            # HTML 태그 제거
+            text = re.sub(r'<[^>]+>', ' ', text)
+            # 연속 공백 정제
+            text = re.sub(r'\s+', ' ', text).strip()
+            return text[:15000]
+    except Exception as e:
+        return ""
+
+# ==========================================
+# 3. 공통 캐싱 및 스마트 글자 크기 조절 함수
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_pdf_bytes_cached(file_path):
@@ -213,7 +240,7 @@ def is_minor(dob_str):
         return True
 
 # ==========================================
-# 3. 오버타임 조항 계산기 (캐나다 퀘벡 제외 전지역)
+# 4. 오버타임 조항 계산기 (캐나다 퀘벡 제외 전지역)
 # ==========================================
 def get_provincial_overtime_clause(address_text):
     text = address_text.upper()
@@ -236,12 +263,11 @@ def get_provincial_overtime_clause(address_text):
         return "Overtime will be paid in accordance with the applicable provincial employment standards legislation for hours worked in excess of standard full-time limits."
 
 # ==========================================
-# 4. 잡오퍼 DOCX 생성 엔진
+# 5. 잡오퍼 DOCX 생성 엔진
 # ==========================================
 def generate_job_offer_docx(data):
     doc = Document()
     
-    # 여백 설정 (상하좌우 1인치)
     sections = doc.sections
     for section in sections:
         section.top_margin = Inches(1)
@@ -254,19 +280,33 @@ def generate_job_offer_docx(data):
     font.name = 'Calibri'
     font.size = Pt(11)
     
+    # 0. 로고 삽입 (업로드된 로고가 있을 경우)
+    logo_bytes = data.get('logo_bytes')
+    if logo_bytes:
+        try:
+            image_stream = io.BytesIO(logo_bytes)
+            doc.add_picture(image_stream, width=Inches(2.2))
+            doc.add_paragraph()
+        except Exception:
+            pass
+
     # 1. 헤더 (고용주 정보)
     p_head = doc.add_paragraph()
     p_head.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    run_comp = p_head.add_run(f"{data.get('employer_name', '')}\n")
+    
+    emp_name_val = data.get('employer_name', '')
+    run_comp = p_head.add_run(f"{emp_name_val}\n")
     run_comp.bold = True
-    run_comp.font.size = Pt(14)
+    run_comp.font.size = Pt(13)
     
     if data.get('employer_address'):
         p_head.add_run(f"{data.get('employer_address')}\n")
     if data.get('employer_phone'):
         p_head.add_run(f"T. {data.get('employer_phone')}\n")
+    if data.get('employer_email'):
+        p_head.add_run(f"E. {data.get('employer_email')}\n")
         
-    doc.add_paragraph() # 공백
+    doc.add_paragraph() 
     
     # 2. 날짜 및 수신자
     doc.add_paragraph(data.get('offer_date', datetime.date.today().strftime("%B %d, %Y")))
@@ -274,15 +314,15 @@ def generate_job_offer_docx(data):
     
     # 3. 본문 서두
     intro_p = doc.add_paragraph()
-    intro_p.add_run(f"We are pleased to offer you a full-time position as ")
+    intro_p.add_run("We are pleased to offer you a full-time position as ")
     run_job = intro_p.add_run(f"{data.get('job_title', '')}")
     run_job.bold = True
     intro_p.add_run(f" for a {data.get('employment_term', '3-year')} term with ")
-    run_emp = intro_p.add_run(f"{data.get('employer_name', '')}")
+    run_emp = intro_p.add_run(f"{emp_name_val}")
     run_emp.bold = True
     intro_p.add_run(" based on the following terms and conditions:")
     
-    # 4. 항목별 세부 조건
+    # 4. 세부 조건
     doc.add_heading("Terms of Employment", level=2)
     doc.add_paragraph(f"This is a full-time, {data.get('employment_term', '3-year')} employment term starting from the date agreed upon by the employer and employee.")
     
@@ -294,7 +334,6 @@ def generate_job_offer_docx(data):
     
     doc.add_heading(f"Job Title: {data.get('job_title', '')}", level=2)
     
-    # 직무 내용 (Duties) Bullet Points
     duties_list = data.get('job_duties', [])
     if isinstance(duties_list, str):
         duties_list = [d.strip() for d in duties_list.split('\n') if d.strip()]
@@ -302,7 +341,8 @@ def generate_job_offer_docx(data):
     if duties_list:
         doc.add_paragraph("Job Duties:")
         for duty in duties_list:
-            doc.add_paragraph(duty, style='List Bullet')
+            clean_duty = re.sub(r'^[•\-\*]\s*', '', duty)
+            doc.add_paragraph(clean_duty, style='List Bullet')
             
     doc.add_heading("Compensation", level=2)
     doc.add_paragraph(f"The employee will be paid ${data.get('wage', '0.00')} per hour, based on a minimum of {data.get('hours', '30')} hours per week.")
@@ -316,14 +356,14 @@ def generate_job_offer_docx(data):
     doc.add_heading("Confidentiality", level=2)
     doc.add_paragraph(
         f"By accepting the terms of this offer, the employee agrees to keep all confidential information obtained "
-        f"during their employment with {data.get('employer_name', '')} strictly confidential. The employee further agrees that, "
+        f"during their employment with {emp_name_val} strictly confidential. The employee further agrees that, "
         f"upon termination of employment for any reason, they will return all physical and digital property belonging to or "
-        f"originating from {data.get('employer_name', '')} within five days of receiving notice of termination."
+        f"originating from {emp_name_val} within five days of receiving notice of termination."
     )
     
     # 5. 종결 및 서명란
     doc.add_paragraph(
-        f"We are pleased to extend this offer of employment to you on behalf of {data.get('employer_name', '')}. "
+        f"We are pleased to extend this offer of employment to you on behalf of {emp_name_val}. "
         f"We are confident that you will make a valuable contribution to our company, and we look forward to working with you."
     )
     
@@ -334,9 +374,11 @@ def generate_job_offer_docx(data):
     run_s_name = p_sig.add_run(f"{data.get('signer_name', '')}\n")
     run_s_name.bold = True
     p_sig.add_run(f"{data.get('signer_title', 'Director')}\n")
-    p_sig.add_run(f"{data.get('employer_name', '')}\n")
+    p_sig.add_run(f"{emp_name_val}\n")
     if data.get('employer_phone'):
-        p_sig.add_run(f"T. {data.get('employer_phone')}")
+        p_sig.add_run(f"T. {data.get('employer_phone')}\n")
+    if data.get('employer_email'):
+        p_sig.add_run(f"E. {data.get('employer_email')}")
         
     doc.add_paragraph("\nI accept the terms of this offer:")
     doc.add_paragraph("_________________________________")
@@ -353,7 +395,7 @@ def generate_job_offer_docx(data):
     return buf.getvalue()
 
 # ==========================================
-# 5. 기존 잡오퍼 분석 함수 (연장용)
+# 6. 기존 잡오퍼 파싱 함수 (연장 모드용)
 # ==========================================
 def parse_existing_job_offer(file_bytes, mime_type):
     prompt = """
@@ -361,14 +403,15 @@ def parse_existing_job_offer(file_bytes, mime_type):
     Extract the following details into exact JSON:
     - client_name: Employee name
     - client_dob: Date of birth (YYYY-MM-DD)
-    - employer_name: Company / Employer Name
+    - employer_name: Full Company / Employer Name (Include legal name and dba if present, e.g. 'Agape Sushi Inc. dba Hiro Japan Sushi Xpress')
     - signer_name: Name of Director or Signer
     - signer_title: Title of Signer
     - employer_address: Full address of employer
     - employer_phone: Telephone
+    - employer_email: Contact email
     - job_title: Job title
-    - wage: Hourly wage (number only)
-    - hours: Weekly hours (number only)
+    - wage: Hourly wage (e.g. '20.15')
+    - hours: Weekly hours (e.g. '30-40')
     - job_location: Job location address
     - benefits: Benefits text
     - job_duties: Array of bullet point job duties
@@ -386,7 +429,7 @@ def parse_existing_job_offer(file_bytes, mime_type):
         return {}
 
 # ==========================================
-# 6. PDF 서식 채우기 & CRM 압축 엔진
+# 7. PDF 서식 채우기 & CRM 압축 엔진
 # ==========================================
 def extract_imm5476_info(image):
     prompt = """
@@ -647,7 +690,7 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
             return compressed_bytes, "application/pdf"
 
 # ==========================================
-# 7. Streamlit 네비게이션 및 UI 구성
+# 8. Streamlit 네비게이션 및 UI 구성
 # ==========================================
 MENU_1 = "🍁 IMM5476 자동 작성"
 MENU_2 = "✈️ 한부모 동의서 자동 작성"
@@ -1346,32 +1389,61 @@ elif app_mode == MENU_5:
                     st.success("기존 잡오퍼 정보를 성공적으로 읽어왔습니다! 아래 필드에 자동 적용됩니다.")
                     st.session_state.job_offer_data.update(existing_parsed)
 
-    # 3. 채용 공고 분석
+    # 3. 채용 공고 분석 (URL 크롤링 연동)
     st.subheader("3. 채용 공고 (광고 링크 또는 내용 붙여넣기)")
-    job_posting_text = st.text_area("채용 공고 링크(URL) 또는 공고 텍스트를 입력하세요", height=100, placeholder="https://... 또는 공고 본문 텍스트")
+    job_posting_text = st.text_area("채용 공고 링크(URL) 또는 공고 텍스트를 입력하세요", height=100, placeholder="https://www.jobspider.com/job/... 또는 공고 본문 텍스트")
+    logo_file = st.file_uploader("회사 로고 이미지 (선택 사항)", type=['jpg', 'jpeg', 'png'], key="jo_logo")
     
     if st.button("AI 채용공고 & 여권 분석 시작"):
-        with st.spinner("정보 추출 중..."):
+        with st.spinner("채용 공고 웹페이지 실시간 접속 및 서류 정보 분석 중..."):
             extracted_info = {}
+            
+            # 로고 이미지 바이트 저장
+            if logo_file:
+                extracted_info['logo_bytes'] = logo_file.getvalue()
+
+            # 여권 분석
             if passport_file:
                 pass_img = process_uploaded_file_to_image(passport_file)
                 pass_data = extract_imm5476_info(pass_img)
                 if pass_data:
                     extracted_info['client_name'] = format_full_name(pass_data.get('surname', ''), pass_data.get('given_name', ''))
                     extracted_info['client_dob'] = pass_data.get('dob', '')
-                    
-            if job_posting_text:
-                prompt_job = f"""
-                Analyze this job posting text/URL carefully:
-                {job_posting_text}
+            
+            # 채용공고 분석 (URL 여부 판별 후 실시간 크롤링)
+            if job_posting_text.strip():
+                raw_input = job_posting_text.strip()
+                is_url = bool(re.search(r'https?://[^\s]+|www\.[^\s]+', raw_input))
                 
-                Extract:
-                - job_title: Job Title
-                - wage: Hourly Wage rate (number only)
-                - hours: Weekly hours (number only)
-                - job_location: Full Job Location Address
-                - job_duties: Array of bullet point job duties
-                Return ONLY raw JSON object.
+                if is_url:
+                    url_match = re.search(r'(https?://[^\s]+|www\.[^\s]+)', raw_input).group(0)
+                    fetched_text = fetch_url_content(url_match)
+                    if fetched_text:
+                        text_to_analyze = fetched_text
+                    else:
+                        text_to_analyze = raw_input
+                else:
+                    text_to_analyze = raw_input
+                    
+                prompt_job = f"""
+                Analyze this job posting webpage/text content carefully:
+                ---
+                {text_to_analyze}
+                ---
+
+                Extract the following details into exact JSON:
+                - employer_name: Full employer or company name including legal name and 'dba' if present (e.g. 'Agape Sushi Inc. dba Hiro Japan Sushi Xpress')
+                - job_title: Position or Job Title (e.g. 'Food Service Supervisor')
+                - wage: Hourly wage rate in numerical string format (e.g. '20.15')
+                - hours: Working hours per week (e.g. '30-40')
+                - job_location: Exact work location address including suite, street, city, province, postal code (e.g. '1644 Hillside Ave Suite 46A, Victoria, BC V8T 2C5')
+                - employer_address: Corporate or Employer address if different, otherwise same as job_location
+                - employer_phone: Contact telephone number if present
+                - employer_email: Contact email address if present
+                - benefits: Benefits (e.g. '4% vacation pay')
+                - job_duties: Array of bullet point job duty strings
+
+                Return ONLY raw valid JSON object without markdown formatting.
                 """
                 try:
                     resp = safe_generate_content([prompt_job])
@@ -1382,7 +1454,7 @@ elif app_mode == MENU_5:
                     st.warning(f"채용공고 분석 중 일부 오류: {e}")
                     
             st.session_state.job_offer_data.update(extracted_info)
-            st.success("분석이 완료되어 아래 입력창에 반영되었습니다.")
+            st.success("채용공고 웹페이지 정보가 정확하게 추출되어 아래 입력창에 적용되었습니다.")
 
     st.markdown("---")
     st.subheader("4. 최종 잡오퍼 정보 확인 및 수정")
@@ -1407,18 +1479,19 @@ elif app_mode == MENU_5:
     with col_e2:
         emp_addr = st.text_input("회사 대표 주소 (Employer Address)", value=jo_data.get('employer_address', ''))
         emp_phone = st.text_input("회사 전화번호 (Employer Phone)", value=jo_data.get('employer_phone', ''))
+        emp_email = st.text_input("회사 이메일 (Employer Email)", value=jo_data.get('employer_email', ''))
 
     st.markdown("#### 💼 근무 조건 및 직무")
     col_j1, col_j2 = st.columns(2)
     with col_j1:
         j_title = st.text_input("직책 (Job Title)", value=jo_data.get('job_title', ''))
-        j_wage = st.text_input("시급 (Hourly Wage, CAD)", value=str(jo_data.get('wage', '35.00')))
-        j_hours = st.text_input("주당 근무시간 (Weekly Hours)", value=str(jo_data.get('hours', '30')))
+        j_wage = st.text_input("시급 (Hourly Wage, CAD)", value=str(jo_data.get('wage', '20.15')))
+        j_hours = st.text_input("주당 근무시간 (Weekly Hours)", value=str(jo_data.get('hours', '30-40')))
     with col_j2:
         j_loc = st.text_input("실제 근무지 주소 (Job Location)", value=jo_data.get('job_location', emp_addr))
         j_benefits = st.text_input("혜택 (Benefits)", value=jo_data.get('benefits', '4% vacation pay'))
 
-    # 오버타임 조항 자동 추천
+    # 오버타임 조항 주(Province)별 자동 추천
     auto_ot_clause = get_provincial_overtime_clause(j_loc if j_loc else emp_addr)
     j_ot = st.text_area("오버타임 조항 (근무지 주소에 따라 자동 계산됨)", value=auto_ot_clause, height=80)
 
@@ -1444,18 +1517,19 @@ elif app_mode == MENU_5:
                 "signer_title": signer_t,
                 "employer_address": emp_addr,
                 "employer_phone": emp_phone,
+                "employer_email": emp_email,
                 "job_title": j_title,
                 "wage": j_wage,
                 "hours": j_hours,
                 "job_location": j_loc,
                 "benefits": j_benefits,
                 "overtime_clause": j_ot,
-                "job_duties": j_duties_text
+                "job_duties": j_duties_text,
+                "logo_bytes": jo_data.get('logo_bytes')
             }
             
             docx_bytes = generate_job_offer_docx(final_jo_dict)
             
-            # 파일명 생성
             crm_client = "NAME"
             if c_name:
                 if re.search(r'[가-힣]', c_name):
