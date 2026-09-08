@@ -102,13 +102,14 @@ def process_uploaded_file_to_image(file_obj):
         if img.mode != "RGB":
             img = img.convert("RGB")
     
-    if img.width > 1500:
-        ratio = 1500 / img.width
-        new_size = (1500, int(img.height * ratio))
+    max_dim = max(img.width, img.height)
+    if max_dim > 1800:
+        ratio = 1800.0 / float(max_dim)
+        new_size = (int(img.width * ratio), int(img.height * ratio))
         img = img.resize(new_size, Image.Resampling.LANCZOS)
     
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=70)
+    img.save(buf, format="JPEG", quality=75)
     buf.seek(0)
     return Image.open(buf)
 
@@ -438,7 +439,7 @@ def fill_consent_letter(template_bytes, data):
     return output_pdf
 
 # ==========================================
-# 4. CRM 스마트 압축 엔진
+# 4. CRM 스마트 압축 엔진 (HEIC & 고해상도 이미지 용량 폭발 방지)
 # ==========================================
 def process_and_compress_file(file_bytes, mime_type, target_filename):
     is_jpeg = target_filename.lower().endswith(('.jpg', '.jpeg'))
@@ -449,12 +450,13 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
         if img.mode != "RGB":
             img = img.convert("RGB")
             
-        if img.width > 2400:
-            ratio = 2400 / img.width
-            img = img.resize((2400, int(img.height * ratio)), Image.Resampling.LANCZOS)
+        max_dim = max(img.width, img.height)
+        if max_dim > 2000:
+            ratio = 2000.0 / float(max_dim)
+            img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.Resampling.LANCZOS)
             
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85, optimize=True)
+        img.save(buf, format="JPEG", quality=80, optimize=True)
         buf.seek(0)
         return buf.getvalue(), "image/jpeg"
         
@@ -480,6 +482,9 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
             
             for page in doc:
                 zoom = target_dpi / 72.0
+                if max(page.rect.width, page.rect.height) > 2000:
+                    zoom = 1.0
+                    
                 pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                 
@@ -502,24 +507,26 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
             return compressed_bytes, "application/pdf"
             
         else:
+            # HEIC / 이미지 -> PDF 변환 시 용량 최적화 처리
             target_dpi = 150
-            quality = 65
+            quality = 70
             img = Image.open(io.BytesIO(file_bytes))
             img = ImageOps.exif_transpose(img)
             if img.mode != "RGB":
                 img = img.convert("RGB")
                 
-            if img.width > 1800:
-                ratio = 1800 / img.width
-                img = img.resize((1800, int(img.height * ratio)), Image.Resampling.LANCZOS)
+            max_dim = max(img.width, img.height)
+            if max_dim > 1800:
+                ratio = 1800.0 / float(max_dim)
+                img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.Resampling.LANCZOS)
                 
             img_buf = io.BytesIO()
             img.save(img_buf, format="JPEG", quality=quality, optimize=True)
             img_buf.seek(0)
             
             new_doc = fitz.open()
-            page_width = img.width * 72 / target_dpi
-            page_height = img.height * 72 / target_dpi
+            page_width = img.width * 72.0 / target_dpi
+            page_height = img.height * 72.0 / target_dpi
             pdf_page = new_doc.new_page(width=page_width, height=page_height)
             
             pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
@@ -529,9 +536,6 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
             new_doc.close()
             
             compressed_bytes = output_pdf.getvalue()
-            if len(compressed_bytes) >= len(file_bytes):
-                return file_bytes, "application/pdf"
-                
             return compressed_bytes, "application/pdf"
 
 # ==========================================
@@ -562,7 +566,7 @@ if app_mode == MENU_1:
         if template_file: template_5476_bytes = template_file.getvalue()
 
     st.markdown("---")
-    client_file = st.file_uploader("1. 손님 여권 또는 퍼밋", type=['jpg', 'jpeg', 'png', 'pdf'], key="client_5476")
+    client_file = st.file_uploader("1. 손님 여권 또는 퍼밋", type=['jpg', 'jpeg', 'png', 'pdf', 'heic', 'HEIC'], key="client_5476")
 
     if client_file and st.button("정보 추출하기", use_container_width=True):
         with st.spinner("서류 분석 중입니다. 잠시만 기다려 주세요..."):
@@ -621,8 +625,8 @@ elif app_mode == MENU_2:
 
     st.markdown("---")
     c1, c2 = st.columns(2)
-    with c1: non_acc_file = st.file_uploader("비동반 부모님 여권 (1장)", type=['jpg', 'jpeg', 'png', 'pdf'])
-    with c2: family_files = st.file_uploader("동반 부모/자녀 여권", type=['jpg', 'jpeg', 'png', 'pdf'], accept_multiple_files=True)
+    with c1: non_acc_file = st.file_uploader("비동반 부모님 여권 (1장)", type=['jpg', 'jpeg', 'png', 'pdf', 'heic', 'HEIC'])
+    with c2: family_files = st.file_uploader("동반 부모/자녀 여권", type=['jpg', 'jpeg', 'png', 'pdf', 'heic', 'HEIC'], accept_multiple_files=True)
 
     if st.button("여권 정보 추출하기", type="primary", use_container_width=True):
         images = []
@@ -752,7 +756,7 @@ elif app_mode == MENU_3:
 
     st.markdown("---")
     st.subheader("2. 손님 제출 서류 (복수 선택 가능)")
-    client_prep_files = st.file_uploader("질문지, 여권, 퍼밋 등 서류 선택", type=['jpg', 'jpeg', 'png', 'pdf'], accept_multiple_files=True, key="case_client_docs")
+    client_prep_files = st.file_uploader("질문지, 여권, 퍼밋 등 서류 선택", type=['jpg', 'jpeg', 'png', 'pdf', 'heic', 'HEIC'], accept_multiple_files=True, key="case_client_docs")
 
     if st.button("서류 정보 정리하기", type="primary", use_container_width=True):
         if tmpl_bytes is None:
@@ -789,7 +793,6 @@ elif app_mode == MENU_3:
                     val = f.get("value", "")
                     src = f.get("source", "")
 
-                    # 💡 Entry 단위(Entry 1, Entry 2 등) 구분선 및 줄바꿈 추가
                     group_match = re.match(r'^(.*?\bEntry\s*\d+)', field_lbl, re.IGNORECASE)
                     curr_group = group_match.group(1).strip() if group_match else None
 
@@ -840,7 +843,7 @@ elif app_mode == MENU_4:
 
     uploaded_files = st.file_uploader(
         "서류 업로드 (복수 선택 가능)", 
-        type=['jpg', 'jpeg', 'png', 'pdf', 'heic'], 
+        type=['jpg', 'jpeg', 'png', 'pdf', 'heic', 'HEIC'], 
         accept_multiple_files=True,
         key=st.session_state.uploader_key
     )
@@ -887,8 +890,10 @@ elif app_mode == MENU_4:
                     if img.mode != "RGB": img = img.convert("RGB")
                     
                     preview = img.copy()
-                    if preview.width > 1200:
-                        preview = preview.resize((1200, int(preview.height * (1200/preview.width))), Image.Resampling.LANCZOS)
+                    max_dim = max(preview.width, preview.height)
+                    if max_dim > 1200:
+                        ratio = 1200.0 / float(max_dim)
+                        preview = preview.resize((int(preview.width * ratio), int(preview.height * ratio)), Image.Resampling.LANCZOS)
                     buf = io.BytesIO()
                     preview.save(buf, format="JPEG", quality=60)
                     
