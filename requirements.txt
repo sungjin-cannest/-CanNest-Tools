@@ -5,3 +5,4 @@ pypdf
 Pillow
 pillow-heif
 python-docx
+python-docx-template
