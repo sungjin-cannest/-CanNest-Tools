@@ -1,15 +1,15 @@
 """
-CanNest 잡오퍼 DOCX 생성기 (v4)
+CanNest 잡오퍼 DOCX 생성기 (v5)
 ----------------------------------
-v3 대비 변경점 (버그 픽스):
-  1) 손님 정보 덮어쓰기 방지: 여권에서 이름/생년월일을 먼저 추출한 경우, 기존 잡오퍼 파일의 옛날 손님 정보로 덮어쓰지 않도록 수정.
-  2) 라벨 형식 자동 감지: Job Location:, Start Date: 등 라벨 뒤에 내용이 "같은 줄"에 있는지, "다음 줄"에 있는지 판단하여 기존 제목(Benefits 등)이 날아가는 버그 수정.
-  3) 상단 인사말 및 서명란 반영: "I am pleased to offer you a 3-year term... Chef position" 안의 연차/직책 업데이트 및 맨 아래 서명란의 이름과 생년월일도 함께 갱신.
+v4 대비 변경점 (서식 및 UI 개선):
+  1) 이름 Title Case 적용: "KWANGCHUL JEONG" -> "Kwangchul Jeong"으로 첫 글자만 대문자 변환.
+  2) 원본 서식 완벽 보존: 텍스트 교체 시 폰트, 크기 등 기존 Run 서식이 날아가지 않도록 안전하게 교체.
+  3) 이메일 [email protected] 방어: 추출된 이메일에 protected가 포함된 경우 빈칸으로 두고 직접 입력할 수 있도록 UI 보완.
 """
 
 import streamlit as st
 
-st.set_page_config(page_title="CanNest 잡오퍼 DOCX 생성기 (v4)", layout="wide")
+st.set_page_config(page_title="CanNest 잡오퍼 DOCX 생성기 (v5)", layout="wide")
 
 import os
 import io
@@ -195,11 +195,10 @@ def format_full_name(surname, given_name):
     g = str(given_name).strip() if given_name else ""
     if not s and not g:
         return ""
-    if not s:
-        return g
-    if not g:
-        return s
-    return f"{g} {s}"
+    
+    # 이름을 합친 뒤 첫 글자들만 대문자로 변환 (예: KWANGCHUL JEONG -> Kwangchul Jeong)
+    full_name = f"{g} {s}".strip()
+    return full_name.title()
 
 
 def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
@@ -491,16 +490,17 @@ def iter_all_paragraphs(doc):
 
 
 def set_paragraph_text(paragraph, new_text):
+    """단락의 기존 서식(폰트, 크기 등)을 최대한 보존하면서 텍스트만 교체"""
     if not paragraph.runs:
         paragraph.add_run(new_text)
         return
-    base_rpr = paragraph.runs[0]._r.find(qn("w:rPr"))
-    for r in list(paragraph.runs):
-        r._r.getparent().remove(r._r)
-    run = paragraph.add_run()
-    if base_rpr is not None:
-        run._r.insert(0, copy.deepcopy(base_rpr))
-    run.text = new_text
+        
+    # 기존 텍스트 비우기 (서식은 놔두고 text만 날림)
+    for r in paragraph.runs:
+        r.text = ""
+        
+    # 첫 번째 run에 새로운 텍스트 삽입
+    paragraph.runs[0].text = new_text
 
 
 def replace_placeholders(doc, mapping: dict):
@@ -656,7 +656,7 @@ def generate_job_offer_docx(data: dict) -> bytes:
 
 
 # ==========================================
-# 5b. 기존 문서 편집 엔진 (v4 픽스 적용)
+# 5b. 기존 문서 편집 엔진
 # ==========================================
 def _replace_label_and_value(doc, label, new_value):
     """
@@ -779,7 +779,6 @@ def generate_job_offer_from_existing(existing_file_bytes: bytes, data: dict) -> 
     if data.get("client_name"):
         _update_salutation(doc, data["client_name"])
 
-    # 추가 픽스: 인사말 문단 (3-year / 1-year 불일치 해결)
     _update_intro_paragraph(doc, data.get("employment_term"), data.get("job_title"))
 
     if data.get("job_title"):
@@ -809,7 +808,6 @@ def generate_job_offer_from_existing(existing_file_bytes: bytes, data: dict) -> 
     if data.get("start_date"):
         _replace_label_and_value(doc, "Start Date:", data["start_date"])
 
-    # 추가 픽스: 하단 서명란 이름/생일 업데이트
     if data.get("client_name") and data.get("client_dob"):
         _update_employee_signature(doc, data["client_name"], data["client_dob"])
 
@@ -821,8 +819,8 @@ def generate_job_offer_from_existing(existing_file_bytes: bytes, data: dict) -> 
 # ==========================================
 # 6. Streamlit UI
 # ==========================================
-st.title("📄 잡오퍼 DOCX 생성기 (v4)")
-st.caption("기존 문서 그대로 편집 · 1단계 통합 분석 · 13개 주/준주 커버리지 · Cloudflare 이메일 디코딩")
+st.title("📄 잡오퍼 DOCX 생성기 (v5)")
+st.caption("기존 문서 그대로 편집 · 1단계 통합 분석 · 13개 주/준주 커버리지 · Cloudflare 이메일 방어")
 
 if "job_offer_data" not in st.session_state:
     st.session_state.job_offer_data = {}
@@ -884,7 +882,6 @@ if st.button("AI 분석 시작", type="primary", use_container_width=True):
                 old_jo_file.type or "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
             if existing_parsed:
-                # 추가 픽스: 여권에서 이미 추출한 핵심 정보(이름, 생일)가 있으면 옛날 정보로 덮어쓰지 않음
                 for k, v in existing_parsed.items():
                     if k in ["client_name", "client_dob"] and extracted_info.get(k):
                         continue
@@ -937,6 +934,12 @@ with col_c2:
     )
 
 st.markdown("#### 🏢 고용주 및 회사 정보")
+
+# 이메일 'protected' 문구 방어 로직
+extracted_email = jo_data.get("employer_email", "")
+if "protected" in extracted_email.lower():
+    extracted_email = ""
+
 col_e1, col_e2 = st.columns(2)
 with col_e1:
     emp_name = st.text_input("회사명", value=jo_data.get("employer_name", ""))
@@ -945,7 +948,7 @@ with col_e1:
 with col_e2:
     emp_addr = st.text_input("회사 대표 주소", value=jo_data.get("employer_address", ""))
     emp_phone = st.text_input("회사 전화번호", value=jo_data.get("employer_phone", ""))
-    emp_email = st.text_input("회사 이메일", value=jo_data.get("employer_email", ""))
+    emp_email = st.text_input("회사 이메일", value=extracted_email, placeholder="예: Upnorthinstallations.hiring@outlook.com")
 
 st.markdown("#### 💼 근무 조건")
 col_j1, col_j2 = st.columns(2)
