@@ -1,19 +1,15 @@
 """
-CanNest 잡오퍼 DOCX 생성기 (v3)
+CanNest 잡오퍼 DOCX 생성기 (v4)
 ----------------------------------
-v2 대비 변경점:
-  1) 기존 잡오퍼 업로드 시, 빈 템플릿이 아니라 "업로드한 문서 그 자체"를 열어
-     바뀌는 항목(받는사람/직책/직무/급여/기간/근무지/overtime/시작일)만 교체.
-     로고·서명·회사헤더·Confidentiality 문구는 원본 그대로 유지됩니다.
-  2) 여권 + 기존잡오퍼 + 채용공고 분석을 버튼 1번("AI 분석 시작")으로 통합.
-  3) 채용공고 URL에 Cloudflare 이메일 난독화([email protected])가 걸려있을 때
-     실제 이메일 주소로 디코딩해서 추출하도록 수정.
-  4) overtime 조항 중복 삽입 버그, "$$..wage.. per hour" 단위 중복 버그 수정.
+v3 대비 변경점 (버그 픽스):
+  1) 손님 정보 덮어쓰기 방지: 여권에서 이름/생년월일을 먼저 추출한 경우, 기존 잡오퍼 파일의 옛날 손님 정보로 덮어쓰지 않도록 수정.
+  2) 라벨 형식 자동 감지: Job Location:, Start Date: 등 라벨 뒤에 내용이 "같은 줄"에 있는지, "다음 줄"에 있는지 판단하여 기존 제목(Benefits 등)이 날아가는 버그 수정.
+  3) 상단 인사말 및 서명란 반영: "I am pleased to offer you a 3-year term... Chef position" 안의 연차/직책 업데이트 및 맨 아래 서명란의 이름과 생년월일도 함께 갱신.
 """
 
 import streamlit as st
 
-st.set_page_config(page_title="CanNest 잡오퍼 DOCX 생성기 (v3)", layout="wide")
+st.set_page_config(page_title="CanNest 잡오퍼 DOCX 생성기 (v4)", layout="wide")
 
 import os
 import io
@@ -35,7 +31,7 @@ import pandas as pd
 import docx
 from docx.oxml.ns import qn
 
-# 신규 Gemini SDK (google-generativeai 아님!)
+# 신규 Gemini SDK
 from google import genai
 from google.genai import types
 
@@ -70,7 +66,7 @@ if not check_password():
     st.stop()
 
 # ==========================================
-# 1. Gemini 클라이언트 (신규 SDK) — 구조화 출력 + 모델 폴백
+# 1. Gemini 클라이언트
 # ==========================================
 _client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
 
@@ -275,7 +271,6 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 def _decode_cf_email(cfemail_hex: str) -> str:
-    """Cloudflare 이메일 난독화(data-cfemail) XOR 디코딩."""
     try:
         r = int(cfemail_hex[:2], 16)
         return "".join(
@@ -291,15 +286,11 @@ _CF_EMAIL_RE = re.compile(
     re.IGNORECASE,
 )
 
-
 def _decloak_cloudflare_emails(html: str) -> str:
-    """채용공고 페이지가 Cloudflare 이메일 보호를 쓰는 경우,
-    화면에 [email protected]로 표시되는 부분을 실제 주소로 되돌립니다."""
     return _CF_EMAIL_RE.sub(lambda m: _decode_cf_email(m.group(1)) + "<", html)
 
 
 def fetch_url_content_safe(url: str, timeout: int = 12, max_bytes: int = 2_000_000):
-    """(text, error_message) 튜플 반환. error_message가 None이면 성공."""
     target_url = url.strip()
     if not re.match(r"^https?://", target_url, re.IGNORECASE):
         target_url = "https://" + target_url
@@ -321,7 +312,7 @@ def fetch_url_content_safe(url: str, timeout: int = 12, max_bytes: int = 2_000_0
     except Exception as e:
         return "", f"URL 요청 실패: {e}"
 
-    html = _decloak_cloudflare_emails(html)  # ← Cloudflare 이메일 디코딩
+    html = _decloak_cloudflare_emails(html)
 
     text = re.sub(r"<script\b[^<]*(?:(?!</script>)<[^<]*)*</script>", "", html, flags=re.IGNORECASE)
     text = re.sub(r"<style\b[^<]*(?:(?!</style>)<[^<]*)*</style>", "", text, flags=re.IGNORECASE)
@@ -332,10 +323,6 @@ def fetch_url_content_safe(url: str, timeout: int = 12, max_bytes: int = 2_000_0
 
 # ==========================================
 # 4. 전체 13개 주/준주 데이터 (중위임금 백업 + 초과근무 조항)
-#    ⚠️ 아래 수치/조항은 참고용 백업값이며 실제 발급 전 최신 법령 재확인 필수
-#    v3: PROVINCES[code]["overtime"]의 첫 줄(인트로 문장)은 신규 템플릿 생성용으로만 쓰고,
-#    기존문서 편집 시에는 get_provincial_overtime_bullets()로 인트로를 뺀 불릿만 씁니다
-#    (문서에 이미 공통 인트로 문장이 있어 중복되는 걸 방지).
 # ==========================================
 BACKUP_WAGE_AS_OF = "2026-01"
 
@@ -467,12 +454,10 @@ def calculate_employment_term(wage_val, address_text):
 
 
 def get_provincial_overtime_clause(address_text):
-    """신규(빈 템플릿) 생성용 — 인트로 문장 포함 전체 조항."""
     return PROVINCES[detect_province(address_text)]["overtime"]
 
 
 def get_provincial_overtime_bullets(address_text):
-    """기존문서 편집용 — 인트로 문장 제외, 요율 불릿 줄만."""
     full_clause = PROVINCES[detect_province(address_text)]["overtime"]
     lines = [l.strip() for l in full_clause.split("\n") if l.strip()]
     if lines and lines[0].lower().startswith("overtime will be paid"):
@@ -506,7 +491,6 @@ def iter_all_paragraphs(doc):
 
 
 def set_paragraph_text(paragraph, new_text):
-    """단락의 첫 번째 run 서식을 유지하면서 전체 텍스트를 교체."""
     if not paragraph.runs:
         paragraph.add_run(new_text)
         return
@@ -548,7 +532,6 @@ def insert_bullets_after(anchor_paragraph, texts, template_bullet_xml):
 
 
 def replace_overtime_block(doc, overtime_lines):
-    """(신규 템플릿용) 'Overtime will be paid...' 바로 다음의 불릿들을 교체."""
     intro = find_paragraph_starting_with(doc, "Overtime will be paid")
     if intro is None:
         return
@@ -602,7 +585,6 @@ def clean_hours(value) -> str:
 
 
 def build_wage_sentence(wage, hours) -> str:
-    """(기존문서 편집용) 매번 새로 조립해서 '$$..per hour' 같은 단위 중복 방지."""
     return f"The employee will be paid ${clean_wage(wage)}/hour, based on a minimum of {clean_hours(hours)} hours per week."
 
 
@@ -674,36 +656,33 @@ def generate_job_offer_docx(data: dict) -> bytes:
 
 
 # ==========================================
-# 5b. 기존 문서 편집 엔진 (v3 신규)
-#    업로드된 기존 잡오퍼 docx를 그대로 열어 바뀌는 항목만 교체.
-#    로고 / 서명 / 회사 헤더 / Confidentiality 문구는 건드리지 않음.
+# 5b. 기존 문서 편집 엔진 (v4 픽스 적용)
 # ==========================================
-def _replace_label_line(doc, label, new_value):
-    """'Job Title: Chef' 처럼 라벨+내용이 한 줄인 경우, 내용만 교체."""
+def _replace_label_and_value(doc, label, new_value):
+    """
+    'Job Location: 123 Street' (한 줄에 같이 있음) 
+    또는 'Job Location:' 다음에 내용 문단이 오는(두 줄에 나뉨) 두 가지 케이스를 모두 안전하게 처리.
+    """
     p = find_paragraph_starting_with(doc, label)
     if p is None:
         return False
-    set_paragraph_text(p, f"{label} {new_value}")
-    return True
 
-
-def _replace_next_paragraph(doc, label, new_value):
-    """'Job Location:' 처럼 라벨 단독 줄 다음에 내용이 오는 경우,
-    라벨 줄은 유지, 바로 다음 문단만 통째로 교체."""
-    p = find_paragraph_starting_with(doc, label)
-    if p is None:
-        return False
-    nxt = p._p.getnext()
-    if nxt is None or nxt.tag != qn("w:p"):
-        return False
-    wrapped = docx.text.paragraph.Paragraph(nxt, p._parent)
-    set_paragraph_text(wrapped, new_value)
-    return True
+    text = p.text.strip()
+    # 라벨 뒤에 텍스트가 더 있으면 한 줄짜리로 판단 (예: "Job Location: Calgary")
+    if len(text) > len(label) + 1:
+        set_paragraph_text(p, f"{label} {new_value}")
+        return True
+    else:
+        # 라벨만 있는 줄이면 다음 문단을 통째로 교체
+        nxt = p._p.getnext()
+        if nxt is not None and nxt.tag == qn("w:p"):
+            wrapped = docx.text.paragraph.Paragraph(nxt, p._parent)
+            set_paragraph_text(wrapped, new_value)
+            return True
+    return False
 
 
 def _replace_bullets_after(doc, label, new_lines):
-    """label 문단 뒤 List Paragraph 형제들을 new_lines로 교체.
-    label과 첫 불릿 사이 인트로 문장은 건드리지 않음."""
     anchor = find_paragraph_starting_with(doc, label)
     if anchor is None or not new_lines:
         return False
@@ -761,12 +740,36 @@ def _update_job_title_line(doc, job_title, noc_code):
     return True
 
 
+def _update_intro_paragraph(doc, term, job_title):
+    """상단 인사말(I am pleased to offer you...) 안의 연차, 직책을 최신화합니다."""
+    for p in doc.paragraphs:
+        lower_text = p.text.lower()
+        if "pleased to offer you" in lower_text or ("offer you" in lower_text and "position" in lower_text):
+            new_text = p.text
+            if term:
+                new_text = re.sub(r"\b\d+-year\b", term, new_text, flags=re.IGNORECASE)
+            if job_title:
+                new_text = re.sub(r"of the\s+(.+?)\s+position", f"of the {job_title} position", new_text, flags=re.IGNORECASE)
+            
+            if new_text != p.text:
+                set_paragraph_text(p, new_text)
+            break
+
+
+def _update_employee_signature(doc, name, dob):
+    """문서 하단 서명란에 기입된 손님 이름과 생년월일을 최신화합니다."""
+    # 하단부터 역순으로 탐색
+    for p in reversed(doc.paragraphs):
+        text = p.text.strip()
+        if "DOB:" in text or "Date of Birth:" in text:
+            # 예: "Joemar Alsum (DOB: 1987-09-05)"를 새 이름/생일로 통째로 덮어씀
+            set_paragraph_text(p, f"{name} (DOB: {dob})")
+            break
+
+
 def generate_job_offer_from_existing(existing_file_bytes: bytes, data: dict) -> bytes:
-    """업로드된 '기존 잡오퍼' docx를 그대로 열어서, 바뀌는 항목만 교체.
-    로고 / 서명란 / 회사 헤더 / Confidentiality 문구는 건드리지 않음."""
     doc = docx.Document(io.BytesIO(existing_file_bytes))
 
-    # 상단 날짜 (예: 'April 4, 2025')
     if data.get("offer_date"):
         for p in doc.paragraphs[:5]:
             if re.match(r"^[A-Z][a-z]+ \d{1,2},? \d{4}$", p.text.strip()):
@@ -775,6 +778,9 @@ def generate_job_offer_from_existing(existing_file_bytes: bytes, data: dict) -> 
 
     if data.get("client_name"):
         _update_salutation(doc, data["client_name"])
+
+    # 추가 픽스: 인사말 문단 (3-year / 1-year 불일치 해결)
+    _update_intro_paragraph(doc, data.get("employment_term"), data.get("job_title"))
 
     if data.get("job_title"):
         _update_job_title_line(doc, data["job_title"], data.get("noc_code", ""))
@@ -787,23 +793,25 @@ def generate_job_offer_from_existing(existing_file_bytes: bytes, data: dict) -> 
 
     if data.get("wage") and data.get("hours"):
         sentence = build_wage_sentence(data["wage"], data["hours"])
-        if not _replace_next_paragraph(doc, "Hourly wage and hours", sentence):
-            _replace_next_paragraph(doc, "Hourly Wage and Hours", sentence)
+        if not _replace_label_and_value(doc, "Hourly wage and hours", sentence):
+            _replace_label_and_value(doc, "Hourly Wage and Hours", sentence)
 
     if data.get("employment_term"):
-        _replace_next_paragraph(doc, "Terms of Employment:", build_term_sentence(data["employment_term"]))
+        _replace_label_and_value(doc, "Terms of Employment:", build_term_sentence(data["employment_term"]))
 
     if data.get("job_location"):
-        _replace_next_paragraph(doc, "Job Location:", data["job_location"])
+        _replace_label_and_value(doc, "Job Location:", data["job_location"])
 
     bullets = get_provincial_overtime_bullets(data.get("job_location", ""))
     if bullets:
         _replace_bullets_after(doc, "Overtime:", bullets)
 
     if data.get("start_date"):
-        _replace_next_paragraph(doc, "Start Date:", data["start_date"])
+        _replace_label_and_value(doc, "Start Date:", data["start_date"])
 
-    # 로고 / 서명 이미지 / 회사명·주소·전화 / Confidentiality 문구는 손대지 않음 → 원본 유지
+    # 추가 픽스: 하단 서명란 이름/생일 업데이트
+    if data.get("client_name") and data.get("client_dob"):
+        _update_employee_signature(doc, data["client_name"], data["client_dob"])
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -813,7 +821,7 @@ def generate_job_offer_from_existing(existing_file_bytes: bytes, data: dict) -> 
 # ==========================================
 # 6. Streamlit UI
 # ==========================================
-st.title("📄 잡오퍼 DOCX 생성기 (v3)")
+st.title("📄 잡오퍼 DOCX 생성기 (v4)")
 st.caption("기존 문서 그대로 편집 · 1단계 통합 분석 · 13개 주/준주 커버리지 · Cloudflare 이메일 디코딩")
 
 if "job_offer_data" not in st.session_state:
@@ -876,7 +884,11 @@ if st.button("AI 분석 시작", type="primary", use_container_width=True):
                 old_jo_file.type or "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
             if existing_parsed:
-                extracted_info.update(existing_parsed)
+                # 추가 픽스: 여권에서 이미 추출한 핵심 정보(이름, 생일)가 있으면 옛날 정보로 덮어쓰지 않음
+                for k, v in existing_parsed.items():
+                    if k in ["client_name", "client_dob"] and extracted_info.get(k):
+                        continue
+                    extracted_info[k] = v
             st.session_state["_old_jo_bytes"] = old_jo_file.getvalue()
         else:
             st.session_state.pop("_old_jo_bytes", None)
