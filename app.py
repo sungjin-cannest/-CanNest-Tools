@@ -62,49 +62,26 @@ if not check_password():
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
 def safe_generate_content(contents):
-    target_models = []
-    
-    # 1. 현재 API 키로 사용 가능한 모델 목록 실시간 자동 조회
-    try:
-        available_models = [
-            m.name for m in genai.list_models() 
-            if 'generateContent' in m.supported_generation_methods
-        ]
-        # flash 모델 우선 ➔ pro 모델 ➔ 기타 모델 순으로 정렬
-        flash_models = [m for m in available_models if 'flash' in m.lower()]
-        pro_models = [m for m in available_models if 'pro' in m.lower()]
-        target_models = flash_models + pro_models + available_models
-    except Exception:
-        pass
-
-    # 2. 자동 조회가 실패할 경우를 위한 백업 모델 후보군 (models/ 접두사 포함)
-    fallback_candidates = [
-        'models/gemini-1.5-flash',
+    # 음성(TTS) 등 실험용 모델이 섞이지 않도록, 확실한 텍스트/비전 범용 모델만 고정 지정
+    candidate_models = [
         'gemini-1.5-flash',
-        'models/gemini-2.0-flash',
-        'gemini-2.0-flash',
-        'models/gemini-1.5-pro',
-        'gemini-1.5-pro'
+        'gemini-1.5-pro',
+        'gemini-1.5-flash-latest'
     ]
-
-    combined_models = []
-    for m in target_models + fallback_candidates:
-        if m not in combined_models:
-            combined_models.append(m)
-
+    
     last_error = None
-    for model_name in combined_models:
+    for model_name in candidate_models:
         try:
             mod = genai.GenerativeModel(model_name)
             response = mod.generate_content(contents)
             return response
         except Exception as e:
             last_error = e
-            if "404" in str(e) or "not found" in str(e).lower():
-                continue
-            else:
-                raise e
+            # 404(Not Found)나 400(Modality Error) 등 어떤 에러가 발생하더라도 
+            # 멈추지 않고 바로 다음 후보 모델을 시도하도록 무조건 continue 처리
+            continue
 
+    # 모든 모델이 실패했을 때만 에러 출력
     raise last_error
 # ==========================================
 # 2. 내장 헬퍼 함수
