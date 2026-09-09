@@ -1,33 +1,27 @@
 import streamlit as st
 
-# 📌 가장 먼저 실행되어야 하는 Streamlit 페이지 설정
-st.set_page_config(page_title="CanNest 통합 업무 시스템", layout="wide")
+# 📌 Streamlit 페이지 설정
+st.set_page_config(page_title="CanNest 잡오퍼 DOCX 생성기 (DEV)", layout="wide")
 
 import google.generativeai as genai
 import fitz  # PyMuPDF
 from PIL import Image, ImageOps
-import pillow_heif  # HEIC 지원 라이브러리
+import pillow_heif  # HEIC 지원
 import io
-import zipfile
 import json
-import os
 import datetime
-import time
-import uuid
-import re 
+import re
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 
 # DOCX 생성 라이브러리
 try:
     import docx
     from docx import Document
-    from docx.shared import Pt, Inches, RGBColor
+    from docx.shared import Pt, Inches
     from docx.enum.text import WD_ALIGN_PARAGRAPH
 except ImportError:
-    st.error("⚠️ 'python-docx' 라이브러리가 필요합니다. requirements.txt에 python-docx를 추가해 주세요.")
+    st.error("⚠️ 'python-docx' 라이브러리가 필요합니다. Streamlit Cloud secrets/requirements.txt에 python-docx를 추가해 주세요.")
 
-# HEIC 이미지 지원 등록 및 고해상도 제한 해제
 pillow_heif.register_heif_opener()
 Image.MAX_IMAGE_PIXELS = None
 
@@ -36,7 +30,7 @@ Image.MAX_IMAGE_PIXELS = None
 # ==========================================
 if "APP_PASSWORD" not in st.secrets or "GEMINI_API_KEY" not in st.secrets:
     st.error("⚠️ Streamlit Cloud의 Secrets 설정이 필요합니다.")
-    st.info("우측 하단 [Manage app] -> [Settings] -> [Secrets]에 GEMINI_API_KEY와 APP_PASSWORD를 입력해 주세요.")
+    st.info("Secrets에 GEMINI_API_KEY와 APP_PASSWORD를 설정해 주세요.")
     st.stop()
 
 def check_password():
@@ -48,11 +42,11 @@ def check_password():
             st.session_state["password_correct"] = False
 
     if "password_correct" not in st.session_state:
-        st.title("🔒 CanNest 통합 업무 시스템")
+        st.title("🔒 CanNest 잡오퍼 생성기 (DEV)")
         st.text_input("접속 비밀번호를 입력하세요", type="password", on_change=password_entered, key="password")
         return False
     elif not st.session_state["password_correct"]:
-        st.title("🔒 CanNest 통합 업무 시스템")
+        st.title("🔒 CanNest 잡오퍼 생성기 (DEV)")
         st.text_input("접속 비밀번호를 입력하세요", type="password", on_change=password_entered, key="password")
         st.error("비밀번호가 틀렸습니다.")
         return False
@@ -64,8 +58,7 @@ if not check_password():
 # ==========================================
 # 1. API 키 및 모델 설정
 # ==========================================
-GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
-genai.configure(api_key=GEMINI_API_KEY)
+genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
 def safe_generate_content(contents):
     candidate_models = ['gemini-3.6-flash']
@@ -84,17 +77,88 @@ def safe_generate_content(contents):
     raise last_error
 
 # ==========================================
-# 2. Canada.ca 실시간 Median Wage 크롤러 (매번 동적 수집)
+# 2. 내장 헬퍼 함수 (독립 실행용)
+# ==========================================
+def process_uploaded_file_to_image(file_obj):
+    if file_obj.type == "application/pdf":
+        doc = fitz.open(stream=file_obj.read(), filetype="pdf")
+        page = doc.load_page(0)
+        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    else:
+        img = Image.open(file_obj)
+        img = ImageOps.exif_transpose(img)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+    
+    max_dim = max(img.width, img.height)
+    if max_dim > 1800:
+        ratio = 1800.0 / float(max_dim)
+        new_size = (int(img.width * ratio), int(img.height * ratio))
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+    
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=75)
+    buf.seek(0)
+    return Image.open(buf)
+
+def format_full_name(surname, given_name):
+    s = str(surname).strip() if surname else ""
+    g = str(given_name).strip() if given_name else ""
+    if not s and not g: return ""
+    if not s: return g
+    if not g: return s
+    return f"{g} {s}"
+
+def extract_imm5476_info(image):
+    prompt = """
+    Analyze this identity document carefully.
+    Extract surname, given_name, dob (YYYY-MM-DD), uci into exact JSON structure:
+    {"surname": "...", "given_name": "...", "dob": "YYYY-MM-DD", "uci": "..."}
+    Return ONLY raw valid JSON object.
+    """
+    try:
+        response = safe_generate_content([prompt, image])
+        clean_text = response.text.strip().replace('```json', '').replace('```', '')
+        return json.loads(clean_text)
+    except Exception:
+        return None
+
+def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
+    ext = os.path.splitext(file_name)[1].lower() if file_name else ""
+    if "word" in mime_type.lower() or "doc" in mime_type.lower() or ext in ['.doc', '.docx']:
+        try:
+            doc_obj = docx.Document(io.BytesIO(file_bytes))
+            text_list = [p.text for p in doc_obj.paragraphs if p.text.strip()]
+            for table in doc_obj.tables:
+                for row in table.rows:
+                    row_txt = " | ".join([cell.text.strip() for cell in row.cells if cell.text.strip()])
+                    if row_txt: text_list.append(row_txt)
+            full_text = "\n".join(text_list)
+            if full_text.strip():
+                return [f"\n--- [Word Document: {file_name}] ---\n{full_text[:20000]}\n"]
+        except Exception: pass
+
+    if "pdf" in mime_type.lower():
+        try:
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            text = ""
+            for page in doc: text += page.get_text("text") + "\n"
+            if len(text.strip()) > 100:
+                return [f"\n--- [Document: {file_name}] ---\n{text[:20000]}\n"]
+        except Exception: pass
+    return [{"mime_type": mime_type, "data": file_bytes}]
+
+# ==========================================
+# 3. Canada.ca 실시간 Median Wage 파싱 엔진
 # ==========================================
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_live_esdc_median_wages():
-    """https://www.canada.ca 공식 ESDC 웹페이지에서 주별 최신 중위 임금 수치를 실시간 크롤링"""
     url = "https://www.canada.ca/en/employment-social-development/services/foreign-workers/median-wage.html"
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
         with urllib.request.urlopen(req, timeout=10) as response:
             html = response.read().decode('utf-8', errors='ignore')
-            
             wages = {}
             prov_regex = r'(Alberta|British Columbia|Manitoba|New Brunswick|Newfoundland and Labrador|Northwest Territories|Nova Scotia|Nunavut|Ontario|Prince Edward Island|Quebec|Saskatchewan|Yukon)'
             
@@ -115,19 +179,17 @@ def get_live_esdc_median_wages():
                         if p_name in code_map:
                             wages[code_map[p_name]] = latest_wage
             if wages:
-                return wages, "Live Canada.ca ESDC API"
+                return wages, "Canada.ca ESDC 실시간 데이터"
     except Exception:
         pass
         
-    # 네트워크 연결 문제 시 비상용 기본 수치
     return {
         "BC": 38.40, "AB": 37.50, "ON": 36.92, "SK": 34.62, "MB": 31.33,
         "NB": 31.73, "NS": 31.96, "PE": 31.20, "NL": 33.60, "YT": 45.60,
         "NT": 48.00, "NU": 45.00, "QC": 36.00
-    }, "Fallback Data"
+    }, "ESDC 백업 기준"
 
 def calculate_employment_term(wage_val, address_text):
-    """실시간 수집된 중위 임금 기반으로 1년/3년 기간 판별"""
     try:
         wage_match = re.search(r'(\d+(?:\.\d+)?)', str(wage_val))
         if not wage_match:
@@ -153,15 +215,15 @@ def calculate_employment_term(wage_val, address_text):
         median_wage = live_wages.get(detected_prov, 38.40)
 
         if wage >= median_wage:
-            return "3-year", median_wage, f"{detected_prov} 실시간 중위임금(${median_wage:.2f}) 이상 (High-Wage Stream)"
+            return "3-year", median_wage, f"{detected_prov} 중위임금(${median_wage:.2f}) 이상 ➔ High-Wage Stream (3년 오퍼)"
         else:
-            return "1-year", median_wage, f"{detected_prov} 실시간 중위임금(${median_wage:.2f}) 미만 (Low-Wage Stream)"
+            return "1-year", median_wage, f"{detected_prov} 중위임금(${median_wage:.2f}) 미만 ➔ Low-Wage Stream (1년 오퍼)"
             
     except Exception:
         return "3-year", 38.40, "기본값 적용"
 
 # ==========================================
-# 3. 고도화된 웹 크롤러 (이메일, 전화번호, mailto 정밀 추출)
+# 4. 크롤러 및 로고 수집 엔진
 # ==========================================
 def fetch_url_content(url):
     target_url = url.strip()
@@ -195,14 +257,39 @@ def fetch_url_content(url):
     except Exception:
         return ""
 
-# ==========================================
-# 4. 주별 오버타임 조항 매핑 (퀘벡 제외 전지역)
-# ==========================================
+def fetch_company_logo(email_or_domain_or_url):
+    if not email_or_domain_or_url: return None
+    domain = ""
+    if "@" in email_or_domain_or_url:
+        domain = email_or_domain_or_url.split("@")[-1].strip()
+    else:
+        match = re.search(r'(?:https?://)?(?:www\.)?([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', email_or_domain_or_url)
+        if match: domain = match.group(1)
+            
+    ignored_domains = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'icloud.com', 'jobspider.com', 'jobbank.gc.ca', 'indeed.com']
+    if not domain or domain.lower() in ignored_domains: return None
+
+    logo_urls = [
+        f"https://logo.clearbit.com/{domain}",
+        f"https://www.google.com/s2/favicons?domain={domain}&sz=256"
+    ]
+
+    for l_url in logo_urls:
+        try:
+            req = urllib.request.Request(l_url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+            with urllib.request.urlopen(req, timeout=5) as response:
+                if response.status == 200:
+                    img_bytes = response.read()
+                    if len(img_bytes) > 1000: return img_bytes
+        except Exception: continue
+    return None
+
 def get_provincial_overtime_clause(address_text):
     text = str(address_text).upper()
     
     if "BC" in text or "BRITISH COLUMBIA" in text:
-        return ("1.5 times the employee’s regular wage for hours worked over 8 hours/day or 40 hours/week; and\n"
+        return ("Overtime will be paid in accordance with the applicable employment standards legislation, including:\n"
+                "1.5 times the employee’s regular wage for hours worked over 8 hours/day or 40 hours/week; and\n"
                 "2 times the employee’s regular wage for hours over 12 hours/day")
     elif "AB" in text or "ALBERTA" in text:
         return "1.5 times the employee's regular rate of pay for hours in excess of 8 hours/day or 44 hours/week"
@@ -215,14 +302,13 @@ def get_provincial_overtime_clause(address_text):
     elif "YT" in text or "YUKON" in text or "NT" in text or "NORTHWEST" in text or "NU" in text or "NUNAVUT" in text:
         return "1.5 times the employee's regular rate of pay for hours worked over 8 hours/day or 40 hours/week"
     else:
-        return "Overtime will be paid in accordance with the applicable provincial employment standards legislation for hours worked in excess of standard full-time limits."
+        return "Overtime will be paid in accordance with applicable provincial employment standards legislation for hours worked in excess of standard full-time limits."
 
 # ==========================================
-# 5. 샘플 기반 CanNest DOCX 잡오퍼 생성 엔진
+# 5. DOCX 생성 엔진
 # ==========================================
-def generate_job_offer_docx(data, layout_style="Style A (Mannylyn / LNI)"):
+def generate_job_offer_docx(data, layout_style="Style A (Mannylyn / LNI 섹션 헤더 스타일)"):
     doc = Document()
-    
     sections = doc.sections
     for section in sections:
         section.top_margin = Inches(1)
@@ -235,7 +321,6 @@ def generate_job_offer_docx(data, layout_style="Style A (Mannylyn / LNI)"):
     font.name = 'Calibri'
     font.size = Pt(11)
     
-    # 로고
     logo_bytes = data.get('logo_bytes')
     if logo_bytes:
         try:
@@ -246,7 +331,6 @@ def generate_job_offer_docx(data, layout_style="Style A (Mannylyn / LNI)"):
         except Exception:
             pass
 
-    # 헤더
     p_head = doc.add_paragraph()
     p_head.alignment = WD_ALIGN_PARAGRAPH.LEFT
     emp_name_val = data.get('employer_name', '')
@@ -263,9 +347,7 @@ def generate_job_offer_docx(data, layout_style="Style A (Mannylyn / LNI)"):
     doc.add_paragraph(data.get('offer_date', datetime.date.today().strftime("%B %d, %Y")))
     doc.add_paragraph(f"Dear {data.get('client_name', 'Employee')},\n")
     
-    # Style A vs Style B 분기
     if "Style B" in layout_style:
-        # Rocking Horse / 21 Century / Low Life 스타일
         intro_p = doc.add_paragraph()
         intro_p.add_run(f"I am pleased to offer you {data.get('employment_term', '3-year')}, full-time employment as a ")
         intro_p.add_run(f"{data.get('job_title', '')}").bold = True
@@ -294,7 +376,6 @@ def generate_job_offer_docx(data, layout_style="Style A (Mannylyn / LNI)"):
         p_o = doc.add_paragraph(); p_o.add_run("Overtime:\n").bold = True; p_o.add_run(f"{data.get('overtime_clause', '')}")
 
     else:
-        # Style A: Mannylyn / LNI 스타일
         intro_p = doc.add_paragraph()
         intro_p.add_run("We are pleased to offer you a full-time position as ")
         intro_p.add_run(f"{data.get('job_title', '')}").bold = True
@@ -354,9 +435,6 @@ def generate_job_offer_docx(data, layout_style="Style A (Mannylyn / LNI)"):
     doc.save(buf); buf.seek(0)
     return buf.getvalue()
 
-# ==========================================
-# 6. 기존 잡오퍼 파싱 함수
-# ==========================================
 def parse_existing_job_offer(file_bytes, mime_type):
     prompt = """
     Analyze this existing Job Offer document carefully.
@@ -367,221 +445,176 @@ def parse_existing_job_offer(file_bytes, mime_type):
     contents.insert(0, prompt)
     try:
         response = safe_generate_content(contents)
-        clean_text = response.text.strip().replace('```json', '').replace('```', '')
-        return json.loads(clean_text)
-    except Exception:
-        return {}
-
-# ==========================================
-# 7. PDF 서식 채우기 & CRM 압축 엔진 (메뉴 1~4용)
-# ==========================================
-def extract_imm5476_info(image):
-    prompt = "Extract surname, given_name, dob, uci into JSON."
-    try:
-        response = safe_generate_content([prompt, image])
         return json.loads(response.text.strip().replace('```json', '').replace('```', ''))
-    except Exception: return None
-
-def extract_all_passports_batch(has_non_acc, images):
-    prompt = "Extract passport details for family members into JSON."
-    try:
-        response = safe_generate_content([prompt] + images)
-        return json.loads(response.text.strip().replace('```json', '').replace('```', ''))
-    except Exception: return None
-
-def extract_case_prep_info(tmpl_bytes, client_files):
-    prompt = "Extract case prep info matching IMM fields into JSON."
-    try:
-        contents = [prompt] + prepare_document_for_gemini(tmpl_bytes, "application/pdf", "Blank_IMM_Form.pdf") + batch_process_client_files(client_files)
-        response = safe_generate_content(contents)
-        return json.loads(response.text.strip().replace('```json', '').replace('```', ''))
-    except Exception: return None
-
-def fill_imm5476(template_bytes, data):
-    doc = fitz.open(stream=template_bytes, filetype="pdf")
-    # (기존 PDF 채우기 로직 유지)
-    output_pdf = io.BytesIO(); doc.save(output_pdf); doc.close(); output_pdf.seek(0)
-    return output_pdf
-
-def fill_consent_letter(template_bytes, data):
-    doc = fitz.open(stream=template_bytes, filetype="pdf")
-    # (기존 한부모 동의서 채우기 로직 유지)
-    output_pdf = io.BytesIO(); doc.save(output_pdf); doc.close(); output_pdf.seek(0)
-    return output_pdf
-
-def process_and_compress_file(file_bytes, mime_type, target_filename):
-    return file_bytes, mime_type
+    except Exception: return {}
 
 # ==========================================
-# 8. Streamlit 네비게이션 및 UI 구성
+# 6. Streamlit 단독 UI
 # ==========================================
-MENU_1 = "🍁 IMM5476 자동 작성"
-MENU_2 = "✈️ 한부모 동의서 자동 작성"
-MENU_3 = "📋 IMM서류 정보 정리"
-MENU_4 = "🏷️ CRM 파일명 생성 및 묶기/분할"
-MENU_5 = "📄 잡오퍼 DOCX 생성기 (DEV)"
+st.title("📄 잡오퍼 DOCX 생성기 (DEV 단독 테스트 모듈)")
+st.caption("실시간 ESDC Median Wage 파싱 및 CanNest 사내 샘플 양식 기반 잡오퍼(.docx) 자동 생성 모듈입니다.")
 
-st.sidebar.title("🦅 CanNest Tool")
-app_mode = st.sidebar.radio("원하시는 업무 도구를 선택하세요", [MENU_1, MENU_2, MENU_3, MENU_4, MENU_5])
+if "job_offer_data" not in st.session_state:
+    st.session_state.job_offer_data = {}
 
-# 메뉴 1~4는 기존과 동일하게 유지되며, 메뉴 5만 고도화됩니다.
-if app_mode == MENU_5:
-    st.title(MENU_5)
-    st.caption("실시간 ESDC Median Wage 파싱 및 CanNest 사내 샘플 양식 기반 잡오퍼(.docx) 자동 생성 모듈입니다.")
-    
-    if "job_offer_data" not in st.session_state:
-        st.session_state.job_offer_data = {}
+doc_mode = st.radio("작성 모드를 선택하세요", ["🆕 신규 잡오퍼 생성", "🔄 기존 잡오퍼 연장/업데이트"])
+
+st.markdown("---")
+
+st.subheader("1. 손님 정보 (여권 업로드)")
+passport_file = st.file_uploader("손님 여권 이미지 또는 PDF", type=['jpg', 'jpeg', 'png', 'pdf', 'heic', 'HEIC', 'docx', 'DOCX', 'doc', 'DOC'], key="jo_passport")
+
+if doc_mode == "🔄 기존 잡오퍼 연장/업데이트":
+    st.subheader("2. 기존 잡오퍼 서류 (업로드 시 기존 정보 자동 로드)")
+    old_jo_file = st.file_uploader("기존 잡오퍼 (DOCX 또는 PDF)", type=['pdf', 'docx', 'doc'], key="jo_old_file")
+    if old_jo_file and st.button("기존 잡오퍼 분석하여 정보 가져오기"):
+        with st.spinner("기존 잡오퍼 분석 중..."):
+            existing_parsed = parse_existing_job_offer(old_jo_file.getvalue(), old_jo_file.type if old_jo_file.type else "application/pdf")
+            if existing_parsed:
+                st.session_state.job_offer_data.update(existing_parsed)
+                st.success("기존 잡오퍼 정보를 불러왔습니다.")
+
+st.subheader("3. 채용 공고 (광고 링크 또는 내용 붙여넣기)")
+job_posting_text = st.text_area("채용 공고 링크(URL) 또는 공고 텍스트를 입력하세요", height=100)
+logo_file = st.file_uploader("회사 로고 이미지 (선택 사항)", type=['jpg', 'jpeg', 'png'], key="jo_logo")
+
+if st.button("AI 채용공고 & 여권 실시간 분석 시작", type="primary", use_container_width=True):
+    with st.spinner("웹페이지 접속, 이메일/전화번호 추출 및 ESDC 실시간 수치 대조 중..."):
+        extracted_info = {}
+        if logo_file: extracted_info['logo_bytes'] = logo_file.getvalue()
+
+        if passport_file:
+            pass_img = process_uploaded_file_to_image(passport_file)
+            pass_data = extract_imm5476_info(pass_img)
+            if pass_data:
+                extracted_info['client_name'] = format_full_name(pass_data.get('surname', ''), pass_data.get('given_name', ''))
+                extracted_info['client_dob'] = pass_data.get('dob', '')
         
-    doc_mode = st.radio("작성 모드를 선택하세요", ["🆕 신규 잡오퍼 생성", "🔄 기존 잡오퍼 연장/업데이트"])
-    
-    st.markdown("---")
-    
-    st.subheader("1. 손님 정보 (여권 업로드)")
-    passport_file = st.file_uploader("손님 여권 이미지 또는 PDF", type=['jpg', 'jpeg', 'png', 'pdf'], key="jo_passport")
-    
-    if doc_mode == "🔄 기존 잡오퍼 연장/업데이트":
-        st.subheader("2. 기존 잡오퍼 서류 (업로드 시 기존 정보 자동 로드)")
-        old_jo_file = st.file_uploader("기존 잡오퍼 (DOCX 또는 PDF)", type=['pdf', 'docx'], key="jo_old_file")
-        if old_jo_file and st.button("기존 잡오퍼 분석하여 정보 가져오기"):
-            with st.spinner("기존 잡오퍼 분석 중..."):
-                existing_parsed = parse_existing_job_offer(old_jo_file.getvalue(), old_jo_file.type)
-                if existing_parsed:
-                    st.session_state.job_offer_data.update(existing_parsed)
-                    st.success("기존 잡오퍼 정보를 불러왔습니다.")
-
-    st.subheader("3. 채용 공고 (광고 링크 또는 내용 붙여넣기)")
-    job_posting_text = st.text_area("채용 공고 링크(URL) 또는 공고 텍스트를 입력하세요", height=100)
-    logo_file = st.file_uploader("회사 로고 이미지 (선택 사항)", type=['jpg', 'jpeg', 'png'], key="jo_logo")
-    
-    if st.button("AI 채용공고 & 여권 실시간 분석 시작", type="primary", use_container_width=True):
-        with st.spinner("웹페이지 접속, 이메일/전화번호 추출 및 ESDC 실시간 수치 대조 중..."):
-            extracted_info = {}
-            if logo_file: extracted_info['logo_bytes'] = logo_file.getvalue()
-
-            if passport_file:
-                pass_img = process_uploaded_file_to_image(passport_file)
-                pass_data = extract_imm5476_info(pass_img)
-                if pass_data:
-                    extracted_info['client_name'] = format_full_name(pass_data.get('surname', ''), pass_data.get('given_name', ''))
-                    extracted_info['client_dob'] = pass_data.get('dob', '')
+        if job_posting_text.strip():
+            raw_input = job_posting_text.strip()
+            is_url = bool(re.search(r'https?://[^\s]+|www\.[^\s]+', raw_input))
             
-            if job_posting_text.strip():
-                raw_input = job_posting_text.strip()
-                is_url = bool(re.search(r'https?://[^\s]+|www\.[^\s]+', raw_input))
+            if is_url:
+                url_match = re.search(r'(https?://[^\s]+|www\.[^\s]+)', raw_input).group(0)
+                fetched_text = fetch_url_content(url_match)
+                text_to_analyze = fetched_text if fetched_text else raw_input
                 
-                if is_url:
-                    url_match = re.search(r'(https?://[^\s]+|www\.[^\s]+)', raw_input).group(0)
-                    fetched_text = fetch_url_content(url_match)
-                    text_to_analyze = fetched_text if fetched_text else raw_input
-                else: text_to_analyze = raw_input
-                    
-                prompt_job = f"""
-                Analyze this job posting webpage/text content carefully:
-                {text_to_analyze}
+                auto_logo = fetch_company_logo(url_match)
+                if auto_logo and 'logo_bytes' not in extracted_info:
+                    extracted_info['logo_bytes'] = auto_logo
+            else: 
+                text_to_analyze = raw_input
+                
+            prompt_job = f"""
+            Analyze this job posting webpage/text content carefully:
+            {text_to_analyze}
 
-                Extract into exact JSON:
-                - employer_name: Full employer/company name including legal name and 'dba' if present (e.g. 'Agape Sushi Inc. dba Hiro Japan Sushi Xpress')
-                - job_title: Position or Job Title
-                - wage: Hourly wage rate in numerical string format (e.g. '20.15')
-                - hours: Working hours per week (e.g. '30-40')
-                - job_location: Exact work location address including suite, street, city, province, postal code
-                - employer_address: Corporate or Employer address if different, otherwise same as job_location
-                - employer_phone: Contact telephone number
-                - employer_email: Contact email address
-                - benefits: Benefits (e.g. '4% vacation pay')
-                - job_duties: Array of bullet point job duty strings
+            Extract into exact JSON:
+            - employer_name: Full employer/company name including legal name and 'dba' if present (e.g. 'Agape Sushi Inc. dba Hiro Japan Sushi Xpress')
+            - job_title: Position or Job Title
+            - wage: Hourly wage rate in numerical string format (e.g. '20.15')
+            - hours: Working hours per week (e.g. '30-40')
+            - job_location: Exact work location address including suite, street, city, province, postal code
+            - employer_address: Corporate or Employer address if different, otherwise same as job_location
+            - employer_phone: Contact telephone number
+            - employer_email: Contact email address
+            - benefits: Benefits (e.g. '4% vacation pay')
+            - job_duties: Array of bullet point job duty strings
 
-                Return ONLY raw valid JSON object.
-                """
-                try:
-                    resp = safe_generate_content([prompt_job])
-                    clean = resp.text.strip().replace('```json', '').replace('```', '')
-                    job_extracted = json.loads(clean)
-                    extracted_info.update(job_extracted)
-                except Exception as e: st.warning(f"분석 경고: {e}")
-                    
-            st.session_state.job_offer_data.update(extracted_info)
-            st.success("실시간 정보 수집 및 분석이 완료되었습니다.")
+            Return ONLY raw valid JSON object.
+            """
+            try:
+                resp = safe_generate_content([prompt_job])
+                clean = resp.text.strip().replace('```json', '').replace('```', '')
+                job_extracted = json.loads(clean)
+                extracted_info.update(job_extracted)
+                
+                if extracted_info.get('employer_email') and 'logo_bytes' not in extracted_info:
+                    auto_logo = fetch_company_logo(extracted_info.get('employer_email'))
+                    if auto_logo: extracted_info['logo_bytes'] = auto_logo
+            except Exception as e: st.warning(f"분석 경고: {e}")
+                
+        st.session_state.job_offer_data.update(extracted_info)
+        st.success("실시간 정보 수집 및 분석이 완료되었습니다.")
 
-    st.markdown("---")
-    st.subheader("4. 최종 잡오퍼 정보 확인 및 수정")
-    
-    jo_data = st.session_state.job_offer_data
-    
-    # 실시간 중위임금 기반 고용 기간 자동 판정
-    temp_wage = jo_data.get('wage', '20.15')
-    temp_loc = jo_data.get('job_location', jo_data.get('employer_address', ''))
-    calc_term, calc_median, calc_reason = calculate_employment_term(temp_wage, temp_loc)
-    
-    col_c1, col_c2 = st.columns(2)
-    with col_c1:
-        c_name = st.text_input("손님 영문 성명 (Client Name)", value=jo_data.get('client_name', ''))
-        offer_dt = st.date_input("오퍼 작성일 (Offer Date)", datetime.date.today()).strftime("%B %d, %Y")
-        term_str = st.text_input("계약 기간 (Term - ESDC 실시간 수치 기준 자동 계산)", value=jo_data.get('employment_term', calc_term))
-        st.info(f"🌐 **Canada.ca ESDC 중위 임금 대조:** {calc_reason}")
-    with col_c2:
-        c_dob = st.text_input("손님 생년월일 (Client DOB)", value=jo_data.get('client_dob', ''))
-        start_dt_str = st.text_input("근무 시작일 (Start Date)", value=jo_data.get('start_date', 'The employment start date will be as soon as possible upon the employee’s authorization to work in Canada.'))
+st.markdown("---")
+st.subheader("4. 최종 잡오퍼 정보 확인 및 수정")
 
-    st.markdown("#### 🏢 고용주 및 회사 정보")
-    col_e1, col_e2 = st.columns(2)
-    with col_e1:
-        emp_name = st.text_input("회사명 (Employer / Company Name - dba 포함)", value=jo_data.get('employer_name', ''))
-        signer_n = st.text_input("대표자/서명자 성명 (Signer Name)", value=jo_data.get('signer_name', ''))
-        signer_t = st.text_input("대표자 직책 (Signer Title)", value=jo_data.get('signer_title', 'Director'))
-    with col_e2:
-        emp_addr = st.text_input("회사 대표 주소 (Employer Address)", value=jo_data.get('employer_address', ''))
-        emp_phone = st.text_input("회사 전화번호 (Employer Phone)", value=jo_data.get('employer_phone', ''))
-        emp_email = st.text_input("회사 이메일 (Employer Email)", value=jo_data.get('employer_email', ''))
+jo_data = st.session_state.job_offer_data
 
-    st.markdown("#### 💼 근무 조건 및 레이아웃 선택")
-    selected_layout = st.selectbox("잡오퍼 문서 양식 스타일 선택", ["Style A (Mannylyn / LNI 섹션 헤더 스타일)", "Style B (Rocking Horse / 21 Century 인라인 라벨 스타일)"])
-    
-    col_j1, col_j2 = st.columns(2)
-    with col_j1:
-        j_title = st.text_input("직책 (Job Title)", value=jo_data.get('job_title', ''))
-        j_wage = st.text_input("시급 (Hourly Wage, CAD)", value=str(jo_data.get('wage', '20.15')))
-        j_hours = st.text_input("주당 근무시간 (Weekly Hours)", value=str(jo_data.get('hours', '30-40')))
-    with col_j2:
-        j_loc = st.text_input("실제 근무지 주소 (Job Location)", value=jo_data.get('job_location', emp_addr))
-        j_benefits = st.text_input("혜택 (Benefits)", value=jo_data.get('benefits', '4% vacation pay'))
+temp_wage = jo_data.get('wage', '20.15')
+temp_loc = jo_data.get('job_location', jo_data.get('employer_address', ''))
+calc_term, calc_median, calc_reason = calculate_employment_term(temp_wage, temp_loc)
 
-    auto_ot_clause = get_provincial_overtime_clause(j_loc if j_loc else emp_addr)
-    j_ot = st.text_area("오버타임 조항 (주별 오버타임 기준 자동 적용)", value=auto_ot_clause, height=80)
+col_c1, col_c2 = st.columns(2)
+with col_c1:
+    c_name = st.text_input("손님 영문 성명 (Client Name)", value=jo_data.get('client_name', ''))
+    offer_dt = st.date_input("오퍼 작성일 (Offer Date)", datetime.date.today()).strftime("%B %d, %Y")
+    term_str = st.text_input("계약 기간 (Term - ESDC 실시간 수치 기준 자동 계산)", value=jo_data.get('employment_term', calc_term))
+    st.info(f"🌐 **Canada.ca ESDC 중위 임금 대조:** {calc_reason}")
+with col_c2:
+    c_dob = st.text_input("손님 생년월일 (Client DOB)", value=jo_data.get('client_dob', ''))
+    start_dt_str = st.text_input("근무 시작일 (Start Date)", value=jo_data.get('start_date', 'The employment start date will be as soon as possible upon the employee’s authorization to work in Canada.'))
 
-    duties_input_str = jo_data.get('job_duties', [])
-    if isinstance(duties_input_str, list): duties_input_str = "\n".join(duties_input_str)
-    j_duties_text = st.text_area("주요 직무 (Job Duties)", value=duties_input_str, height=150)
+st.markdown("#### 🏢 고용주 및 회사 정보")
+col_e1, col_e2 = st.columns(2)
+with col_e1:
+    emp_name = st.text_input("회사명 (Employer / Company Name - dba 포함)", value=jo_data.get('employer_name', ''))
+    signer_n = st.text_input("대표자/서명자 성명 (Signer Name)", value=jo_data.get('signer_name', ''))
+    signer_t = st.text_input("대표자 직책 (Signer Title)", value=jo_data.get('signer_title', 'Director'))
+with col_e2:
+    emp_addr = st.text_input("회사 대표 주소 (Employer Address)", value=jo_data.get('employer_address', ''))
+    emp_phone = st.text_input("회사 전화번호 (Employer Phone)", value=jo_data.get('employer_phone', ''))
+    emp_email = st.text_input("회사 이메일 (Employer Email)", value=jo_data.get('employer_email', ''))
 
-    st.markdown("---")
-    if st.button("📄 MS Word (.docx) 잡오퍼 생성 및 다운로드", type="primary", use_container_width=True):
-        if not c_name or not emp_name or not j_title:
-            st.error("손님 성명, 회사명, 직책은 필수 입력 항목입니다.")
-        else:
-            final_jo_dict = {
-                "client_name": c_name, "client_dob": c_dob, "offer_date": offer_dt, "employment_term": term_str,
-                "start_date": start_dt_str, "employer_name": emp_name, "signer_name": signer_n, "signer_title": signer_t,
-                "employer_address": emp_addr, "employer_phone": emp_phone, "employer_email": emp_email,
-                "job_title": j_title, "wage": j_wage, "hours": j_hours, "job_location": j_loc,
-                "benefits": j_benefits, "overtime_clause": j_ot, "job_duties": j_duties_text,
-                "logo_bytes": jo_data.get('logo_bytes')
-            }
-            
-            docx_bytes = generate_job_offer_docx(final_jo_dict, layout_style=selected_layout)
-            
-            crm_client = "NAME"
-            if c_name:
-                parts = c_name.strip().split()
-                if parts: crm_client = parts[0].capitalize()
-                    
-            out_filename = f"[Job Offer]_{crm_client}.docx"
-            
-            st.success("CanNest 표준 잡오퍼 DOCX 문서 생성이 완료되었습니다!")
-            st.download_button(
-                label="📥 Job Offer .docx 파일 다운로드",
-                data=docx_bytes,
-                file_name=out_filename,
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                type="primary",
-                use_container_width=True
-            )
+st.markdown("#### 💼 근무 조건 및 레이아웃 선택")
+selected_layout = st.selectbox("잡오퍼 문서 양식 스타일 선택", ["Style A (Mannylyn / LNI 섹션 헤더 스타일)", "Style B (Rocking Horse / 21 Century 인라인 라벨 스타일)"])
+
+col_j1, col_j2 = st.columns(2)
+with col_j1:
+    j_title = st.text_input("직책 (Job Title)", value=jo_data.get('job_title', ''))
+    j_wage = st.text_input("시급 (Hourly Wage, CAD)", value=str(jo_data.get('wage', '20.15')))
+    j_hours = st.text_input("주당 근무시간 (Weekly Hours)", value=str(jo_data.get('hours', '30-40')))
+with col_j2:
+    j_loc = st.text_input("실제 근무지 주소 (Job Location)", value=jo_data.get('job_location', emp_addr))
+    j_benefits = st.text_input("혜택 (Benefits)", value=jo_data.get('benefits', '4% vacation pay'))
+
+auto_ot_clause = get_provincial_overtime_clause(j_loc if j_loc else emp_addr)
+j_ot = st.text_area("오버타임 조항 (주별 오버타임 기준 자동 적용)", value=auto_ot_clause, height=80)
+
+duties_input_str = jo_data.get('job_duties', [])
+if isinstance(duties_input_str, list): duties_input_str = "\n".join(duties_input_str)
+j_duties_text = st.text_area("주요 직무 (Job Duties)", value=duties_input_str, height=150)
+
+st.markdown("---")
+if st.button("📄 MS Word (.docx) 잡오퍼 생성 및 다운로드", type="primary", use_container_width=True):
+    if not c_name or not emp_name or not j_title:
+        st.error("손님 성명, 회사명, 직책은 필수 입력 항목입니다.")
+    else:
+        final_jo_dict = {
+            "client_name": c_name, "client_dob": c_dob, "offer_date": offer_dt, "employment_term": term_str,
+            "start_date": start_dt_str, "employer_name": emp_name, "signer_name": signer_n, "signer_title": signer_t,
+            "employer_address": emp_addr, "employer_phone": emp_phone, "employer_email": emp_email,
+            "job_title": j_title, "wage": j_wage, "hours": j_hours, "job_location": j_loc,
+            "benefits": j_benefits, "overtime_clause": j_ot, "job_duties": j_duties_text,
+            "logo_bytes": jo_data.get('logo_bytes')
+        }
+        
+        docx_bytes = generate_job_offer_docx(final_jo_dict, layout_style=selected_layout)
+        
+        crm_client = "NAME"
+        if c_name:
+            parts = c_name.strip().split()
+            if parts: crm_client = parts[0].capitalize()
+                
+        out_filename = f"[Job Offer]_{crm_client}.docx"
+        
+        st.success("CanNest 표준 잡오퍼 DOCX 문서 생성이 완료되었습니다!")
+        st.download_button(
+            label="📥 Job Offer .docx 파일 다운로드",
+            data=docx_bytes,
+            file_name=out_filename,
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            type="primary",
+            use_container_width=True
+        )
