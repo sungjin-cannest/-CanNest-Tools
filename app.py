@@ -14,7 +14,7 @@ import re
 import urllib.request
 import os
 
-# DOCX 생성 라이브러리
+# 순수 DOCX 생성 라이브러리 (docxtpl 사용 안 함)
 try:
     import docx
     from docx import Document
@@ -31,7 +31,6 @@ Image.MAX_IMAGE_PIXELS = None
 # ==========================================
 if "APP_PASSWORD" not in st.secrets or "GEMINI_API_KEY" not in st.secrets:
     st.error("⚠️ Streamlit Cloud의 Secrets 설정이 필요합니다.")
-    st.info("Secrets에 GEMINI_API_KEY와 APP_PASSWORD를 설정해 주세요.")
     st.stop()
 
 def check_password():
@@ -57,32 +56,32 @@ if not check_password():
     st.stop()
 
 # ==========================================
-# 1. API 키 및 모델 설정
+# 1. API 키 및 가장 안전한 모델 호출 로직
 # ==========================================
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
 def safe_generate_content(contents):
-    # 음성(TTS) 등 실험용 모델이 섞이지 않도록, 확실한 텍스트/비전 범용 모델만 고정 지정
-    candidate_models = [
+    # 에러가 발생하지 않는 가장 범용적이고 안정적인 모델명만 고정
+    models_to_try = [
         'gemini-1.5-flash',
         'gemini-1.5-pro',
-        'gemini-1.5-flash-latest'
+        'gemini-1.0-pro',
+        'gemini-pro'
     ]
     
-    last_error = None
-    for model_name in candidate_models:
+    last_err = None
+    for m in models_to_try:
         try:
-            mod = genai.GenerativeModel(model_name)
-            response = mod.generate_content(contents)
-            return response
+            model = genai.GenerativeModel(m)
+            response = model.generate_content(contents)
+            if response.text:
+                return response
         except Exception as e:
-            last_error = e
-            # 404(Not Found)나 400(Modality Error) 등 어떤 에러가 발생하더라도 
-            # 멈추지 않고 바로 다음 후보 모델을 시도하도록 무조건 continue 처리
-            continue
+            last_err = e
+            continue  # 실패하면 즉시 다음 모델로 넘어감
+            
+    raise Exception(f"AI 모델 호출 실패. 마지막 발생 에러: {last_err}")
 
-    # 모든 모델이 실패했을 때만 에러 출력
-    raise last_error
 # ==========================================
 # 2. 내장 헬퍼 함수
 # ==========================================
@@ -157,13 +156,13 @@ def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
     return [{"mime_type": mime_type, "data": file_bytes}]
 
 # ==========================================
-# 3. Canada.ca 실시간 Median Wage 파싱
+# 3. 데이터 파싱 및 가공 함수
 # ==========================================
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_live_esdc_median_wages():
     url = "https://www.canada.ca/en/employment-social-development/services/foreign-workers/median-wage.html"
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=10) as response:
             html = response.read().decode('utf-8', errors='ignore')
             wages = {}
@@ -207,10 +206,7 @@ def calculate_employment_term(wage_val, address_text):
         detected_prov = "BC"
         
         prov_map = {
-            "BC": ["BC", "BRITISH COLUMBIA"], "AB": ["AB", "ALBERTA"], "ON": ["ON", "ONTARIO"],
-            "SK": ["SK", "SASKATCHEWAN"], "MB": ["MB", "MANITOBA"], "NB": ["NB", "NEW BRUNSWICK"],
-            "NS": ["NS", "NOVA SCOTIA"], "PE": ["PE", "PRINCE EDWARD"], "NL": ["NL", "NEWFOUNDLAND", "LABRADOR"],
-            "YT": ["YT", "YUKON"], "NT": ["NT", "NORTHWEST"], "NU": ["NU", "NUNAVUT"], "QC": ["QC", "QUEBEC"]
+            "BC": ["BC", "BRITISH COLUMBIA"], "AB": ["AB", "ALBERTA"], "ON": ["ON", "ONTARIO"]
         }
 
         for code, keywords in prov_map.items():
@@ -225,7 +221,6 @@ def calculate_employment_term(wage_val, address_text):
             return "3 years", median_wage, f"{detected_prov} 중위임금(${median_wage:.2f}) 이상 ➔ High-Wage Stream (3년 오퍼)"
         else:
             return "1 year", median_wage, f"{detected_prov} 중위임금(${median_wage:.2f}) 미만 ➔ Low-Wage Stream (1년 오퍼)"
-            
     except Exception:
         return "3 years", 38.40, "기본값 적용"
 
@@ -234,29 +229,14 @@ def fetch_url_content(url):
     if not target_url.startswith("http://") and not target_url.startswith("https://"):
         target_url = "https://" + target_url
     try:
-        req = urllib.request.Request(
-            target_url, 
-            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        )
+        req = urllib.request.Request(target_url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=12) as response:
             html = response.read().decode('utf-8', errors='ignore')
-            emails_in_html = re.findall(r'mailto:([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', html, re.IGNORECASE)
-            phones_in_html = re.findall(r'tel:([\d\+\-\(\)\s\.]+)', html, re.IGNORECASE)
-            raw_emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', html)
-            
-            all_emails = list(set(emails_in_html + raw_emails))
-            all_phones = list(set([p.strip() for p in phones_in_html if len(p.strip()) >= 7]))
-
             text = re.sub(r'<script\b[^<]*(?:(?!</script>)<[^<]*)*</script>', '', html, flags=re.IGNORECASE)
             text = re.sub(r'<style\b[^<]*(?:(?!</style>)<[^<]*)*</style>', '', html, flags=re.IGNORECASE)
             text = re.sub(r'<[^>]+>', ' ', text)
             text = re.sub(r'\s+', ' ', text).strip()
-
-            contact_hints = []
-            if all_emails: contact_hints.append(f"[CRITICAL DETECTED EMAILS: {', '.join(all_emails)}]")
-            if all_phones: contact_hints.append(f"[CRITICAL DETECTED PHONES: {', '.join(all_phones)}]")
-
-            return "\n".join(contact_hints) + "\n\n" + text[:15000]
+            return text[:15000]
     except Exception:
         return ""
 
@@ -267,13 +247,13 @@ def get_provincial_overtime_clause(address_text):
                 "2 times the employee’s regular rate of pay for hours in excess of 12 hours/day")
     elif "AB" in text or "ALBERTA" in text:
         return "1.5 times the employee's regular rate of pay for hours in excess of 8 hours/day or 44 hours/week"
-    elif "ON" in text or "ONTARIO" in text or "NB" in text or "NEW BRUNSWICK" in text:
+    elif "ON" in text or "ONTARIO" in text:
         return "1.5 times the employee's regular rate of pay for hours worked in excess of 44 hours per week"
     else:
         return "1.5 times the employee's regular rate of pay for hours worked over 8 hours/day or 40 hours/week"
 
 # ==========================================
-# 4. 순수 python-docx 전용 잡오퍼 생성 엔진 (Style A / Style B)
+# 4. 순수 python-docx 양식 100% 동일 구현 엔진
 # ==========================================
 def generate_job_offer_docx(data, selected_style="Style A"):
     doc = Document()
@@ -291,7 +271,7 @@ def generate_job_offer_docx(data, selected_style="Style A"):
     emp_name = data.get('employer_name', '')
     client_name = data.get('client_name', '')
 
-    # 로고 이미지 삽입 (선택 시)
+    # 로고 이미지 삽입
     logo_bytes = data.get('logo_bytes')
     if logo_bytes:
         try:
@@ -320,61 +300,35 @@ def generate_job_offer_docx(data, selected_style="Style A"):
         intro_p.add_run(f"{emp_name}").bold = True
         intro_p.add_run(" based on the following terms and conditions:")
 
-        # Job Title
-        p = doc.add_paragraph()
-        p.add_run("Job Title: ").bold = True
-        p.add_run(f"{data.get('job_title', '')}")
+        p = doc.add_paragraph(); p.add_run("Job Title: ").bold = True; p.add_run(f"{data.get('job_title', '')}")
 
-        # Job Duties
         duties_list = data.get('job_duties', [])
         if isinstance(duties_list, str):
             duties_list = [d.strip() for d in duties_list.split('\n') if d.strip()]
         if duties_list:
-            p_d = doc.add_paragraph()
-            p_d.add_run("Job Duties:").bold = True
+            p_d = doc.add_paragraph(); p_d.add_run("Job Duties:").bold = True
             for duty in duties_list:
                 clean_duty = re.sub(r'^[•\-\*]\s*', '', duty)
                 doc.add_paragraph(clean_duty, style='List Bullet')
 
-        # Compensation
         p_comp = doc.add_paragraph()
         p_comp.add_run("Compensation:\n").bold = True
         p_comp.add_run("Hourly wage and hours\n")
         p_comp.add_run(f"The employee will be paid ${data.get('wage', '0.00')} per hour, based on a minimum of {data.get('hours', '30')} hours per week.")
 
-        # Terms of Employment
-        p = doc.add_paragraph()
-        p.add_run("Terms of Employment:\n").bold = True
-        p.add_run(f"This is a full-time, {data.get('employment_term', '3 years')} employment term starting from the date agreed upon by the employer and employee.")
-
-        # Job Location
-        p = doc.add_paragraph()
-        p.add_run("Job Location:\n").bold = True
-        p.add_run(f"{data.get('job_location', '')}")
-
-        # Benefits
-        p = doc.add_paragraph()
-        p.add_run("Benefits:\n").bold = True
-        p.add_run(f"{data.get('benefits', '4% vacation pay')}")
-
-        # Confidentiality
-        p = doc.add_paragraph()
-        p.add_run("Confidentiality:\n").bold = True
+        p = doc.add_paragraph(); p.add_run("Terms of Employment:\n").bold = True; p.add_run(f"This is a full-time, {data.get('employment_term', '3 years')} employment term starting from the date agreed upon by the employer and employee.")
+        p = doc.add_paragraph(); p.add_run("Job Location:\n").bold = True; p.add_run(f"{data.get('job_location', '')}")
+        p = doc.add_paragraph(); p.add_run("Benefits:\n").bold = True; p.add_run(f"{data.get('benefits', '4% vacation pay')}")
+        
+        p = doc.add_paragraph(); p.add_run("Confidentiality:\n").bold = True
         p.add_run(f"By accepting the terms of this offer, the employee agrees to keep all confidential information obtained during their employment with {emp_name} strictly confidential. The employee further agrees that, upon termination of employment for any reason, they will return all physical and digital property belonging to or originating from {emp_name} within five days of receiving notice of termination.")
 
-        # Start Date
-        p = doc.add_paragraph()
-        p.add_run("Start Date:\n").bold = True
-        p.add_run(f"{data.get('start_date', 'The employment start date will be as soon as possible upon the employee’s authorization to work in Canada.')}")
-
-        # Overtime
-        p = doc.add_paragraph()
-        p.add_run("Overtime:\n").bold = True
-        p.add_run(f"{data.get('overtime_clause', '')}")
+        p = doc.add_paragraph(); p.add_run("Start Date:\n").bold = True; p.add_run(f"{data.get('start_date', 'As soon as possible upon obtaining a valid Work Permit')}")
+        
+        p = doc.add_paragraph(); p.add_run("Overtime:\n").bold = True; p.add_run(f"{data.get('overtime_clause', '')}")
 
         doc.add_paragraph(f"We are pleased to extend this offer of employment to you on behalf of {emp_name}. We are confident that you will make a valuable contribution to our company, and we look forward to working with you.")
 
-        # 서명란
         doc.add_paragraph("Sincerely,\t\t\t\t\tI accept the terms of this offer:")
         doc.add_paragraph("X\t\t\t\t\t\t______")
 
@@ -398,10 +352,8 @@ def generate_job_offer_docx(data, selected_style="Style A"):
         intro_p.add_run(". We are confident that your skills will be a great asset to our business. The details of your employment are outlined below:")
 
         def add_kv(label, val):
-            p = doc.add_paragraph()
-            p.paragraph_format.space_after = Pt(2)
-            p.add_run(f"{label}: ").bold = True
-            p.add_run(str(val))
+            p = doc.add_paragraph(); p.paragraph_format.space_after = Pt(2)
+            p.add_run(f"{label}: ").bold = True; p.add_run(str(val))
 
         add_kv("Job Title", data.get('job_title', ''))
         add_kv("Employment Type", "Full-time")
@@ -409,8 +361,7 @@ def generate_job_offer_docx(data, selected_style="Style A"):
         add_kv("Start Date", data.get('start_date', 'As soon as possible upon obtaining a valid Work Permit'))
         add_kv("Hourly wage", f"{data.get('wage', '0.00')} CAD per hour")
 
-        p_ot = doc.add_paragraph()
-        p_ot.paragraph_format.space_after = Pt(2)
+        p_ot = doc.add_paragraph(); p_ot.paragraph_format.space_after = Pt(2)
         p_ot.add_run("Overtime:\n").bold = True
         p_ot.add_run(f"{data.get('overtime_clause', '')}")
 
@@ -418,25 +369,20 @@ def generate_job_offer_docx(data, selected_style="Style A"):
         add_kv("Work Location", data.get('job_location', ''))
         add_kv("Vacation Pay", data.get('benefits', '4% gross earnings'))
 
-        # Job Duties
         duties_list = data.get('job_duties', [])
         if isinstance(duties_list, str):
             duties_list = [d.strip() for d in duties_list.split('\n') if d.strip()]
         if duties_list:
-            p_d = doc.add_paragraph()
-            p_d.add_run("Job Duties:").bold = True
+            p_d = doc.add_paragraph(); p_d.add_run("Job Duties:").bold = True
             for duty in duties_list:
                 clean_duty = re.sub(r'^[•\-\*]\s*', '', duty)
                 doc.add_paragraph(clean_duty, style='List Bullet')
 
-        # Confidentiality Agreement
-        p_c = doc.add_paragraph()
-        p_c.add_run("Confidentiality Agreement:\n").bold = True
+        p_c = doc.add_paragraph(); p_c.add_run("Confidentiality Agreement:\n").bold = True
         p_c.add_run(f"By agreeing to the terms of this offer, the employee further agrees that they will hold all confidential information with which they are entrusted while employed by {emp_name} in strict confidence. The employee also agrees that upon termination of employment for any reason, they will return all physical and digital property which belongs to or originates at {emp_name} within 5 days of notice of termination of employment.")
 
         doc.add_paragraph("We look forward to your acceptance of this offer.\nPlease sign below to confirm your agreement.")
-        doc.add_paragraph("Yours truly,")
-        doc.add_paragraph("X_____________________________________________")
+        doc.add_paragraph("Yours truly,\nX_____________________________________________")
 
         p_sig = doc.add_paragraph()
         p_sig.add_run(f"{data.get('signer_name', '')}\n").bold = True
@@ -445,8 +391,7 @@ def generate_job_offer_docx(data, selected_style="Style A"):
         if data.get('employer_phone'): p_sig.add_run(f"T. {data.get('employer_phone')}\n")
         if data.get('employer_email'): p_sig.add_run(f"E. {data.get('employer_email')}")
 
-        doc.add_paragraph("\nI accept the terms of this offer:")
-        doc.add_paragraph("___________________________________________")
+        doc.add_paragraph("\nI accept the terms of this offer:\n___________________________________________")
 
         p_acc = doc.add_paragraph()
         p_acc.add_run(f"{client_name}\n").bold = True
@@ -459,24 +404,21 @@ def generate_job_offer_docx(data, selected_style="Style A"):
 
 def parse_existing_job_offer(file_bytes, mime_type):
     prompt = """
-    Analyze this Job Offer document carefully.
-    Extract key information into exact JSON:
-    - client_name: Full name of employee
-    - client_dob: Date of birth (YYYY-MM-DD)
-    - employer_name: Full employer company name
-    - signer_name: Name of owner/manager/director who signed
-    - signer_title: Title of signer (e.g. 'Owner', 'Senior Manager')
-    - employer_address: Address of employer
-    - employer_phone: Contact phone number
-    - employer_email: Contact email address
-    - job_title: Position title
-    - wage: Hourly wage string (numeric)
-    - hours: Weekly hours
-    - job_location: Work location address
-    - benefits: Vacation pay or benefits
-    - job_duties: Array of job duty bullet points
-
-    Return ONLY raw valid JSON object.
+    Analyze this Job Offer document carefully. Extract into valid JSON:
+    - client_name
+    - client_dob
+    - employer_name
+    - signer_name
+    - signer_title
+    - employer_address
+    - employer_phone
+    - employer_email
+    - job_title
+    - wage
+    - hours
+    - job_location
+    - benefits
+    - job_duties (Array of strings)
     """
     contents = prepare_document_for_gemini(file_bytes, mime_type, "Existing_Job_Offer.pdf")
     contents.insert(0, prompt)
@@ -486,10 +428,10 @@ def parse_existing_job_offer(file_bytes, mime_type):
     except Exception: return {}
 
 # ==========================================
-# 5. Streamlit 단독 UI
+# 5. Streamlit 메인 UI
 # ==========================================
 st.title("📄 잡오퍼 DOCX 생성기 (DEV)")
-st.caption("실시간 ESDC Median Wage 파싱 및 사내 표준 양식 기반 잡오퍼(.docx) 자동 생성 모듈입니다.")
+st.caption("실시간 ESDC Median Wage 파싱 및 사내 표준 양식 기반 잡오퍼(.docx) 자동 생성기입니다.")
 
 if "job_offer_data" not in st.session_state:
     st.session_state.job_offer_data = {}
@@ -497,12 +439,11 @@ if "job_offer_data" not in st.session_state:
 doc_mode = st.radio("작성 모드를 선택하세요", ["🆕 신규 잡오퍼 생성", "🔄 기존 잡오퍼 연장/업데이트"])
 
 st.markdown("---")
-
 st.subheader("1. 손님 정보 (여권 업로드)")
-passport_file = st.file_uploader("손님 여권 이미지 또는 PDF", type=['jpg', 'jpeg', 'png', 'pdf', 'heic', 'HEIC', 'docx', 'DOCX', 'doc', 'DOC'], key="jo_passport")
+passport_file = st.file_uploader("손님 여권 이미지 또는 PDF", type=['jpg', 'jpeg', 'png', 'pdf', 'heic'], key="jo_passport")
 
 if doc_mode == "🔄 기존 잡오퍼 연장/업데이트":
-    st.subheader("2. 기존 잡오퍼 서류 (업로드 시 기존 정보 자동 로드)")
+    st.subheader("2. 기존 잡오퍼 서류")
     old_jo_file = st.file_uploader("기존 잡오퍼 (DOCX 또는 PDF)", type=['pdf', 'docx', 'doc'], key="jo_old_file")
     if old_jo_file and st.button("기존 잡오퍼 분석하여 정보 가져오기"):
         with st.spinner("기존 잡오퍼 분석 중..."):
@@ -511,12 +452,12 @@ if doc_mode == "🔄 기존 잡오퍼 연장/업데이트":
                 st.session_state.job_offer_data.update(existing_parsed)
                 st.success("기존 잡오퍼 정보를 불러왔습니다.")
 
-st.subheader("3. 채용 공고 (광고 링크 또는 내용 붙여넣기)")
-job_posting_text = st.text_area("채용 공고 링크(URL) 또는 공고 텍스트를 입력하세요", height=100)
+st.subheader("3. 채용 공고")
+job_posting_text = st.text_area("채용 공고 링크(URL) 또는 텍스트", height=100)
 logo_file = st.file_uploader("회사 로고 이미지 (선택 사항)", type=['jpg', 'jpeg', 'png'], key="jo_logo")
 
 if st.button("AI 채용공고 & 여권 실시간 분석 시작", type="primary", use_container_width=True):
-    with st.spinner("웹페이지 접속, 이메일/전화번호 추출 및 ESDC 실시간 수치 대조 중..."):
+    with st.spinner("정보 추출 및 분석 중..."):
         extracted_info = {}
         if logo_file: extracted_info['logo_bytes'] = logo_file.getvalue()
 
@@ -539,29 +480,28 @@ if st.button("AI 채용공고 & 여권 실시간 분석 시작", type="primary",
                 text_to_analyze = raw_input
                 
             prompt_job = f"""
-            Analyze this job posting webpage/text content carefully:
+            Analyze this job posting:
             {text_to_analyze}
 
-            Extract into exact JSON:
-            - employer_name: Full employer/company name
-            - job_title: Position or Job Title
-            - wage: Hourly wage rate in numerical string format (e.g. '20.15')
-            - hours: Working hours per week (e.g. '30')
-            - job_location: Exact work location address
-            - employer_address: Corporate address if different, otherwise same
-            - employer_phone: Contact phone number
-            - employer_email: Contact email address
-            - benefits: Benefits (e.g. '4% vacation pay')
-            - job_duties: Array of bullet point job duty strings
-
+            Extract into JSON:
+            - employer_name
+            - job_title
+            - wage (numeric string)
+            - hours
+            - job_location
+            - employer_address
+            - employer_phone
+            - employer_email
+            - benefits
+            - job_duties (Array of strings)
             Return ONLY raw valid JSON object.
             """
             try:
                 resp = safe_generate_content([prompt_job])
                 clean = resp.text.strip().replace('```json', '').replace('```', '')
-                job_extracted = json.loads(clean)
-                extracted_info.update(job_extracted)
-            except Exception as e: st.warning(f"분석 경고: {e}")
+                extracted_info.update(json.loads(clean))
+            except Exception as e: 
+                st.warning(f"분석 중 오류 발생: {e}")
                 
         st.session_state.job_offer_data.update(extracted_info)
         st.success("실시간 정보 수집 및 분석이 완료되었습니다.")
@@ -570,59 +510,50 @@ st.markdown("---")
 st.subheader("4. 최종 잡오퍼 정보 확인 및 수정")
 
 jo_data = st.session_state.job_offer_data
-
 temp_wage = jo_data.get('wage', '20.15')
 temp_loc = jo_data.get('job_location', jo_data.get('employer_address', ''))
 calc_term, calc_median, calc_reason = calculate_employment_term(temp_wage, temp_loc)
 
 col_c1, col_c2 = st.columns(2)
 with col_c1:
-    c_name = st.text_input("손님 영문 성명 (Client Name)", value=jo_data.get('client_name', ''))
-    offer_dt = st.date_input("오퍼 작성일 (Offer Date)", datetime.date.today()).strftime("%B %d, %Y")
-    term_str = st.text_input("계약 기간 (Term - ESDC 실시간 수치 기준 자동 계산)", value=jo_data.get('employment_term', calc_term))
-    st.info(f"🌐 **Canada.ca ESDC 중위 임금 대조:** {calc_reason}")
+    c_name = st.text_input("손님 영문 성명", value=jo_data.get('client_name', ''))
+    offer_dt = st.date_input("오퍼 작성일", datetime.date.today()).strftime("%B %d, %Y")
+    term_str = st.text_input("계약 기간", value=jo_data.get('employment_term', calc_term))
+    st.info(f"🌐 **ESDC 중위 임금 계산:** {calc_reason}")
 with col_c2:
-    c_dob = st.text_input("손님 생년월일 (Client DOB)", value=jo_data.get('client_dob', ''))
-    start_dt_str = st.text_input("근무 시작일 (Start Date)", value=jo_data.get('start_date', 'As soon as possible upon authorization to work in Canada'))
+    c_dob = st.text_input("손님 생년월일", value=jo_data.get('client_dob', ''))
+    start_dt_str = st.text_input("근무 시작일", value=jo_data.get('start_date', 'As soon as possible upon obtaining a valid Work Permit'))
 
-st.markdown("#### 🏢 고용주 및 회사 정보")
 col_e1, col_e2 = st.columns(2)
 with col_e1:
-    emp_name = st.text_input("회사명 (Employer / Company Name)", value=jo_data.get('employer_name', ''))
-    signer_n = st.text_input("대표자/서명자 성명 (Signer Name)", value=jo_data.get('signer_name', ''))
-    signer_t = st.text_input("대표자 직책 (Signer Title)", value=jo_data.get('signer_title', 'Owner'))
+    emp_name = st.text_input("회사명", value=jo_data.get('employer_name', ''))
+    signer_n = st.text_input("대표자 성명", value=jo_data.get('signer_name', ''))
+    signer_t = st.text_input("대표자 직책", value=jo_data.get('signer_title', 'Owner'))
 with col_e2:
-    emp_addr = st.text_input("회사 대표 주소 (Employer Address)", value=jo_data.get('employer_address', ''))
-    emp_phone = st.text_input("회사 전화번호 (Employer Phone)", value=jo_data.get('employer_phone', ''))
-    emp_email = st.text_input("회사 이메일 (Employer Email)", value=jo_data.get('employer_email', ''))
+    emp_addr = st.text_input("회사 주소", value=jo_data.get('employer_address', ''))
+    emp_phone = st.text_input("회사 전화번호", value=jo_data.get('employer_phone', ''))
+    emp_email = st.text_input("회사 이메일", value=jo_data.get('employer_email', ''))
 
-st.markdown("#### 💼 근무 조건 및 레이아웃 선택")
-selected_layout = st.selectbox(
-    "잡오퍼 문서 양식 스타일 선택", 
-    [
-        "Style A (서두 서술형 / 하단 개별 서명란)", 
-        "Style B (상단 조건 리스트형 / 서명 블록)"
-    ]
-)
+selected_layout = st.selectbox("잡오퍼 문서 양식", ["Style A (서두 서술형 / 하단 개별 서명란)", "Style B (상단 조건 리스트형 / 서명 블록)"])
 
 col_j1, col_j2 = st.columns(2)
 with col_j1:
-    j_title = st.text_input("직책 (Job Title)", value=jo_data.get('job_title', ''))
-    j_wage = st.text_input("시급 (Hourly Wage, CAD)", value=str(jo_data.get('wage', '20.15')))
-    j_hours = st.text_input("주당 근무시간 (Weekly Hours)", value=str(jo_data.get('hours', '30')))
+    j_title = st.text_input("직책", value=jo_data.get('job_title', ''))
+    j_wage = st.text_input("시급", value=str(jo_data.get('wage', '20.15')))
+    j_hours = st.text_input("주당 근무시간", value=str(jo_data.get('hours', '30')))
 with col_j2:
-    j_loc = st.text_input("실제 근무지 주소 (Job Location)", value=jo_data.get('job_location', emp_addr))
-    j_benefits = st.text_input("혜택 (Benefits)", value=jo_data.get('benefits', '4% vacation pay'))
+    j_loc = st.text_input("근무지 주소", value=jo_data.get('job_location', emp_addr))
+    j_benefits = st.text_input("혜택", value=jo_data.get('benefits', '4% vacation pay'))
 
 auto_ot_clause = get_provincial_overtime_clause(j_loc if j_loc else emp_addr)
-j_ot = st.text_area("오버타임 조항 (주별 오버타임 기준 자동 적용)", value=auto_ot_clause, height=80)
+j_ot = st.text_area("오버타임 조항", value=auto_ot_clause, height=80)
 
 duties_input_str = jo_data.get('job_duties', [])
 if isinstance(duties_input_str, list): duties_input_str = "\n".join(duties_input_str)
-j_duties_text = st.text_area("주요 직무 (Job Duties)", value=duties_input_str, height=150)
+j_duties_text = st.text_area("주요 직무", value=duties_input_str, height=150)
 
 st.markdown("---")
-if st.button("📄 MS Word (.docx) 잡오퍼 생성 및 다운로드", type="primary", use_container_width=True):
+if st.button("📄 MS Word (.docx) 다운로드", type="primary", use_container_width=True):
     if not c_name or not emp_name or not j_title:
         st.error("손님 성명, 회사명, 직책은 필수 입력 항목입니다.")
     else:
@@ -636,20 +567,7 @@ if st.button("📄 MS Word (.docx) 잡오퍼 생성 및 다운로드", type="pri
         }
         
         docx_bytes = generate_job_offer_docx(final_jo_dict, selected_style=selected_layout)
+        out_filename = f"[Job Offer]_{c_name.strip().split()[0].capitalize() if c_name.strip() else 'Client'}.docx"
         
-        crm_client = "NAME"
-        if c_name:
-            parts = c_name.strip().split()
-            if parts: crm_client = parts[0].capitalize()
-                
-        out_filename = f"[Job Offer]_{crm_client}.docx"
-        
-        st.success("CanNest 표준 잡오퍼 DOCX 문서 생성이 완료되었습니다!")
-        st.download_button(
-            label="📥 Job Offer .docx 파일 다운로드",
-            data=docx_bytes,
-            file_name=out_filename,
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            type="primary",
-            use_container_width=True
-        )
+        st.success("문서 생성이 완료되었습니다!")
+        st.download_button("📥 파일 다운로드", data=docx_bytes, file_name=out_filename, mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", type="primary", use_container_width=True)
