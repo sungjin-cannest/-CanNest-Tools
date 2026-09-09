@@ -5,7 +5,7 @@ st.set_page_config(page_title="CanNest 통합 업무 시스템", layout="wide")
 
 import google.generativeai as genai
 import fitz  # PyMuPDF
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageDraw, ImageFont
 import pillow_heif  # HEIC 지원 라이브러리
 import io
 import zipfile
@@ -16,6 +16,12 @@ import time
 import uuid
 import re 
 from concurrent.futures import ThreadPoolExecutor
+
+# DOCX 및 DOC 파일 파싱 지원
+try:
+    import docx
+except ImportError:
+    pass
 
 # HEIC 이미지 지원 등록 및 고해상도 제한 해제
 pillow_heif.register_heif_opener()
@@ -74,7 +80,45 @@ def safe_generate_content(contents):
     raise last_error
 
 # ==========================================
-# 2. 공통 캐싱 및 스마트 글자 크기 조절 함수
+# 2. MS Word (.doc / .docx) 텍스트 추출 엔진
+# ==========================================
+def read_word_document_text(file_bytes, file_name=""):
+    # 1. python-docx 시도 (.docx 또는 docx 기반 .doc)
+    try:
+        doc_obj = docx.Document(io.BytesIO(file_bytes))
+        text_list = [p.text for p in doc_obj.paragraphs if p.text.strip()]
+        for table in doc_obj.tables:
+            for row in table.rows:
+                row_txt = " | ".join([cell.text.strip() for cell in row.cells if cell.text.strip()])
+                if row_txt:
+                    text_list.append(row_txt)
+        full_text = "\n".join(text_list)
+        if len(full_text.strip()) > 10:
+            return full_text
+    except Exception:
+        pass
+        
+    # 2. 구버전 이진 .doc 파일용 바이너리 텍스트 디코딩
+    try:
+        raw_bytes = file_bytes
+        text_utf16 = raw_bytes.decode('utf-16le', errors='ignore')
+        cleaned = re.sub(r'[^\w\s\.,\-\:\/@\(\)\?\!\'\"]+', ' ', text_utf16)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        if len(cleaned) > 30:
+            return cleaned
+    except Exception:
+        pass
+        
+    try:
+        text_ascii = file_bytes.decode('latin1', errors='ignore')
+        cleaned = re.sub(r'[^\w\s\.,\-\:\/@\(\)\?\!\'\"]+', ' ', text_ascii)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        return cleaned
+    except Exception:
+        return ""
+
+# ==========================================
+# 3. 공통 캐싱 및 스마트 글자 크기 조절 함수
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_pdf_bytes_cached(file_path):
@@ -91,13 +135,23 @@ def get_preloaded_file_bytes(file_names):
     return None
 
 def process_uploaded_file_to_image(file_obj):
-    if file_obj.type == "application/pdf":
-        doc = fitz.open(stream=file_obj.read(), filetype="pdf")
+    file_bytes = file_obj.getvalue()
+    fname = file_obj.name.lower()
+    
+    if fname.endswith(('.doc', '.docx')):
+        text = read_word_document_text(file_bytes, file_obj.name)
+        img = Image.new('RGB', (800, 1000), color=(255, 255, 255))
+        draw = ImageDraw.Draw(img)
+        display_str = f"[Word Document: {file_obj.name}]\n\n" + (text[:800] if text else "Word Document Content")
+        draw.text((40, 40), display_str, fill=(0, 0, 0))
+        return img
+    elif file_obj.type == "application/pdf" or fname.endswith('.pdf'):
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
         page = doc.load_page(0)
         pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     else:
-        img = Image.open(file_obj)
+        img = Image.open(io.BytesIO(file_bytes))
         img = ImageOps.exif_transpose(img)
         if img.mode != "RGB":
             img = img.convert("RGB")
@@ -158,6 +212,12 @@ def set_smart_widget_value(widget, value, default_fontsize=11, min_fontsize=5.5)
     widget.update()
 
 def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
+    ext = os.path.splitext(file_name)[1].lower() if file_name else ""
+    if "word" in mime_type.lower() or "doc" in mime_type.lower() or ext in ['.doc', '.docx']:
+        word_text = read_word_document_text(file_bytes, file_name)
+        if word_text:
+            return [f"\n--- [Word Document: {file_name}] ---\n{word_text[:20000]}\n"]
+            
     if "pdf" in mime_type.lower():
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -204,8 +264,35 @@ def is_minor(dob_str):
     except:
         return True
 
+def sanitize_and_unlock_pdf(pdf_bytes):
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        clean_doc = fitz.open()
+
+        for page in doc:
+            clean_doc.insert_pdf(doc, from_page=page.number, to_page=page.number)
+
+        for page in clean_doc:
+            for widget in list(page.widgets()):
+                page.delete_widget(widget)
+            annot = page.first_annot
+            while annot:
+                nxt = annot.next
+                page.delete_annot(annot)
+                annot = nxt
+
+        clean_doc.set_metadata({})
+        
+        out_buf = io.BytesIO()
+        clean_doc.save(out_buf, clean=True, deflate=True, garbage=4)
+        clean_doc.close()
+        doc.close()
+        return out_buf.getvalue()
+    except Exception:
+        return pdf_bytes
+
 # ==========================================
-# 3. PDF 서식 채우기 로직
+# 4. PDF 서식 채우기 로직
 # ==========================================
 def extract_imm5476_info(image):
     prompt = """
@@ -439,7 +526,7 @@ def fill_consent_letter(template_bytes, data):
     return output_pdf
 
 # ==========================================
-# 4. CRM 스마트 압축 엔진 (HEIC & 고해상도 이미지 용량 폭발 방지)
+# 5. CRM 스마트 압축 및 언락(Unlocking) 엔진
 # ==========================================
 def process_and_compress_file(file_bytes, mime_type, target_filename):
     is_jpeg = target_filename.lower().endswith(('.jpg', '.jpeg'))
@@ -474,7 +561,7 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
             
             if total_text_len > 50:
                 doc.close()
-                return file_bytes, "application/pdf"
+                return sanitize_and_unlock_pdf(file_bytes), "application/pdf"
             
             new_doc = fitz.open()
             target_dpi = 150
@@ -501,13 +588,10 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
             doc.close()
             
             compressed_bytes = output_pdf.getvalue()
-            if len(compressed_bytes) >= len(file_bytes):
-                return file_bytes, "application/pdf"
-                
-            return compressed_bytes, "application/pdf"
+            final_bytes = compressed_bytes if len(compressed_bytes) < len(file_bytes) else file_bytes
+            return sanitize_and_unlock_pdf(final_bytes), "application/pdf"
             
         else:
-            # HEIC / 이미지 -> PDF 변환 시 용량 최적화 처리
             target_dpi = 150
             quality = 70
             img = Image.open(io.BytesIO(file_bytes))
@@ -536,10 +620,10 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
             new_doc.close()
             
             compressed_bytes = output_pdf.getvalue()
-            return compressed_bytes, "application/pdf"
+            return sanitize_and_unlock_pdf(compressed_bytes), "application/pdf"
 
 # ==========================================
-# 5. Streamlit 네비게이션 및 UI 구성
+# 6. Streamlit 네비게이션 및 UI 구성
 # ==========================================
 MENU_1 = "🍁 IMM5476 자동 작성"
 MENU_2 = "✈️ 한부모 동의서 자동 작성"
@@ -566,7 +650,7 @@ if app_mode == MENU_1:
         if template_file: template_5476_bytes = template_file.getvalue()
 
     st.markdown("---")
-    client_file = st.file_uploader("1. 손님 여권 또는 퍼밋", type=['jpg', 'jpeg', 'png', 'pdf', 'heic', 'HEIC'], key="client_5476")
+    client_file = st.file_uploader("1. 손님 여권 또는 퍼밋", type=['jpg', 'jpeg', 'png', 'pdf', 'heic', 'HEIC', 'docx', 'DOCX', 'doc', 'DOC'], key="client_5476")
 
     if client_file and st.button("정보 추출하기", use_container_width=True):
         with st.spinner("서류 분석 중입니다. 잠시만 기다려 주세요..."):
@@ -625,8 +709,8 @@ elif app_mode == MENU_2:
 
     st.markdown("---")
     c1, c2 = st.columns(2)
-    with c1: non_acc_file = st.file_uploader("비동반 부모님 여권 (1장)", type=['jpg', 'jpeg', 'png', 'pdf', 'heic', 'HEIC'])
-    with c2: family_files = st.file_uploader("동반 부모/자녀 여권", type=['jpg', 'jpeg', 'png', 'pdf', 'heic', 'HEIC'], accept_multiple_files=True)
+    with c1: non_acc_file = st.file_uploader("비동반 부모님 여권 (1장)", type=['jpg', 'jpeg', 'png', 'pdf', 'heic', 'HEIC', 'docx', 'DOCX', 'doc', 'DOC'])
+    with c2: family_files = st.file_uploader("동반 부모/자녀 여권", type=['jpg', 'jpeg', 'png', 'pdf', 'heic', 'HEIC', 'docx', 'DOCX', 'doc', 'DOC'], accept_multiple_files=True)
 
     if st.button("여권 정보 추출하기", type="primary", use_container_width=True):
         images = []
@@ -756,7 +840,7 @@ elif app_mode == MENU_3:
 
     st.markdown("---")
     st.subheader("2. 손님 제출 서류 (복수 선택 가능)")
-    client_prep_files = st.file_uploader("질문지, 여권, 퍼밋 등 서류 선택", type=['jpg', 'jpeg', 'png', 'pdf', 'heic', 'HEIC'], accept_multiple_files=True, key="case_client_docs")
+    client_prep_files = st.file_uploader("질문지, 여권, 퍼밋 등 서류 선택", type=['jpg', 'jpeg', 'png', 'pdf', 'heic', 'HEIC', 'docx', 'DOCX', 'doc', 'DOC'], accept_multiple_files=True, key="case_client_docs")
 
     if st.button("서류 정보 정리하기", type="primary", use_container_width=True):
         if tmpl_bytes is None:
@@ -834,7 +918,7 @@ elif app_mode == MENU_3:
 # ------------------------------------------
 elif app_mode == MENU_4:
     st.title(MENU_4)
-    st.caption("개별 낱장 이미지, 여러 장짜리 통짜 PDF 등을 섞어서 올려도 AI가 알아서 문서 단위로 묶거나 분할하여 CRM 파일명으로 최적화합니다.")
+    st.caption("개별 낱장 이미지, 여러 장짜리 통짜 PDF, MS Word 서류 등을 섞어서 올려도 AI가 알아서 문서 단위로 묶거나 분할하여 CRM 파일명으로 최적화합니다.")
 
     if "uploader_key" not in st.session_state:
         st.session_state.uploader_key = str(uuid.uuid4())
@@ -843,7 +927,7 @@ elif app_mode == MENU_4:
 
     uploaded_files = st.file_uploader(
         "서류 업로드 (복수 선택 가능)", 
-        type=['jpg', 'jpeg', 'png', 'pdf', 'heic', 'HEIC'], 
+        type=['jpg', 'jpeg', 'png', 'pdf', 'heic', 'HEIC', 'docx', 'DOCX', 'doc', 'DOC'], 
         accept_multiple_files=True,
         key=st.session_state.uploader_key
     )
@@ -862,8 +946,30 @@ elif app_mode == MENU_4:
             for file in uploaded_files:
                 file_bytes = file.getvalue()
                 mime_type = file.type if file.type else "application/pdf"
+                fname_lower = file.name.lower()
                 
-                if "pdf" in mime_type.lower():
+                if fname_lower.endswith(('.doc', '.docx')):
+                    text_content = read_word_document_text(file_bytes, file.name)
+                    img = Image.new('RGB', (800, 1000), color=(255, 255, 255))
+                    draw = ImageDraw.Draw(img)
+                    disp_text = f"[Word File: {file.name}]\n\n" + (text_content[:800] if text_content else "Word Document")
+                    draw.text((40, 40), disp_text, fill=(0, 0, 0))
+                    
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=60)
+                    
+                    global_pages.append({
+                        "global_idx": page_counter,
+                        "original_name": file.name,
+                        "mime_type": mime_type,
+                        "file_bytes": file_bytes,
+                        "pdf_page_idx": 0,
+                        "preview_bytes": buf.getvalue(),
+                        "is_word": True,
+                        "word_text": text_content
+                    })
+                    page_counter += 1
+                elif "pdf" in mime_type.lower() or fname_lower.endswith('.pdf'):
                     doc = fitz.open(stream=file_bytes, filetype="pdf")
                     for i in range(len(doc)):
                         if page_counter > 40: break
@@ -879,7 +985,8 @@ elif app_mode == MENU_4:
                             "mime_type": mime_type,
                             "file_bytes": file_bytes,
                             "pdf_page_idx": i,
-                            "preview_bytes": buf.getvalue()
+                            "preview_bytes": buf.getvalue(),
+                            "is_word": False
                         })
                         page_counter += 1
                     doc.close()
@@ -903,7 +1010,8 @@ elif app_mode == MENU_4:
                         "mime_type": mime_type,
                         "file_bytes": file_bytes,
                         "pdf_page_idx": 0,
-                        "preview_bytes": buf.getvalue()
+                        "preview_bytes": buf.getvalue(),
+                        "is_word": False
                     })
                     page_counter += 1
 
@@ -1045,7 +1153,6 @@ elif app_mode == MENU_4:
 
                 unique_src_files = list(set([p["original_name"] for p in group_pages]))
                 is_all_from_same_pdf = (len(unique_src_files) == 1 and "pdf" in group_pages[0]["mime_type"].lower())
-                
                 needs_rotation = any(int(rotations.get(str(p["global_idx"]), 0)) != 0 for p in group_pages)
                 
                 try:
@@ -1076,7 +1183,12 @@ elif app_mode == MENU_4:
                             try: rot = int(rotations.get(str(p_data["global_idx"]), 0))
                             except: pass
                             
-                            if "pdf" in p_data["mime_type"].lower():
+                            if p_data.get("is_word"):
+                                # Word 파일 텍스트를 고화질 PDF 페이지로 전환
+                                pdf_page = new_doc.new_page(width=595, height=842)
+                                w_text = p_data.get("word_text", "")
+                                pdf_page.insert_text((50, 50), w_text[:3000] if w_text else f"Word Document: {p_data['original_name']}", fontsize=10)
+                            elif "pdf" in p_data["mime_type"].lower():
                                 src_doc = fitz.open(stream=p_data["file_bytes"], filetype="pdf")
                                 new_doc.insert_pdf(src_doc, from_page=p_data["pdf_page_idx"], to_page=p_data["pdf_page_idx"])
                                 if rot != 0:
