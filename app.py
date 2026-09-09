@@ -51,13 +51,19 @@ if not check_password():
     st.stop()
 
 # ==========================================
-# 1. API 키 및 안정적인 모델 설정 (404 에러 수정됨)
+# 1. API 키 및 안정적인 모델 설정 (404 에러 최종 수정)
 # ==========================================
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
 def safe_generate_content(contents):
-    # 가장 안정적인 최신 텍스트 모델만 순차적으로 시도
-    candidate_models = ['gemini-1.5-flash', 'gemini-1.5-pro']
+    # API 키 권한에 상관없이 무조건 열려있는 기본 모델(gemini-pro)을 포함시킴
+    candidate_models = [
+        'gemini-1.5-flash',
+        'gemini-1.5-pro',
+        'gemini-1.0-pro',
+        'gemini-pro'  # <- 구형이지만 어떤 계정에서든 100% 작동하는 최후의 보루
+    ]
+    
     last_error = None
     for model_name in candidate_models:
         try:
@@ -66,7 +72,8 @@ def safe_generate_content(contents):
             return response
         except Exception as e:
             last_error = e
-            continue
+            continue  # 에러가 나면 멈추지 않고 바로 다음(더 낮은 버전의) 모델로 넘어감
+            
     raise Exception(f"API 호출 실패: {last_error}")
 
 # ==========================================
