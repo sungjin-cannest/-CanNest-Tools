@@ -311,4 +311,67 @@ if st.button("실시간 분석 시작", type="primary"):
             prompt = f"Analyze: {txt}\nExtract to JSON: employer_name, job_title, wage, hours, job_location, employer_address, employer_phone, employer_email, benefits, job_duties (Array of strings). Return ONLY raw JSON."
             try:
                 resp = safe_generate_content([prompt])
-                clean = resp.text.strip().replace('```json','').replace('
+                clean = resp.text.strip().replace('```json','').replace('```','')
+                data_json = json.loads(clean)
+                if 'job_duties' in data_json and isinstance(data_json['job_duties'], list):
+                    data_json['job_duties'] = "\n".join(data_json['job_duties'])
+                info.update(data_json)
+            except Exception as e:
+                st.error(f"채용공고 분석 실패: {e}")
+                
+        st.session_state.jo_data.update(info)
+        st.success("분석 완료")
+
+st.markdown("---")
+st.subheader("3. 잡오퍼 정보 확인 및 문서 생성")
+jo = st.session_state.jo_data
+
+term, med, reason = calculate_employment_term(jo.get('wage', '20.00'), jo.get('job_location', ''))
+
+c1, c2 = st.columns(2)
+c_name = c1.text_input("손님 성명", value=jo.get('client_name', ''))
+c_dob = c2.text_input("생년월일", value=jo.get('client_dob', ''))
+offer_dt = c1.date_input("오퍼 작성일", datetime.date.today()).strftime("%B %d, %Y")
+start_dt = c2.text_input("근무 시작일", value=jo.get('start_date', 'As soon as possible upon obtaining a valid Work Permit'))
+
+e1, e2 = st.columns(2)
+emp_name = e1.text_input("회사명", value=jo.get('employer_name', ''))
+emp_addr = e2.text_input("회사 주소", value=jo.get('employer_address', ''))
+signer_n = e1.text_input("대표자 성명", value=jo.get('signer_name', ''))
+emp_phone = e2.text_input("회사 전화번호", value=jo.get('employer_phone', ''))
+signer_t = e1.text_input("대표자 직책", value=jo.get('signer_title', 'Owner'))
+emp_email = e2.text_input("회사 이메일", value=jo.get('employer_email', ''))
+
+j1, j2 = st.columns(2)
+j_title = j1.text_input("직책", value=jo.get('job_title', ''))
+j_loc = j2.text_input("근무지 주소", value=jo.get('job_location', emp_addr))
+j_wage = j1.text_input("시급", value=str(jo.get('wage', '20.00')))
+j_hours = j2.text_input("주당 시간", value=str(jo.get('hours', '30')))
+
+j1.info(f"계산된 계약기간: {term} ({reason})")
+term_input = j2.text_input("계약 기간", value=term)
+j_ben = st.text_input("혜택", value=jo.get('benefits', '4% vacation pay'))
+
+ot_def = get_provincial_overtime_clause(j_loc if j_loc else emp_addr)
+j_ot = st.text_area("오버타임 조항", value=ot_def, height=80)
+j_duties = st.text_area("주요 직무", value=jo.get('job_duties', ''), height=150)
+
+layout = st.selectbox("잡오퍼 양식", ["Style A (Everfresh 서식)", "Style B (Sushiwood 서식)"])
+
+if st.button("📄 DOCX 다운로드", type="primary", use_container_width=True):
+    if not c_name or not emp_name:
+        st.error("성명과 회사명은 필수입니다.")
+    else:
+        final_data = {
+            "client_name": c_name, "client_dob": c_dob, "offer_date": offer_dt, "start_date": start_dt,
+            "employer_name": emp_name, "employer_address": emp_addr, "signer_name": signer_n,
+            "employer_phone": emp_phone, "signer_title": signer_t, "employer_email": emp_email,
+            "job_title": j_title, "job_location": j_loc, "wage": j_wage, "hours": j_hours,
+            "employment_term": term_input, "benefits": j_ben, "overtime_clause": j_ot,
+            "job_duties": j_duties, "logo_bytes": jo.get('logo_bytes')
+        }
+        
+        docx_bytes = generate_job_offer_docx(final_data, selected_style=layout)
+        filename = f"[Job Offer]_{c_name.split()[0]}.docx" if c_name else "Job_Offer.docx"
+        
+        st.download_button("📥 파일 다운로드", data=docx_bytes, file_name=filename, mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", type="primary", use_container_width=True)
