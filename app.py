@@ -83,7 +83,6 @@ def safe_generate_content(contents):
 # 2. MS Word (.doc / .docx) 텍스트 추출 엔진
 # ==========================================
 def read_word_document_text(file_bytes, file_name=""):
-    # 1. python-docx 시도 (.docx 또는 docx 기반 .doc)
     try:
         doc_obj = docx.Document(io.BytesIO(file_bytes))
         text_list = [p.text for p in doc_obj.paragraphs if p.text.strip()]
@@ -98,7 +97,6 @@ def read_word_document_text(file_bytes, file_name=""):
     except Exception:
         pass
         
-    # 2. 구버전 이진 .doc 파일용 바이너리 텍스트 디코딩
     try:
         raw_bytes = file_bytes
         text_utf16 = raw_bytes.decode('utf-16le', errors='ignore')
@@ -1027,7 +1025,8 @@ elif app_mode == MENU_4:
             Your task:
             1. Read ALL pages carefully.
             2. GROUP the pages that logically belong to the SAME document type for the SAME client. 
-               *CRITICAL MERGE RULE*: If you see multiple pages of BANK STATEMENTS, PAYSTUBS, or UTILITY BILLS for the SAME client (even if from different months), MERGE THEM ALL into a single group.
+               *CRITICAL MERGE RULE 1*: If you see multiple pages of BANK STATEMENTS, PAYSTUBS, or UTILITY BILLS for the SAME client (even if from different months), MERGE THEM ALL into a single group.
+               *CRITICAL MERGE RULE 2 (PASSPORT)*: Merge ALL PASSPORT PAGES (bio-data page, pages with entry stamps, and pages with TRV / Temporary Resident Visa stickers) for the same client into ONE SINGLE GROUP. DO NOT classify a TRV sticker attached inside a passport as a Visitor Record (VR). A Visitor Record is a separate standalone document.
             3. ROTATION CHECK: Check if text is upside down or sideways (0, 90, 180, or 270).
             4. For EACH grouped document, generate an EXACT filename using our strict CRM manual rules provided below.
 
@@ -1039,14 +1038,14 @@ elif app_mode == MENU_4:
             Rule 5 (Capitalization): Every English word MUST be Title Case (Capitalize First Letter).
 
             [CATEGORIES & CMS SUFFIX RULES]
-            1. Passport: {{Name}}_PP_{{ExpiryDate YYYY.MM.DD}}
-            2. Work Permit / Study Permit / Visitor Record / Coop / PGWP / BOWP: {{Name}}_{{WP/SP/VR/Coop/PGWP/BOWP}}_{{ExpiryDate YYYY.MM.DD}}
+            1. Passport (including all stamp/visa pages): {{Name}}_PP_{{ExpiryDate YYYY.MM.DD}}
+            2. Work Permit / Study Permit / Visitor Record (IMM 1442) / Coop / PGWP / BOWP: {{Name}}_{{WP/SP/VR/Coop/PGWP/BOWP}}_{{ExpiryDate YYYY.MM.DD}}
             3. Questionnaire: {{Name}}_QA_{{Type}}_{{ReceivedDate YYYY.MM.DD}}
             4. Police Certificate: {{Name}}_Police Cert_{{CountryInEnglish}}
             5. Employment Letter / Certificate of Employment / Confirmation of Employment: {{Name}}_LOE_{{CompanyInEnglish}} (CRITICAL: MUST use 'LOE', NEVER 'Employment Letter')
             6. Paystub: {{Name}}_Paystub_{{CompanyInEnglish}}_{{StartDate-EndDate}}
             7. Education Certificate / WES: {{Name}}_{{Diploma/Bachelor/Master/Highschool/Certificate/WES}}_{{SchoolName}} (If WES: {{Name}}_WES)
-            8. Certificate of Income: {{Name}}_COI_{{Year YYYY}}
+            8. Certificate of Income / NOA (Notice of Assessment): {{Name}}_COI_{{Year YYYY}}
             9. Official English Score: {{Name}}_{{IELTS/CELPIP}}_{{Date YYYY.MM.DD}}
             10. Resume: {{Name}}_Resume_{{ReceivedDate YYYY.MM.DD}}
             11. Medical Exam / Emedical: {{Name}}_Emedical_{{Year YYYY}}
@@ -1062,9 +1061,10 @@ elif app_mode == MENU_4:
             21. Tuition Receipt: {{Name}}_Tuition Receipt_{{SchoolName}}
             22. Confirmation of Enrollment: {{Name}}_Confirmation of Enrollment_{{SchoolName}}
             23. Digital Photo / Passport Photo: {{Name}}_Digital Photo.jpg
+            24. T4 (Statement of Remuneration Paid): {{Name}}_T4_{{EmployerNameInEnglish}}_{{Year YYYY}} (e.g. 홍길동_T4_Provence Marinaside_2025)
 
             [CRITICAL FALLBACK RULE FOR UNKNOWN DOCUMENTS]
-            - Step 1: If a document does NOT match any of the 23 categories above, extract the official document title printed at the top of the document (in English, Title Case) and format as: {{Name}}_{{DocumentTitleInEnglish}}.
+            - Step 1: If a document does NOT match any of the 24 categories above, extract the official document title printed at the top of the document (in English, Title Case) and format as: {{Name}}_{{DocumentTitleInEnglish}}.
             - Step 2: If the document title/type is completely ambiguous, unreadable, or unclassified, set suggested_filename as {{Name}}_Unclassified_확인필요.pdf and set "is_unclassified": true.
 
             Return ONLY a raw JSON object:
@@ -1184,7 +1184,6 @@ elif app_mode == MENU_4:
                             except: pass
                             
                             if p_data.get("is_word"):
-                                # Word 파일 텍스트를 고화질 PDF 페이지로 전환
                                 pdf_page = new_doc.new_page(width=595, height=842)
                                 w_text = p_data.get("word_text", "")
                                 pdf_page.insert_text((50, 50), w_text[:3000] if w_text else f"Word Document: {p_data['original_name']}", fontsize=10)
