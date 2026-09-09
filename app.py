@@ -62,7 +62,13 @@ if not check_password():
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
 def safe_generate_content(contents):
-    candidate_models = ['gemini-2.5-flash', 'gemini-1.5-flash']
+    # 최신 및 호환 가능한 Gemini 모델 순차 시도
+    candidate_models = [
+        'gemini-2.0-flash',
+        'gemini-1.5-flash-latest',
+        'gemini-1.5-flash',
+        'gemini-1.5-pro'
+    ]
     last_error = None
     for model_name in candidate_models:
         try:
@@ -71,6 +77,7 @@ def safe_generate_content(contents):
             return response
         except Exception as e:
             last_error = e
+            # 모델을 찾을 수 없는 경우 다음 모델로 자동 전환
             if "404" in str(e) or "not found" in str(e).lower():
                 continue
             else:
