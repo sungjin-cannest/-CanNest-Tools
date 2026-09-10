@@ -1,14 +1,14 @@
 """
-CanNest 잡오퍼 DOCX 생성기 (v9)
+CanNest 잡오퍼 DOCX 생성기 (v10)
 ----------------------------------
-v8 대비 변경점:
-  1) 기존 잡오퍼 파일로 PDF(.pdf) 지원 추가.
-  2) PDF 업로드 시 직접 편집 대신 데이터를 모두 추출하여 새 DOCX 템플릿으로 재생성하도록 분기 로직 적용.
+v9 대비 변경점:
+  1) 최종 다운로드 파일에서 이메일 찌꺼기 제거: 다운로드 직전 이메일 문자열에 'protected'가 포함된 경우 강제 빈칸("") 처리.
+  2) 기존 파일 스캔 및 클렌징: 업로드된 기존 DOCX 내부에 이미 '[email protected]' 텍스트가 박혀있을 경우, 진짜 이메일로 덮어쓰거나 흔적 없이 삭제하는 클렌징 로직 추가.
 """
 
 import streamlit as st
 
-st.set_page_config(page_title="CanNest 잡오퍼 DOCX 생성기 (v9)", layout="wide")
+st.set_page_config(page_title="CanNest 잡오퍼 DOCX 생성기 (v10)", layout="wide")
 
 import os
 import io
@@ -573,6 +573,18 @@ def _update_employee_signature(doc, name, dob):
 def generate_job_offer_from_existing(existing_file_bytes: bytes, data: dict) -> bytes:
     doc = docx.Document(io.BytesIO(existing_file_bytes))
 
+    # [핵심 클렌징 로직] 업로드된 파일 내부에 [email protected] 찌꺼기가 있으면 진짜 이메일로 덮어쓰거나 완전히 삭제
+    target_email = data.get("employer_email", "").strip()
+    if "protected" in target_email.lower():
+        target_email = ""  # 절대 protected가 들어가지 못하도록 방어
+        
+    for p in iter_all_paragraphs(doc):
+        if "protected" in p.text.lower():
+            # [email protected] 텍스트를 대상 이메일로 치환 (비어있으면 삭제됨)
+            new_text = re.sub(r'\[?\s*email\s*protected\s*\]?', target_email, p.text, flags=re.IGNORECASE)
+            if new_text != p.text:
+                set_paragraph_text(p, new_text)
+
     if data.get("offer_date"):
         for p in doc.paragraphs[:5]:
             if re.match(r"^[A-Z][a-z]+ \d{1,2},? \d{4}$", p.text.strip()):
@@ -607,8 +619,8 @@ def generate_job_offer_from_existing(existing_file_bytes: bytes, data: dict) -> 
 # ==========================================
 # 6. Streamlit UI
 # ==========================================
-st.title("📄 잡오퍼 DOCX 생성기 (v9)")
-st.caption("완벽한 초기화 · PDF 자동 DOCX 추출 지원 · 이메일 강제 추출 적용")
+st.title("📄 잡오퍼 DOCX 생성기 (v10)")
+st.caption("완벽한 초기화 · PDF 지원 · 이메일 강제 추출 및 최종 파일 내 찌꺼기(protected) 완벽 제거")
 
 if "job_offer_data" not in st.session_state:
     st.session_state.job_offer_data = {}
@@ -724,7 +736,14 @@ def get_resolved_val(key, default_dict):
         choice = st.session_state.get(f"resolve_{key}", "")
         if "기존 문서" in choice: return o_val
         return a_val
-    return a_val if a_val else (o_val if o_val else default_dict.get(key, ""))
+        
+    fallback = a_val if a_val else (o_val if o_val else default_dict.get(key, ""))
+    
+    # 마지막 안전망: fallback 에도 protected가 포함되어 있다면 빈칸 처리
+    if key == "employer_email" and "protected" in fallback.lower():
+        fallback = ""
+        
+    return fallback
 
 resolved_emp_addr = get_resolved_val("employer_address", jo_data)
 if not resolved_emp_addr:
@@ -785,10 +804,15 @@ if st.button("📄 MS Word (.docx) 생성 및 다운로드", type="primary", use
     if not c_name or not emp_name or not j_title:
         st.error("손님 성명, 회사명, 직책은 필수 입력 항목입니다.")
     else:
+        # 다운로드 직전 이메일 다시 한번 검열
+        final_email = emp_email.strip()
+        if "protected" in final_email.lower():
+            final_email = ""
+            
         final_jo_dict = {
             "client_name": c_name, "client_dob": c_dob, "offer_date": offer_dt, "employment_term": term_str,
             "start_date": start_dt_str, "employer_name": emp_name, "signer_name": signer_n, "signer_title": signer_t,
-            "employer_address": emp_addr, "employer_phone": emp_phone, "employer_email": emp_email,
+            "employer_address": emp_addr, "employer_phone": emp_phone, "employer_email": final_email,
             "job_title": j_title, "noc_code": j_noc, "wage": j_wage, "hours": j_hours, "job_location": j_loc,
             "benefits": j_benefits, "overtime_clause": j_ot, "job_duties": j_duties_text,
             "logo_bytes": jo_data.get("logo_bytes"),
