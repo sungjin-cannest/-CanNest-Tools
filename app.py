@@ -1,15 +1,13 @@
 """
-CanNest 잡오퍼 DOCX 생성기 (v5)
+CanNest 잡오퍼 DOCX 생성기 (v7)
 ----------------------------------
-v4 대비 변경점 (서식 및 UI 개선):
-  1) 이름 Title Case 적용: "KWANGCHUL JEONG" -> "Kwangchul Jeong"으로 첫 글자만 대문자 변환.
-  2) 원본 서식 완벽 보존: 텍스트 교체 시 폰트, 크기 등 기존 Run 서식이 날아가지 않도록 안전하게 교체.
-  3) 이메일 [email protected] 방어: 추출된 이메일에 protected가 포함된 경우 빈칸으로 두고 직접 입력할 수 있도록 UI 보완.
+v6 대비 변경점:
+  1) 광고 기반 주소/이메일 강제 할당: AI가 '근무지 주소'만 찾고 '회사 주소'를 못 찾았을 경우, 근무지 주소를 회사 주소의 기본값으로 자동 복사하도록 개선.
 """
 
 import streamlit as st
 
-st.set_page_config(page_title="CanNest 잡오퍼 DOCX 생성기 (v5)", layout="wide")
+st.set_page_config(page_title="CanNest 잡오퍼 DOCX 생성기 (v7)", layout="wide")
 
 import os
 import io
@@ -47,7 +45,6 @@ if "APP_PASSWORD" not in st.secrets or "GEMINI_API_KEY" not in st.secrets:
     st.error("⚠️ Streamlit Cloud의 Secrets 설정이 필요합니다.")
     st.stop()
 
-
 def check_password():
     if st.session_state.get("password_correct", False):
         return True
@@ -60,7 +57,6 @@ def check_password():
         else:
             st.error("비밀번호가 틀렸습니다.")
     return False
-
 
 if not check_password():
     st.stop()
@@ -75,7 +71,6 @@ MODEL_CANDIDATES = [
     "gemini-3.7-flash",
     "gemini-2.5-pro",
 ]
-
 
 def call_gemini(parts, response_schema=None):
     contents = []
@@ -106,7 +101,6 @@ def call_gemini(parts, response_schema=None):
             continue
     raise Exception(f"Gemini API 호출 실패 (모든 모델 시도함): {last_error}")
 
-
 def call_gemini_json(parts, response_schema):
     try:
         response = call_gemini(parts, response_schema=response_schema)
@@ -114,7 +108,6 @@ def call_gemini_json(parts, response_schema):
     except Exception as e:
         st.warning(f"AI 분석 중 경고: {e}")
         return None
-
 
 PASSPORT_SCHEMA = {
     "type": "object",
@@ -189,17 +182,12 @@ def process_uploaded_file_to_image(file_obj):
     buf.seek(0)
     return Image.open(buf)
 
-
 def format_full_name(surname, given_name):
     s = str(surname).strip() if surname else ""
     g = str(given_name).strip() if given_name else ""
-    if not s and not g:
-        return ""
-    
-    # 이름을 합친 뒤 첫 글자들만 대문자로 변환 (예: KWANGCHUL JEONG -> Kwangchul Jeong)
+    if not s and not g: return ""
     full_name = f"{g} {s}".strip()
     return full_name.title()
-
 
 def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
     ext = os.path.splitext(file_name)[1].lower() if file_name else ""
@@ -210,8 +198,7 @@ def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
             for table in doc_obj.tables:
                 for row in table.rows:
                     row_txt = " | ".join([c.text.strip() for c in row.cells if c.text.strip()])
-                    if row_txt:
-                        text_list.append(row_txt)
+                    if row_txt: text_list.append(row_txt)
             full_text = "\n".join(text_list)
             if full_text.strip():
                 return [f"\n--- [Word Document: {file_name}] ---\n{full_text[:20000]}\n"]
@@ -228,38 +215,29 @@ def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
             pass
     return [types.Part.from_bytes(data=file_bytes, mime_type=mime_type)]
 
-
 def extract_imm5476_info(image):
     prompt = "Analyze this identity document and extract the requested fields exactly."
     return call_gemini_json([prompt, image], PASSPORT_SCHEMA)
-
 
 def parse_existing_job_offer(file_bytes, mime_type):
     prompt = "Analyze this existing Job Offer document and extract the requested fields exactly."
     contents = prepare_document_for_gemini(file_bytes, mime_type, "Existing_Job_Offer.pdf")
     return call_gemini_json([prompt] + contents, EXISTING_OFFER_SCHEMA) or {}
 
-
 # ==========================================
-# 3. URL 보안 강화 fetch (SSRF 방지) + Cloudflare 이메일 디코딩
+# 3. URL 보안 강화 fetch + Cloudflare 디코딩
 # ==========================================
 def _is_hostname_safe(hostname: str) -> bool:
-    try:
-        infos = socket.getaddrinfo(hostname, None)
-    except socket.gaierror:
-        return False
-    if not infos:
-        return False
+    try: infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror: return False
+    if not infos: return False
     for info in infos:
         ip_str = info[4][0]
-        try:
-            ip = ipaddress.ip_address(ip_str)
-        except ValueError:
-            return False
+        try: ip = ipaddress.ip_address(ip_str)
+        except ValueError: return False
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
             return False
     return True
-
 
 class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -268,137 +246,61 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
             raise urllib.error.URLError(f"차단된 리다이렉트 대상: {newurl}")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
-
 def _decode_cf_email(cfemail_hex: str) -> str:
     try:
         r = int(cfemail_hex[:2], 16)
-        return "".join(
-            chr(int(cfemail_hex[i:i + 2], 16) ^ r)
-            for i in range(2, len(cfemail_hex), 2)
-        )
+        return "".join(chr(int(cfemail_hex[i:i + 2], 16) ^ r) for i in range(2, len(cfemail_hex), 2))
     except Exception:
         return ""
 
-
-_CF_EMAIL_RE = re.compile(
-    r'data-cfemail="([0-9a-fA-F]+)"[^>]*>\s*\[email\s*protected\]\s*<',
-    re.IGNORECASE,
-)
+_CF_EMAIL_RE = re.compile(r'data-cfemail="([0-9a-fA-F]+)"[^>]*>\s*\[email\s*protected\]\s*<', re.IGNORECASE)
 
 def _decloak_cloudflare_emails(html: str) -> str:
     return _CF_EMAIL_RE.sub(lambda m: _decode_cf_email(m.group(1)) + "<", html)
 
-
 def fetch_url_content_safe(url: str, timeout: int = 12, max_bytes: int = 2_000_000):
     target_url = url.strip()
-    if not re.match(r"^https?://", target_url, re.IGNORECASE):
-        target_url = "https://" + target_url
-
+    if not re.match(r"^https?://", target_url, re.IGNORECASE): target_url = "https://" + target_url
     parsed = urllib.parse.urlparse(target_url)
-    if parsed.scheme not in ("http", "https"):
-        return "", "허용되지 않는 URL 스킴입니다."
-    if not parsed.hostname or not _is_hostname_safe(parsed.hostname):
-        return "", "내부망/사설 IP로 확인되어 요청을 차단했습니다."
+    if parsed.scheme not in ("http", "https"): return "", "허용되지 않는 URL 스킴입니다."
+    if not parsed.hostname or not _is_hostname_safe(parsed.hostname): return "", "내부망/사설 IP로 확인되어 요청을 차단했습니다."
 
     opener = urllib.request.build_opener(_SafeRedirectHandler)
     req = urllib.request.Request(target_url, headers={"User-Agent": "Mozilla/5.0 (CanNestJobOfferBot)"})
     try:
         with opener.open(req, timeout=timeout) as resp:
             raw = resp.read(max_bytes + 1)
-            if len(raw) > max_bytes:
-                raw = raw[:max_bytes]
+            if len(raw) > max_bytes: raw = raw[:max_bytes]
             html = raw.decode("utf-8", errors="ignore")
-    except Exception as e:
-        return "", f"URL 요청 실패: {e}"
+    except Exception as e: return "", f"URL 요청 실패: {e}"
 
     html = _decloak_cloudflare_emails(html)
-
     text = re.sub(r"<script\b[^<]*(?:(?!</script>)<[^<]*)*</script>", "", html, flags=re.IGNORECASE)
     text = re.sub(r"<style\b[^<]*(?:(?!</style>)<[^<]*)*</style>", "", text, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text[:15000], None
 
-
 # ==========================================
-# 4. 전체 13개 주/준주 데이터 (중위임금 백업 + 초과근무 조항)
+# 4. 전체 13개 주/준주 데이터
 # ==========================================
 BACKUP_WAGE_AS_OF = "2026-01"
-
 PROVINCES = {
-    "BC": {
-        "names": ["British Columbia", "BC"],
-        "backup_wage": 38.40,
-        "overtime": (
-            "Overtime will be paid in accordance with BC employment standards legislation:\n"
-            "1.5 times regular wage for hours over 8/day or 40/week; and\n"
-            "2 times regular wage for hours over 12/day."
-        ),
-    },
-    "AB": {
-        "names": ["Alberta", "AB"],
-        "backup_wage": 37.50,
-        "overtime": "Overtime will be paid in accordance with AB employment standards legislation:\n1.5 times regular rate of pay for hours in excess of 8 hours/day or 44 hours/week.",
-    },
-    "ON": {
-        "names": ["Ontario", "ON"],
-        "backup_wage": 36.92,
-        "overtime": "Overtime will be paid in accordance with ON employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 44 hours per week.",
-    },
-    "SK": {
-        "names": ["Saskatchewan", "SK"],
-        "backup_wage": 34.62,
-        "overtime": "Overtime will be paid in accordance with SK employment standards legislation:\n1.5 times regular rate of pay for hours over 8 hours/day or 40 hours/week.",
-    },
-    "MB": {
-        "names": ["Manitoba", "MB"],
-        "backup_wage": 31.33,
-        "overtime": "Overtime will be paid in accordance with MB employment standards legislation:\n1.5 times regular rate of pay for hours over 8 hours/day or 40 hours/week.",
-    },
-    "NB": {
-        "names": ["New Brunswick", "NB"],
-        "backup_wage": 31.73,
-        "overtime": "Overtime will be paid in accordance with NB employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 44 hours per week.",
-    },
-    "NS": {
-        "names": ["Nova Scotia", "NS"],
-        "backup_wage": 31.96,
-        "overtime": "Overtime will be paid in accordance with NS employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 48 hours per week.",
-    },
-    "PE": {
-        "names": ["Prince Edward Island"],
-        "backup_wage": 31.20,
-        "overtime": "Overtime will be paid in accordance with PE employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 48 hours per week.",
-    },
-    "NL": {
-        "names": ["Newfoundland and Labrador", "NL"],
-        "backup_wage": 33.60,
-        "overtime": "Overtime will be paid in accordance with NL employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 40 hours per week.",
-    },
-    "YT": {
-        "names": ["Yukon", "YT"],
-        "backup_wage": 45.60,
-        "overtime": "Overtime will be paid in accordance with YT employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 8 hours/day or 40 hours/week.",
-    },
-    "NT": {
-        "names": ["Northwest Territories", "NT"],
-        "backup_wage": 48.00,
-        "overtime": "Overtime will be paid in accordance with NT employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 8 hours/day or 40 hours/week.",
-    },
-    "NU": {
-        "names": ["Nunavut", "NU"],
-        "backup_wage": 45.00,
-        "overtime": "Overtime will be paid in accordance with NU employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 8 hours/day or 40 hours/week.",
-    },
-    "QC": {
-        "names": ["Quebec", "Québec", "QC"],
-        "backup_wage": 36.00,
-        "overtime": "Overtime will be paid in accordance with QC employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 40 hours per week.",
-    },
+    "BC": {"names": ["British Columbia", "BC"], "backup_wage": 38.40, "overtime": "Overtime will be paid in accordance with BC employment standards legislation:\n1.5 times regular wage for hours over 8/day or 40/week; and\n2 times regular wage for hours over 12/day."},
+    "AB": {"names": ["Alberta", "AB"], "backup_wage": 37.50, "overtime": "Overtime will be paid in accordance with AB employment standards legislation:\n1.5 times regular rate of pay for hours in excess of 8 hours/day or 44 hours/week."},
+    "ON": {"names": ["Ontario", "ON"], "backup_wage": 36.92, "overtime": "Overtime will be paid in accordance with ON employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 44 hours per week."},
+    "SK": {"names": ["Saskatchewan", "SK"], "backup_wage": 34.62, "overtime": "Overtime will be paid in accordance with SK employment standards legislation:\n1.5 times regular rate of pay for hours over 8 hours/day or 40 hours/week."},
+    "MB": {"names": ["Manitoba", "MB"], "backup_wage": 31.33, "overtime": "Overtime will be paid in accordance with MB employment standards legislation:\n1.5 times regular rate of pay for hours over 8 hours/day or 40 hours/week."},
+    "NB": {"names": ["New Brunswick", "NB"], "backup_wage": 31.73, "overtime": "Overtime will be paid in accordance with NB employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 44 hours per week."},
+    "NS": {"names": ["Nova Scotia", "NS"], "backup_wage": 31.96, "overtime": "Overtime will be paid in accordance with NS employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 48 hours per week."},
+    "PE": {"names": ["Prince Edward Island"], "backup_wage": 31.20, "overtime": "Overtime will be paid in accordance with PE employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 48 hours per week."},
+    "NL": {"names": ["Newfoundland and Labrador", "NL"], "backup_wage": 33.60, "overtime": "Overtime will be paid in accordance with NL employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 40 hours per week."},
+    "YT": {"names": ["Yukon", "YT"], "backup_wage": 45.60, "overtime": "Overtime will be paid in accordance with YT employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 8 hours/day or 40 hours/week."},
+    "NT": {"names": ["Northwest Territories", "NT"], "backup_wage": 48.00, "overtime": "Overtime will be paid in accordance with NT employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 8 hours/day or 40 hours/week."},
+    "NU": {"names": ["Nunavut", "NU"], "backup_wage": 45.00, "overtime": "Overtime will be paid in accordance with NU employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 8 hours/day or 40 hours/week."},
+    "QC": {"names": ["Quebec", "Québec", "QC"], "backup_wage": 36.00, "overtime": "Overtime will be paid in accordance with QC employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 40 hours per week."},
 }
-
 BACKUP_WAGES = {code: v["backup_wage"] for code, v in PROVINCES.items()}
-
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_live_esdc_median_wages():
@@ -417,25 +319,17 @@ def get_live_esdc_median_wages():
                 for name_upper, code in name_to_code.items():
                     if name_upper in row_text.upper():
                         dollar_matches = re.findall(r"\$\s*(\d+(?:\.\d+)?)", row_text)
-                        if dollar_matches:
-                            wages[code] = float(dollar_matches[-1])
-        if wages:
-            today_tag = datetime.date.today().strftime("%Y-%m-%d")
-            return wages, "Canada.ca ESDC 실시간 데이터", today_tag
-    except Exception:
-        pass
-
+                        if dollar_matches: wages[code] = float(dollar_matches[-1])
+        if wages: return wages, "Canada.ca ESDC 실시간 데이터", datetime.date.today().strftime("%Y-%m-%d")
+    except Exception: pass
     return dict(BACKUP_WAGES), "ESDC 백업 기준표 (네트워크 조회 실패)", BACKUP_WAGE_AS_OF
-
 
 def detect_province(address_text: str) -> str:
     addr_upper = str(address_text).upper()
     for code, v in PROVINCES.items():
         for name in v["names"]:
-            if re.search(r"\b" + re.escape(name.upper()) + r"\b", addr_upper):
-                return code
+            if re.search(r"\b" + re.escape(name.upper()) + r"\b", addr_upper): return code
     return "BC"
-
 
 def calculate_employment_term(wage_val, address_text):
     try:
@@ -446,80 +340,53 @@ def calculate_employment_term(wage_val, address_text):
         median_wage = live_wages.get(detected_prov, BACKUP_WAGES[detected_prov])
         stream = "High-Wage Stream (3년 오퍼)" if wage >= median_wage else "Low-Wage Stream (1년 오퍼)"
         term = "3-year" if wage >= median_wage else "1-year"
-        reason = f"{detected_prov} 중위임금 ${median_wage:.2f} ({source_tag}, 기준일 {as_of}) → {stream}"
-        return term, median_wage, reason, detected_prov
+        return term, median_wage, f"{detected_prov} 중위임금 ${median_wage:.2f} ({source_tag}, 기준일 {as_of}) → {stream}", detected_prov
     except Exception:
         return "3-year", 38.40, "기본값 적용 (계산 실패)", "BC"
 
-
-def get_provincial_overtime_clause(address_text):
-    return PROVINCES[detect_province(address_text)]["overtime"]
-
-
+def get_provincial_overtime_clause(address_text): return PROVINCES[detect_province(address_text)]["overtime"]
 def get_provincial_overtime_bullets(address_text):
-    full_clause = PROVINCES[detect_province(address_text)]["overtime"]
-    lines = [l.strip() for l in full_clause.split("\n") if l.strip()]
-    if lines and lines[0].lower().startswith("overtime will be paid"):
-        lines = lines[1:]
+    lines = [l.strip() for l in PROVINCES[detect_province(address_text)]["overtime"].split("\n") if l.strip()]
+    if lines and lines[0].lower().startswith("overtime will be paid"): lines = lines[1:]
     return lines
 
-
 # ==========================================
-# 5. DOCX 엔진 (공용 헬퍼)
+# 5. DOCX 엔진
 # ==========================================
 def _iter_paragraphs_in_cell(cell):
-    for p in cell.paragraphs:
-        yield p
+    for p in cell.paragraphs: yield p
     for table in cell.tables:
         for row in table.rows:
-            for c in row.cells:
-                yield from _iter_paragraphs_in_cell(c)
-
+            for c in row.cells: yield from _iter_paragraphs_in_cell(c)
 
 def iter_all_paragraphs(doc):
-    for p in doc.paragraphs:
-        yield p
+    for p in doc.paragraphs: yield p
     for table in doc.tables:
         for row in table.rows:
-            for cell in row.cells:
-                yield from _iter_paragraphs_in_cell(cell)
+            for cell in row.cells: yield from _iter_paragraphs_in_cell(cell)
     for section in doc.sections:
         for hf in (section.header, section.footer):
-            for p in hf.paragraphs:
-                yield p
-
+            for p in hf.paragraphs: yield p
 
 def set_paragraph_text(paragraph, new_text):
-    """단락의 기존 서식(폰트, 크기 등)을 최대한 보존하면서 텍스트만 교체"""
     if not paragraph.runs:
         paragraph.add_run(new_text)
         return
-        
-    # 기존 텍스트 비우기 (서식은 놔두고 text만 날림)
-    for r in paragraph.runs:
-        r.text = ""
-        
-    # 첫 번째 run에 새로운 텍스트 삽입
+    for r in paragraph.runs: r.text = ""
     paragraph.runs[0].text = new_text
-
 
 def replace_placeholders(doc, mapping: dict):
     pattern = re.compile("|".join(re.escape(k) for k in mapping.keys()))
     for p in iter_all_paragraphs(doc):
         full_text = "".join(r.text for r in p.runs)
-        if not full_text or not pattern.search(full_text):
-            continue
+        if not full_text or not pattern.search(full_text): continue
         new_text = pattern.sub(lambda m: str(mapping[m.group(0)]), full_text)
-        if new_text != full_text:
-            set_paragraph_text(p, new_text)
-
+        if new_text != full_text: set_paragraph_text(p, new_text)
 
 def find_paragraph_starting_with(doc, prefix):
     for p in doc.paragraphs:
-        if p.text.strip().lower().startswith(prefix.lower()):
-            return p
+        if p.text.strip().lower().startswith(prefix.lower()): return p
     return None
-
 
 def insert_bullets_after(anchor_paragraph, texts, template_bullet_xml):
     ref = anchor_paragraph._p
@@ -530,11 +397,9 @@ def insert_bullets_after(anchor_paragraph, texts, template_bullet_xml):
         wrapped = docx.text.paragraph.Paragraph(new_p, anchor_paragraph._parent)
         set_paragraph_text(wrapped, text)
 
-
 def replace_overtime_block(doc, overtime_lines):
     intro = find_paragraph_starting_with(doc, "Overtime will be paid")
-    if intro is None:
-        return
+    if intro is None: return
     bullets = []
     node = intro._p.getnext()
     while node is not None and node.tag == qn("w:p"):
@@ -542,14 +407,11 @@ def replace_overtime_block(doc, overtime_lines):
         if wrapped.style.name == "List Paragraph":
             bullets.append(node)
             node = node.getnext()
-        else:
-            break
-    if not bullets:
-        return
+        else: break
+    if not bullets: return
     template_xml = copy.deepcopy(bullets[0])
     anchor = bullets[0].getprevious()
-    for b in bullets:
-        b.getparent().remove(b)
+    for b in bullets: b.getparent().remove(b)
     ref = anchor
     for line in overtime_lines:
         new_p = copy.deepcopy(template_xml)
@@ -558,49 +420,34 @@ def replace_overtime_block(doc, overtime_lines):
         wrapped = docx.text.paragraph.Paragraph(new_p, intro._parent)
         set_paragraph_text(wrapped, line)
 
-
 def insert_logo(doc, logo_bytes):
     for p in doc.paragraphs:
         if "[Company Logo]" in p.text:
             set_paragraph_text(p, "")
             if logo_bytes:
                 run = p.add_run()
-                try:
-                    run.add_picture(io.BytesIO(logo_bytes), width=docx.shared.Inches(2.0))
-                except Exception:
-                    pass
+                try: run.add_picture(io.BytesIO(logo_bytes), width=docx.shared.Inches(2.0))
+                except Exception: pass
             return
-
 
 def clean_wage(value) -> str:
     m = re.search(r"\d+(?:\.\d+)?", str(value))
     return m.group(0) if m else str(value).strip()
 
-
 def clean_hours(value) -> str:
-    text = str(value)
-    text = re.sub(r"(?i)\b(hours?|hrs?)\b", "", text)
-    text = re.sub(r"(?i)(per\s*week|/\s*week)", "", text)
-    return text.strip(" -/\t")
-
+    text = re.sub(r"(?i)\b(hours?|hrs?)\b", "", str(value))
+    return re.sub(r"(?i)(per\s*week|/\s*week)", "", text).strip(" -/\t")
 
 def build_wage_sentence(wage, hours) -> str:
     return f"The employee will be paid ${clean_wage(wage)}/hour, based on a minimum of {clean_hours(hours)} hours per week."
 
-
 def build_term_sentence(term_years: str) -> str:
     return f"This is a full-time, {term_years} employment term starting from the date agreed upon by the employer and employee."
 
-
-# ==========================================
-# 5a. 신규(빈 템플릿) 생성 엔진
-# ==========================================
 def generate_job_offer_docx(data: dict) -> bytes:
     doc = docx.Document(TEMPLATE_PATH)
-
     duties = data.get("job_duties", [])
-    if isinstance(duties, str):
-        duties = [re.sub(r"^[•\-\*]\s*", "", d.strip()) for d in duties.split("\n") if d.strip()]
+    if isinstance(duties, str): duties = [re.sub(r"^[•\-\*]\s*", "", d.strip()) for d in duties.split("\n") if d.strip()]
 
     insert_logo(doc, data.get("logo_bytes"))
 
@@ -642,130 +489,85 @@ def generate_job_offer_docx(data: dict) -> bytes:
     if duties_anchor is not None and duties:
         list_bullets = [p for p in doc.paragraphs if p.style.name == "List Paragraph"]
         if list_bullets:
-            template_xml = copy.deepcopy(list_bullets[0]._p)
-            insert_bullets_after(duties_anchor, duties, template_xml)
+            insert_bullets_after(duties_anchor, duties, copy.deepcopy(list_bullets[0]._p))
 
     overtime_text = data.get("overtime_clause", "")
     overtime_lines = [l.strip() for l in overtime_text.split("\n") if l.strip()]
-    if overtime_lines:
-        replace_overtime_block(doc, overtime_lines)
+    if overtime_lines: replace_overtime_block(doc, overtime_lines)
 
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
 
-
-# ==========================================
-# 5b. 기존 문서 편집 엔진
-# ==========================================
 def _replace_label_and_value(doc, label, new_value):
-    """
-    'Job Location: 123 Street' (한 줄에 같이 있음) 
-    또는 'Job Location:' 다음에 내용 문단이 오는(두 줄에 나뉨) 두 가지 케이스를 모두 안전하게 처리.
-    """
     p = find_paragraph_starting_with(doc, label)
-    if p is None:
-        return False
-
-    text = p.text.strip()
-    # 라벨 뒤에 텍스트가 더 있으면 한 줄짜리로 판단 (예: "Job Location: Calgary")
-    if len(text) > len(label) + 1:
+    if p is None: return False
+    if len(p.text.strip()) > len(label) + 1:
         set_paragraph_text(p, f"{label} {new_value}")
         return True
     else:
-        # 라벨만 있는 줄이면 다음 문단을 통째로 교체
         nxt = p._p.getnext()
         if nxt is not None and nxt.tag == qn("w:p"):
-            wrapped = docx.text.paragraph.Paragraph(nxt, p._parent)
-            set_paragraph_text(wrapped, new_value)
+            set_paragraph_text(docx.text.paragraph.Paragraph(nxt, p._parent), new_value)
             return True
     return False
 
-
 def _replace_bullets_after(doc, label, new_lines):
     anchor = find_paragraph_starting_with(doc, label)
-    if anchor is None or not new_lines:
-        return False
-
+    if anchor is None or not new_lines: return False
     node = anchor._p.getnext()
     while node is not None and node.tag == qn("w:p"):
         wrapped = docx.text.paragraph.Paragraph(node, anchor._parent)
-        if wrapped.style.name == "List Paragraph":
-            break
+        if wrapped.style.name == "List Paragraph": break
         node = node.getnext()
 
     bullets = []
-    cur = node
-    while cur is not None and cur.tag == qn("w:p"):
-        wrapped = docx.text.paragraph.Paragraph(cur, anchor._parent)
-        if wrapped.style.name != "List Paragraph":
-            break
-        bullets.append(cur)
-        cur = cur.getnext()
+    while node is not None and node.tag == qn("w:p"):
+        wrapped = docx.text.paragraph.Paragraph(node, anchor._parent)
+        if wrapped.style.name != "List Paragraph": break
+        bullets.append(node)
+        node = node.getnext()
 
-    if not bullets:
-        return False
-
+    if not bullets: return False
     template_xml = copy.deepcopy(bullets[0])
     ref = bullets[0].getprevious()
-    for b in bullets:
-        b.getparent().remove(b)
+    for b in bullets: b.getparent().remove(b)
     for line in new_lines:
         new_p = copy.deepcopy(template_xml)
         ref.addnext(new_p)
         ref = new_p
-        wrapped = docx.text.paragraph.Paragraph(new_p, anchor._parent)
-        set_paragraph_text(wrapped, line)
+        set_paragraph_text(docx.text.paragraph.Paragraph(new_p, anchor._parent), line)
     return True
-
 
 def _update_salutation(doc, new_name):
     p = find_paragraph_starting_with(doc, "Dear ")
-    if p is None:
-        return False
-    new_text = re.sub(r"^Dear .+?,", f"Dear {new_name},", p.text)
-    set_paragraph_text(p, new_text)
+    if p is None: return False
+    set_paragraph_text(p, re.sub(r"^Dear .+?,", f"Dear {new_name},", p.text))
     return True
-
 
 def _update_job_title_line(doc, job_title, noc_code):
     p = find_paragraph_starting_with(doc, "Job Title:")
-    if p is None:
-        return False
-    if noc_code and str(noc_code).strip():
-        new_text = f"Job Title: {job_title} (NOC {noc_code})"
-    else:
-        new_text = f"Job Title: {job_title}"
+    if p is None: return False
+    new_text = f"Job Title: {job_title} (NOC {noc_code})" if noc_code and str(noc_code).strip() else f"Job Title: {job_title}"
     set_paragraph_text(p, new_text)
     return True
 
-
 def _update_intro_paragraph(doc, term, job_title):
-    """상단 인사말(I am pleased to offer you...) 안의 연차, 직책을 최신화합니다."""
     for p in doc.paragraphs:
         lower_text = p.text.lower()
         if "pleased to offer you" in lower_text or ("offer you" in lower_text and "position" in lower_text):
             new_text = p.text
-            if term:
-                new_text = re.sub(r"\b\d+-year\b", term, new_text, flags=re.IGNORECASE)
-            if job_title:
-                new_text = re.sub(r"of the\s+(.+?)\s+position", f"of the {job_title} position", new_text, flags=re.IGNORECASE)
-            
-            if new_text != p.text:
-                set_paragraph_text(p, new_text)
+            if term: new_text = re.sub(r"\b\d+-year\b", term, new_text, flags=re.IGNORECASE)
+            if job_title: new_text = re.sub(r"of the\s+(.+?)\s+position", f"of the {job_title} position", new_text, flags=re.IGNORECASE)
+            if new_text != p.text: set_paragraph_text(p, new_text)
             break
 
-
 def _update_employee_signature(doc, name, dob):
-    """문서 하단 서명란에 기입된 손님 이름과 생년월일을 최신화합니다."""
-    # 하단부터 역순으로 탐색
     for p in reversed(doc.paragraphs):
         text = p.text.strip()
         if "DOB:" in text or "Date of Birth:" in text:
-            # 예: "Joemar Alsum (DOB: 1987-09-05)"를 새 이름/생일로 통째로 덮어씀
             set_paragraph_text(p, f"{name} (DOB: {dob})")
             break
-
 
 def generate_job_offer_from_existing(existing_file_bytes: bytes, data: dict) -> bytes:
     doc = docx.Document(io.BytesIO(existing_file_bytes))
@@ -776,139 +578,97 @@ def generate_job_offer_from_existing(existing_file_bytes: bytes, data: dict) -> 
                 set_paragraph_text(p, data["offer_date"])
                 break
 
-    if data.get("client_name"):
-        _update_salutation(doc, data["client_name"])
-
+    if data.get("client_name"): _update_salutation(doc, data["client_name"])
     _update_intro_paragraph(doc, data.get("employment_term"), data.get("job_title"))
-
-    if data.get("job_title"):
-        _update_job_title_line(doc, data["job_title"], data.get("noc_code", ""))
+    if data.get("job_title"): _update_job_title_line(doc, data["job_title"], data.get("noc_code", ""))
 
     duties = data.get("job_duties", [])
-    if isinstance(duties, str):
-        duties = [re.sub(r"^[•\-\*]\s*", "", d.strip()) for d in duties.split("\n") if d.strip()]
-    if duties:
-        _replace_bullets_after(doc, "Job Duties:", duties)
+    if isinstance(duties, str): duties = [re.sub(r"^[•\-\*]\s*", "", d.strip()) for d in duties.split("\n") if d.strip()]
+    if duties: _replace_bullets_after(doc, "Job Duties:", duties)
 
     if data.get("wage") and data.get("hours"):
         sentence = build_wage_sentence(data["wage"], data["hours"])
         if not _replace_label_and_value(doc, "Hourly wage and hours", sentence):
             _replace_label_and_value(doc, "Hourly Wage and Hours", sentence)
 
-    if data.get("employment_term"):
-        _replace_label_and_value(doc, "Terms of Employment:", build_term_sentence(data["employment_term"]))
-
-    if data.get("job_location"):
-        _replace_label_and_value(doc, "Job Location:", data["job_location"])
-
+    if data.get("employment_term"): _replace_label_and_value(doc, "Terms of Employment:", build_term_sentence(data["employment_term"]))
+    if data.get("job_location"): _replace_label_and_value(doc, "Job Location:", data["job_location"])
+    
     bullets = get_provincial_overtime_bullets(data.get("job_location", ""))
-    if bullets:
-        _replace_bullets_after(doc, "Overtime:", bullets)
-
-    if data.get("start_date"):
-        _replace_label_and_value(doc, "Start Date:", data["start_date"])
-
-    if data.get("client_name") and data.get("client_dob"):
-        _update_employee_signature(doc, data["client_name"], data["client_dob"])
+    if bullets: _replace_bullets_after(doc, "Overtime:", bullets)
+    if data.get("start_date"): _replace_label_and_value(doc, "Start Date:", data["start_date"])
+    if data.get("client_name") and data.get("client_dob"): _update_employee_signature(doc, data["client_name"], data["client_dob"])
 
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
 
-
 # ==========================================
 # 6. Streamlit UI
 # ==========================================
-st.title("📄 잡오퍼 DOCX 생성기 (v5)")
-st.caption("기존 문서 그대로 편집 · 1단계 통합 분석 · 13개 주/준주 커버리지 · Cloudflare 이메일 방어")
+st.title("📄 잡오퍼 DOCX 생성기 (v7)")
+st.caption("완벽한 초기화 · 여권 최우선 반영 · 채용공고 기반 주소/이메일 자동 강제 할당")
 
 if "job_offer_data" not in st.session_state:
     st.session_state.job_offer_data = {}
 
-col_reset, _ = st.columns([1, 5])
-with col_reset:
-    if st.button("🔄 새 케이스 시작 (초기화)"):
-        st.session_state.job_offer_data = {}
-        st.session_state.pop("_old_jo_bytes", None)
-        for k in ("jo_passport", "jo_old_file", "jo_logo"):
-            st.session_state.pop(k, None)
-        st.rerun()
-
 st.markdown("---")
 st.subheader("1. 서류 업로드")
 
-passport_file = st.file_uploader(
-    "손님 여권 이미지 또는 PDF",
-    type=["jpg", "jpeg", "png", "pdf", "heic", "HEIC"],
-    key="jo_passport",
-)
-
-old_jo_file = st.file_uploader(
-    "기준으로 사용할 기존 잡오퍼 (있으면 이 문서를 그대로 편집합니다)",
-    type=["docx"],
-    key="jo_old_file",
-)
-
-job_posting_text = st.text_area(
-    "채용 공고 링크(URL) 또는 공고 텍스트",
-    height=100,
-)
-
-logo_file = st.file_uploader(
-    "회사 로고 이미지 (기존 잡오퍼 편집 모드에서는 무시됩니다 — 원본 로고 그대로 유지)",
-    type=["jpg", "jpeg", "png"],
-    key="jo_logo",
-)
+passport_file = st.file_uploader("손님 여권 이미지 또는 PDF", type=["jpg", "jpeg", "png", "pdf", "heic", "HEIC"], key="jo_passport")
+old_jo_file = st.file_uploader("기준으로 사용할 기존 잡오퍼 (있으면 이 문서를 그대로 편집합니다)", type=["docx"], key="jo_old_file")
+job_posting_text = st.text_area("채용 공고 링크(URL) 또는 공고 텍스트", height=100, key="job_posting_text")
+logo_file = st.file_uploader("회사 로고 이미지 (기존 잡오퍼 편집 모드에서는 무시됩니다 — 원본 로고 그대로 유지)", type=["jpg", "jpeg", "png"], key="jo_logo")
 
 if st.button("AI 분석 시작", type="primary", use_container_width=True):
     with st.spinner("정보 추출 중..."):
         extracted_info = {}
+        old_info = {}
+        ad_info = {}
 
         if logo_file and not old_jo_file:
             extracted_info["logo_bytes"] = logo_file.getvalue()
 
+        # [우선순위 1번] 여권 정보 파싱
         if passport_file:
             pass_img = process_uploaded_file_to_image(passport_file)
             pass_data = extract_imm5476_info(pass_img)
             if pass_data:
-                extracted_info["client_name"] = format_full_name(
-                    pass_data.get("surname", ""), pass_data.get("given_name", "")
-                )
+                extracted_info["client_name"] = format_full_name(pass_data.get("surname", ""), pass_data.get("given_name", ""))
                 extracted_info["client_dob"] = pass_data.get("dob", "")
 
+        # 기존 잡오퍼 파싱
         if old_jo_file:
-            existing_parsed = parse_existing_job_offer(
-                old_jo_file.getvalue(),
-                old_jo_file.type or "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            )
+            existing_parsed = parse_existing_job_offer(old_jo_file.getvalue(), old_jo_file.type or "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
             if existing_parsed:
+                old_info = existing_parsed
                 for k, v in existing_parsed.items():
-                    if k in ["client_name", "client_dob"] and extracted_info.get(k):
-                        continue
+                    if k in ["client_name", "client_dob"] and extracted_info.get(k): continue
                     extracted_info[k] = v
             st.session_state["_old_jo_bytes"] = old_jo_file.getvalue()
         else:
             st.session_state.pop("_old_jo_bytes", None)
 
+        # 채용공고(광고) 파싱
         if job_posting_text.strip():
             raw_input = job_posting_text.strip()
             is_url = bool(re.search(r"https?://[^\s]+|www\.[^\s]+", raw_input))
             if is_url:
                 url_match = re.search(r"(https?://[^\s]+|www\.[^\s]+)", raw_input).group(0)
                 fetched_text, err = fetch_url_content_safe(url_match)
-                if err:
-                    st.warning(f"URL 조회 실패: {err} (입력하신 텍스트 자체를 분석합니다)")
+                if err: st.warning(f"URL 조회 실패: {err} (입력하신 텍스트 자체를 분석합니다)")
                 text_to_analyze = fetched_text if fetched_text else raw_input
             else:
                 text_to_analyze = raw_input
 
-            job_extracted = call_gemini_json(
-                [f"Analyze this job posting content and extract the requested fields:\n\n{text_to_analyze}"],
-                JOB_POSTING_SCHEMA,
-            )
+            job_extracted = call_gemini_json([f"Analyze this job posting content and extract the requested fields:\n\n{text_to_analyze}"], JOB_POSTING_SCHEMA)
             if job_extracted:
-                extracted_info.update(job_extracted)
+                ad_info = job_extracted
+                for k, v in job_extracted.items():
+                    if k not in ["client_name", "client_dob"]: extracted_info[k] = v
 
+        st.session_state.old_info_backup = old_info
+        st.session_state.ad_info_backup = ad_info
         st.session_state.job_offer_data.update(extracted_info)
         st.success("분석이 완료되었습니다.")
 
@@ -916,8 +676,43 @@ st.markdown("---")
 st.subheader("2. 최종 잡오퍼 정보 확인 및 수정")
 
 jo_data = st.session_state.job_offer_data
+ad_b = st.session_state.get("ad_info_backup", {})
+old_b = st.session_state.get("old_info_backup", {})
+
+conflicts = []
+for key, label in [("employer_name", "회사명"), ("employer_address", "회사 주소"), ("employer_phone", "회사 전화번호"), ("employer_email", "회사 이메일")]:
+    a_val = ad_b.get(key, "").strip()
+    o_val = old_b.get(key, "").strip()
+    if a_val and o_val and a_val.lower() != o_val.lower():
+        conflicts.append((key, label, a_val, o_val))
+
+if conflicts:
+    st.markdown("#### 🔍 정보 충돌 해결 (채용공고 vs 기존 문서)")
+    st.info("광고와 기존 잡오퍼 문서에서 서로 다른 정보가 발견되었습니다. 입력란에 반영할 정보를 선택해주세요. (기본값: 최신 광고 정보)")
+    for key, label, a_val, o_val in conflicts:
+        st.radio(f"**{label}** 충돌", options=[f"채용공고 (우선): {a_val}", f"기존 문서: {o_val}"], key=f"resolve_{key}")
+
+def get_resolved_val(key, default_dict):
+    a_val = ad_b.get(key, "").strip()
+    o_val = old_b.get(key, "").strip()
+    
+    if key == "employer_email":
+        if "protected" in a_val.lower(): a_val = ""
+        if "protected" in o_val.lower(): o_val = ""
+
+    if a_val and o_val and a_val.lower() != o_val.lower():
+        choice = st.session_state.get(f"resolve_{key}", "")
+        if "기존 문서" in choice: return o_val
+        return a_val
+    return a_val if a_val else (o_val if o_val else default_dict.get(key, ""))
+
+# AI가 회사 주소를 찾지 못하고 근무지 주소만 추출했을 경우 대비용 로직
+resolved_emp_addr = get_resolved_val("employer_address", jo_data)
+if not resolved_emp_addr:
+    resolved_emp_addr = get_resolved_val("job_location", jo_data)
+
 temp_wage = jo_data.get("wage", "20.15")
-temp_loc = jo_data.get("job_location", jo_data.get("employer_address", ""))
+temp_loc = resolved_emp_addr
 calc_term, calc_median, calc_reason, calc_prov = calculate_employment_term(temp_wage, temp_loc)
 
 col_c1, col_c2 = st.columns(2)
@@ -928,59 +723,42 @@ with col_c1:
     st.info(f"🌐 **판정 근거 (주: {calc_prov}):** {calc_reason}")
 with col_c2:
     c_dob = st.text_input("손님 생년월일", value=jo_data.get("client_dob", ""))
-    start_dt_str = st.text_input(
-        "근무 시작일",
-        value=jo_data.get("start_date", "The employment start date will be as soon as possible upon the employee’s authorization to work in Canada."),
-    )
+    start_dt_str = st.text_input("근무 시작일", value=jo_data.get("start_date", "The employment start date will be as soon as possible upon the employee’s authorization to work in Canada."))
 
 st.markdown("#### 🏢 고용주 및 회사 정보")
-
-# 이메일 'protected' 문구 방어 로직
-extracted_email = jo_data.get("employer_email", "")
-if "protected" in extracted_email.lower():
-    extracted_email = ""
-
 col_e1, col_e2 = st.columns(2)
 with col_e1:
-    emp_name = st.text_input("회사명", value=jo_data.get("employer_name", ""))
+    emp_name = st.text_input("회사명", value=get_resolved_val("employer_name", jo_data))
     signer_n = st.text_input("대표자 성명", value=jo_data.get("signer_name", ""))
     signer_t = st.text_input("대표자 직책", value=jo_data.get("signer_title", "Director"))
 with col_e2:
-    emp_addr = st.text_input("회사 대표 주소", value=jo_data.get("employer_address", ""))
-    emp_phone = st.text_input("회사 전화번호", value=jo_data.get("employer_phone", ""))
-    emp_email = st.text_input("회사 이메일", value=extracted_email, placeholder="예: Upnorthinstallations.hiring@outlook.com")
+    emp_addr = st.text_input("회사 대표 주소", value=resolved_emp_addr)
+    emp_phone = st.text_input("회사 전화번호", value=get_resolved_val("employer_phone", jo_data))
+    emp_email = st.text_input("회사 이메일", value=get_resolved_val("employer_email", jo_data), placeholder="예: hiring@company.com")
 
 st.markdown("#### 💼 근무 조건")
 col_j1, col_j2 = st.columns(2)
 with col_j1:
     j_title = st.text_input("직책", value=jo_data.get("job_title", ""))
-    j_wage = st.text_input(
-        "시급 (CAD)", value=str(jo_data.get("wage", "20.15")),
-        help="숫자만 입력해도 되고, '$38.50/hour'처럼 붙여넣어도 자동으로 숫자만 추출됩니다.",
-    )
-    j_hours = st.text_input(
-        "주당 근무시간", value=str(jo_data.get("hours", "30-40")),
-        help="'30-40 hours/week'처럼 붙여넣어도 단위는 자동으로 제거됩니다.",
-    )
+    j_wage = st.text_input("시급 (CAD)", value=str(jo_data.get("wage", "20.15")))
+    j_hours = st.text_input("주당 근무시간", value=str(jo_data.get("hours", "30-40")))
 with col_j2:
-    j_loc = st.text_input("근무지 주소", value=jo_data.get("job_location", emp_addr))
+    j_loc = st.text_input("근무지 주소", value=get_resolved_val("job_location", jo_data) or emp_addr)
     j_benefits = st.text_input("혜택", value=jo_data.get("benefits", "4% vacation pay"))
     j_noc = st.text_input("NOC 코드", value=jo_data.get("noc_code", ""))
-    if not j_noc.strip():
-        st.warning("⚠️ NOC 코드가 비어 있습니다. LMIA 관련 서류는 보통 NOC 코드가 필수이니 확인 후 입력해주세요.")
 
 auto_ot_clause = get_provincial_overtime_clause(j_loc or emp_addr)
 j_ot = st.text_area("오버타임 조항 (주별 기준 자동 적용, 신규 생성 시에만 사용됨)", value=auto_ot_clause, height=100)
 
 duties_input_str = jo_data.get("job_duties", [])
-if isinstance(duties_input_str, list):
-    duties_input_str = "\n".join(duties_input_str)
+if isinstance(duties_input_str, list): duties_input_str = "\n".join(duties_input_str)
 j_duties_text = st.text_area("주요 직무 (한 줄에 하나씩)", value=duties_input_str, height=150)
 
 if st.session_state.get("_old_jo_bytes"):
     st.info("📎 기존 잡오퍼 문서를 그대로 편집합니다. 로고/서명/회사 헤더는 원본 그대로 유지됩니다.")
 
 st.markdown("---")
+
 if st.button("📄 MS Word (.docx) 생성 및 다운로드", type="primary", use_container_width=True):
     if not c_name or not emp_name or not j_title:
         st.error("손님 성명, 회사명, 직책은 필수 입력 항목입니다.")
@@ -999,23 +777,21 @@ if st.button("📄 MS Word (.docx) 생성 및 다운로드", type="primary", use
             docx_bytes = generate_job_offer_from_existing(old_bytes, final_jo_dict)
         else:
             if not os.path.exists(TEMPLATE_PATH):
-                st.error(f"템플릿 파일을 찾을 수 없습니다: {TEMPLATE_PATH} (저장소에 Job_Offer_Template.docx를 app.py와 같은 폴더에 커밋하세요)")
+                st.error(f"템플릿 파일을 찾을 수 없습니다: {TEMPLATE_PATH}")
                 st.stop()
             docx_bytes = generate_job_offer_docx(final_jo_dict)
 
         crm_client = "NAME"
         if c_name:
             parts = c_name.strip().split()
-            if parts:
-                crm_client = parts[0].capitalize()
+            if parts: crm_client = parts[0].capitalize()
         out_filename = f"[Job Offer]_{crm_client}.docx"
 
         st.success("잡오퍼 DOCX 문서 생성이 완료되었습니다!")
-        st.download_button(
-            label="📥 Job Offer 다운로드",
-            data=docx_bytes,
-            file_name=out_filename,
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            type="primary",
-            use_container_width=True,
-        )
+        st.download_button(label="📥 Job Offer 다운로드", data=docx_bytes, file_name=out_filename, mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", type="primary", use_container_width=True)
+
+st.markdown("<br><br>", unsafe_allow_html=True)
+if st.button("🔄 새 케이스 시작 (전체 초기화)", type="secondary", use_container_width=True):
+    for key in list(st.session_state.keys()):
+        if key != "password_correct": del st.session_state[key]
+    st.rerun()
