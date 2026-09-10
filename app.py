@@ -1,13 +1,14 @@
 """
-CanNest 잡오퍼 DOCX 생성기 (v7)
+CanNest 잡오퍼 DOCX 생성기 (v9)
 ----------------------------------
-v6 대비 변경점:
-  1) 광고 기반 주소/이메일 강제 할당: AI가 '근무지 주소'만 찾고 '회사 주소'를 못 찾았을 경우, 근무지 주소를 회사 주소의 기본값으로 자동 복사하도록 개선.
+v8 대비 변경점:
+  1) 기존 잡오퍼 파일로 PDF(.pdf) 지원 추가.
+  2) PDF 업로드 시 직접 편집 대신 데이터를 모두 추출하여 새 DOCX 템플릿으로 재생성하도록 분기 로직 적용.
 """
 
 import streamlit as st
 
-st.set_page_config(page_title="CanNest 잡오퍼 DOCX 생성기 (v7)", layout="wide")
+st.set_page_config(page_title="CanNest 잡오퍼 DOCX 생성기 (v9)", layout="wide")
 
 import os
 import io
@@ -205,7 +206,7 @@ def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
         except Exception:
             pass
 
-    if "pdf" in mime_type.lower():
+    if "pdf" in mime_type.lower() or ext == ".pdf":
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
             text = "".join(page.get_text("text") + "\n" for page in doc)
@@ -219,9 +220,9 @@ def extract_imm5476_info(image):
     prompt = "Analyze this identity document and extract the requested fields exactly."
     return call_gemini_json([prompt, image], PASSPORT_SCHEMA)
 
-def parse_existing_job_offer(file_bytes, mime_type):
+def parse_existing_job_offer(file_bytes, mime_type, filename="Existing_Job_Offer.pdf"):
     prompt = "Analyze this existing Job Offer document and extract the requested fields exactly."
-    contents = prepare_document_for_gemini(file_bytes, mime_type, "Existing_Job_Offer.pdf")
+    contents = prepare_document_for_gemini(file_bytes, mime_type, filename)
     return call_gemini_json([prompt] + contents, EXISTING_OFFER_SCHEMA) or {}
 
 # ==========================================
@@ -266,7 +267,7 @@ def fetch_url_content_safe(url: str, timeout: int = 12, max_bytes: int = 2_000_0
     if not parsed.hostname or not _is_hostname_safe(parsed.hostname): return "", "내부망/사설 IP로 확인되어 요청을 차단했습니다."
 
     opener = urllib.request.build_opener(_SafeRedirectHandler)
-    req = urllib.request.Request(target_url, headers={"User-Agent": "Mozilla/5.0 (CanNestJobOfferBot)"})
+    req = urllib.request.Request(target_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"})
     try:
         with opener.open(req, timeout=timeout) as resp:
             raw = resp.read(max_bytes + 1)
@@ -606,8 +607,8 @@ def generate_job_offer_from_existing(existing_file_bytes: bytes, data: dict) -> 
 # ==========================================
 # 6. Streamlit UI
 # ==========================================
-st.title("📄 잡오퍼 DOCX 생성기 (v7)")
-st.caption("완벽한 초기화 · 여권 최우선 반영 · 채용공고 기반 주소/이메일 자동 강제 할당")
+st.title("📄 잡오퍼 DOCX 생성기 (v9)")
+st.caption("완벽한 초기화 · PDF 자동 DOCX 추출 지원 · 이메일 강제 추출 적용")
 
 if "job_offer_data" not in st.session_state:
     st.session_state.job_offer_data = {}
@@ -616,9 +617,12 @@ st.markdown("---")
 st.subheader("1. 서류 업로드")
 
 passport_file = st.file_uploader("손님 여권 이미지 또는 PDF", type=["jpg", "jpeg", "png", "pdf", "heic", "HEIC"], key="jo_passport")
-old_jo_file = st.file_uploader("기준으로 사용할 기존 잡오퍼 (있으면 이 문서를 그대로 편집합니다)", type=["docx"], key="jo_old_file")
-job_posting_text = st.text_area("채용 공고 링크(URL) 또는 공고 텍스트", height=100, key="job_posting_text")
-logo_file = st.file_uploader("회사 로고 이미지 (기존 잡오퍼 편집 모드에서는 무시됩니다 — 원본 로고 그대로 유지)", type=["jpg", "jpeg", "png"], key="jo_logo")
+old_jo_file = st.file_uploader("기준으로 사용할 기존 잡오퍼 (DOCX 업로드 시 서식 유지 편집 / PDF 업로드 시 내용 추출 후 새 DOCX로 변환)", type=["docx", "pdf"], key="jo_old_file")
+
+st.info("💡 **Tip:** JobSpider 등 보안이 강력한 구인 사이트는 URL을 넣으면 정보 추출이 차단될 수 있습니다. 이메일 등 누락되는 항목이 있다면, **공고 내용을 텍스트로 전부 드래그하여 아래 칸에 직접 붙여넣어주세요.**")
+job_posting_text = st.text_area("채용 공고 링크(URL) 또는 공고 텍스트 전체 복사/붙여넣기", height=150, key="job_posting_text")
+
+logo_file = st.file_uploader("회사 로고 이미지 (기존 잡오퍼 DOCX 편집 모드에서는 무시됩니다 — 원본 로고 유지)", type=["jpg", "jpeg", "png"], key="jo_logo")
 
 if st.button("AI 분석 시작", type="primary", use_container_width=True):
     with st.spinner("정보 추출 중..."):
@@ -626,7 +630,7 @@ if st.button("AI 분석 시작", type="primary", use_container_width=True):
         old_info = {}
         ad_info = {}
 
-        if logo_file and not old_jo_file:
+        if logo_file and not (old_jo_file and old_jo_file.name.lower().endswith(".docx")):
             extracted_info["logo_bytes"] = logo_file.getvalue()
 
         # [우선순위 1번] 여권 정보 파싱
@@ -637,32 +641,48 @@ if st.button("AI 분석 시작", type="primary", use_container_width=True):
                 extracted_info["client_name"] = format_full_name(pass_data.get("surname", ""), pass_data.get("given_name", ""))
                 extracted_info["client_dob"] = pass_data.get("dob", "")
 
-        # 기존 잡오퍼 파싱
+        # 기존 잡오퍼 파싱 (PDF, DOCX 공통 내용 추출)
         if old_jo_file:
-            existing_parsed = parse_existing_job_offer(old_jo_file.getvalue(), old_jo_file.type or "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+            mime_type = old_jo_file.type or ("application/pdf" if old_jo_file.name.lower().endswith(".pdf") else "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+            is_pdf = old_jo_file.name.lower().endswith(".pdf") or "pdf" in mime_type.lower()
+            
+            existing_parsed = parse_existing_job_offer(old_jo_file.getvalue(), mime_type, filename=old_jo_file.name)
             if existing_parsed:
                 old_info = existing_parsed
                 for k, v in existing_parsed.items():
                     if k in ["client_name", "client_dob"] and extracted_info.get(k): continue
                     extracted_info[k] = v
-            st.session_state["_old_jo_bytes"] = old_jo_file.getvalue()
+            
+            # PDF는 기존 틀을 덮어씌울 수 없으므로, 바이트 저장(편집용)을 생략하여 새 템플릿 사용을 유도
+            if is_pdf:
+                st.session_state.pop("_old_jo_bytes", None)
+                st.toast("PDF 형식의 잡오퍼가 업로드되었습니다! 내용은 모두 추출되었으며, 다운로드 시 새 DOCX 파일로 깔끔하게 변환됩니다.", icon="✅")
+            else:
+                st.session_state["_old_jo_bytes"] = old_jo_file.getvalue()
         else:
             st.session_state.pop("_old_jo_bytes", None)
 
         # 채용공고(광고) 파싱
         if job_posting_text.strip():
             raw_input = job_posting_text.strip()
-            is_url = bool(re.search(r"https?://[^\s]+|www\.[^\s]+", raw_input))
+            is_url = bool(re.search(r"^https?://[^\s]+|^www\.[^\s]+", raw_input))
             if is_url:
                 url_match = re.search(r"(https?://[^\s]+|www\.[^\s]+)", raw_input).group(0)
                 fetched_text, err = fetch_url_content_safe(url_match)
-                if err: st.warning(f"URL 조회 실패: {err} (입력하신 텍스트 자체를 분석합니다)")
+                if err: st.warning(f"URL 조회 실패: {err} (해당 사이트는 봇 차단이 설정되어 있습니다. 텍스트를 직접 복사해서 붙여넣는 것을 권장합니다.)")
                 text_to_analyze = fetched_text if fetched_text else raw_input
             else:
                 text_to_analyze = raw_input
 
             job_extracted = call_gemini_json([f"Analyze this job posting content and extract the requested fields:\n\n{text_to_analyze}"], JOB_POSTING_SCHEMA)
-            if job_extracted:
+            
+            if job_extracted is not None:
+                current_em = job_extracted.get("employer_email", "")
+                if not current_em or "protected" in current_em.lower():
+                    email_match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text_to_analyze)
+                    if email_match:
+                        job_extracted["employer_email"] = email_match.group(0)
+
                 ad_info = job_extracted
                 for k, v in job_extracted.items():
                     if k not in ["client_name", "client_dob"]: extracted_info[k] = v
@@ -706,7 +726,6 @@ def get_resolved_val(key, default_dict):
         return a_val
     return a_val if a_val else (o_val if o_val else default_dict.get(key, ""))
 
-# AI가 회사 주소를 찾지 못하고 근무지 주소만 추출했을 경우 대비용 로직
 resolved_emp_addr = get_resolved_val("employer_address", jo_data)
 if not resolved_emp_addr:
     resolved_emp_addr = get_resolved_val("job_location", jo_data)
@@ -755,7 +774,10 @@ if isinstance(duties_input_str, list): duties_input_str = "\n".join(duties_input
 j_duties_text = st.text_area("주요 직무 (한 줄에 하나씩)", value=duties_input_str, height=150)
 
 if st.session_state.get("_old_jo_bytes"):
-    st.info("📎 기존 잡오퍼 문서를 그대로 편집합니다. 로고/서명/회사 헤더는 원본 그대로 유지됩니다.")
+    st.info("📎 기존 잡오퍼 문서(DOCX)를 그대로 편집합니다. 로고/서명/회사 헤더는 원본 그대로 유지됩니다.")
+else:
+    if old_jo_file and old_jo_file.name.lower().endswith(".pdf"):
+        st.info("📎 PDF 파일이 업로드되었습니다. 데이터는 성공적으로 추출되었으며, 다운로드 시 새 DOCX 문서로 생성됩니다.")
 
 st.markdown("---")
 
