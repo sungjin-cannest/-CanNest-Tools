@@ -262,7 +262,6 @@ def is_minor(dob_str):
     except:
         return True
 
-# 💡 핵심 수정: 데이터 증발(깨짐) 방지 및 편집 잠금 해제 엔진 고도화
 def sanitize_and_unlock_pdf(pdf_bytes):
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -272,20 +271,16 @@ def sanitize_and_unlock_pdf(pdf_bytes):
             clean_doc.insert_pdf(doc, from_page=page.number, to_page=page.number)
 
         for page in clean_doc:
-            # 모든 폼 위젯을 무작정 삭제하지 않고, 서명(Signature) 위젯만 핀셋 제거
             for widget in list(page.widgets()):
                 field_type_str = getattr(widget, "field_type_string", "").lower()
                 if "sig" in field_type_str:
-                    page.delete_widget(widget) # 서명 잠금 원인만 제거
+                    page.delete_widget(widget) 
                 else:
-                    # 나머지 데이터(T4 금액, 이름 등)는 삭제하지 않고 읽기 전용으로 보존
                     if hasattr(widget, "field_flags"):
-                        widget.field_flags |= 1 # ReadOnly Flag 적용
+                        widget.field_flags |= 1 
                         widget.update()
                         
-            # 주석(Annot) 일괄 삭제 로직 완전 제거 (T4 레이아웃 및 텍스트 증발 방지)
-
-        clean_doc.set_metadata({}) # 메타데이터 세척
+        clean_doc.set_metadata({}) 
         
         out_buf = io.BytesIO()
         clean_doc.save(out_buf, clean=True, deflate=True)
@@ -353,7 +348,7 @@ def extract_all_passports_batch(has_non_acc, images):
 def extract_case_prep_info(tmpl_bytes, client_files):
     prompt = """
     You are an expert Canadian immigration case prep assistant.
-    The FIRST document is a BLANK reference IRCC IMM form template.
+    The FIRST document is a BLANK reference IRCC IMM form template (such as IMM5710, IMM5709, IMM1294, IMM1295, IMM5708).
     The REMAINING attached documents are client materials.
 
     Carefully scan ALL attached client documents to extract all required information matching the IMM form fields.
@@ -530,7 +525,104 @@ def fill_consent_letter(template_bytes, data):
     return output_pdf
 
 # ==========================================
-# 5. Streamlit 네비게이션 및 UI 구성
+# 5. CRM 스마트 압축 및 PDF 안전 병합 엔진
+# ==========================================
+def process_and_compress_file(file_bytes, mime_type, target_filename):
+    is_jpeg = target_filename.lower().endswith(('.jpg', '.jpeg'))
+    
+    if is_jpeg:
+        img = Image.open(io.BytesIO(file_bytes))
+        img = ImageOps.exif_transpose(img)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+            
+        max_dim = max(img.width, img.height)
+        if max_dim > 2000:
+            ratio = 2000.0 / float(max_dim)
+            img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.Resampling.LANCZOS)
+            
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=80, optimize=True)
+        buf.seek(0)
+        return buf.getvalue(), "image/jpeg"
+        
+    else:
+        if "pdf" in mime_type.lower():
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            total_text_len = 0
+            
+            for page_idx in range(min(len(doc), 5)):
+                page = doc.load_page(page_idx)
+                text = page.get_text("text").strip()
+                total_text_len += len(text)
+                if total_text_len > 50:
+                    break
+            
+            if total_text_len > 50:
+                doc.close()
+                return sanitize_and_unlock_pdf(file_bytes), "application/pdf"
+            
+            new_doc = fitz.open()
+            target_dpi = 150
+            quality = 65
+            
+            for page in doc:
+                zoom = target_dpi / 72.0
+                if max(page.rect.width, page.rect.height) > 2000:
+                    zoom = 1.0
+                    
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                
+                img_buf = io.BytesIO()
+                img.save(img_buf, format="JPEG", quality=quality, optimize=True)
+                img_buf.seek(0)
+                
+                pdf_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
+                pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
+                
+            output_pdf = io.BytesIO()
+            new_doc.save(output_pdf, deflate=True, garbage=4)
+            new_doc.close()
+            doc.close()
+            
+            compressed_bytes = output_pdf.getvalue()
+            final_bytes = compressed_bytes if len(compressed_bytes) < len(file_bytes) else file_bytes
+            return sanitize_and_unlock_pdf(final_bytes), "application/pdf"
+            
+        else:
+            target_dpi = 150
+            quality = 70
+            img = Image.open(io.BytesIO(file_bytes))
+            img = ImageOps.exif_transpose(img)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+                
+            max_dim = max(img.width, img.height)
+            if max_dim > 1800:
+                ratio = 1800.0 / float(max_dim)
+                img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.Resampling.LANCZOS)
+                
+            img_buf = io.BytesIO()
+            img.save(img_buf, format="JPEG", quality=quality, optimize=True)
+            img_buf.seek(0)
+            
+            new_doc = fitz.open()
+            page_width = img.width * 72.0 / target_dpi
+            page_height = img.height * 72.0 / target_dpi
+            pdf_page = new_doc.new_page(width=page_width, height=page_height)
+            
+            pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
+            
+            output_pdf = io.BytesIO()
+            new_doc.save(output_pdf)
+            new_doc.close()
+            
+            compressed_bytes = output_pdf.getvalue()
+            return sanitize_and_unlock_pdf(compressed_bytes), "application/pdf"
+
+# ==========================================
+# 6. Streamlit 네비게이션 및 UI 구성
 # ==========================================
 MENU_1 = "🍁 IMM5476 자동 작성"
 MENU_2 = "✈️ 한부모 동의서 자동 작성"
@@ -1062,6 +1154,8 @@ elif app_mode == MENU_4:
 
                 unique_src_files = list(set([p["original_name"] for p in group_pages]))
                 is_all_from_same_pdf = (len(unique_src_files) == 1 and "pdf" in group_pages[0]["mime_type"].lower())
+                
+                # 💡 회전 에러 원천 차단: AI 회전 명령이 있어도 메타데이터 조작 엔진을 사용하여 안전하게 회전 처리
                 needs_rotation = any(int(rotations.get(str(p["global_idx"]), 0)) != 0 for p in group_pages)
                 
                 try:
@@ -1072,7 +1166,6 @@ elif app_mode == MENU_4:
                         if len(pdf_indices) == len(src_doc) and not needs_rotation and pdf_indices == list(range(len(src_doc))):
                             merged_pdf_bytes = group_pages[0]["file_bytes"]
                             src_doc.close()
-                            # 💡 원본 유지 시에도 T4 깨짐 방지용 안전 세척 적용
                             final_processed_bytes = sanitize_and_unlock_pdf(merged_pdf_bytes)
                         else:
                             src_doc.select(pdf_indices)  
@@ -1081,6 +1174,7 @@ elif app_mode == MENU_4:
                                     rot = int(rotations.get(str(p_data["global_idx"]), 0))
                                     if rot != 0:
                                         page = src_doc[i]
+                                        # 💡 PyMuPDF 안전 회전 적용
                                         page.set_rotation((page.rotation + rot) % 360)
                                 except: pass
                             merged_pdf_bytes_io = io.BytesIO()
@@ -1146,7 +1240,6 @@ elif app_mode == MENU_4:
                             img.save(img_buf, format="JPEG", quality=95)
                             comp_bytes, out_mime = process_and_compress_file(img_buf.getvalue(), "image/jpeg", final_name)
                         else:
-                            # 💡 병합된 PDF 처리 시 안전 세척 엔진 적용
                             final_processed_bytes = sanitize_and_unlock_pdf(merged_pdf_bytes)
                             comp_bytes, out_mime = process_and_compress_file(final_processed_bytes, "application/pdf", final_name)
                         
