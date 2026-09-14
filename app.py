@@ -262,12 +262,10 @@ def is_minor(dob_str):
     except:
         return True
 
-# 💡 수정사항: 원본 복사(insert_pdf) 없이, 제자리에서 서명 잠금만 핀셋 해제하여 폼 데이터 100% 보존
 def sanitize_and_unlock_pdf(pdf_bytes):
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         
-        # 문서 내 모든 서명 위젯 추적 및 삭제 (Acrobat 편집 잠금 해제용)
         for page in doc:
             for widget in list(page.widgets()):
                 field_type_str = getattr(widget, "field_type_string", "").lower()
@@ -277,7 +275,6 @@ def sanitize_and_unlock_pdf(pdf_bytes):
         doc.set_metadata({}) 
         
         out_buf = io.BytesIO()
-        # clean=True 속성을 제거하여 폼 데이터 구조 변경(증발) 완벽 차단
         doc.save(out_buf)
         doc.close()
         return out_buf.getvalue()
@@ -1013,6 +1010,7 @@ elif app_mode == MENU_4:
 
             status_text.text("2. AI가 페이지별 문맥을 분석하여 연관 서류를 묶거나 나누는 중입니다...")
             
+            # 💡 수정된 프롬프트: Job Offer 카테고리(25) 및 LOE와 구분하는 강력한 규칙(RULE 3) 추가
             prompt = f"""
             You are an expert AI document classifier for a Canadian immigration firm.
             I am providing {len(global_pages)} pages of documents uploaded by a client. 
@@ -1022,6 +1020,7 @@ elif app_mode == MENU_4:
             2. GROUP the pages that logically belong to the SAME document type for the SAME client. 
                *CRITICAL MERGE RULE 1*: If you see multiple pages of BANK STATEMENTS, PAYSTUBS, or UTILITY BILLS for the SAME client (even if from different months), MERGE THEM ALL into a single group.
                *CRITICAL MERGE RULE 2 (PASSPORT)*: Merge ALL PASSPORT PAGES (bio-data page, pages with entry stamps, and pages with TRV / Temporary Resident Visa stickers) for the same client into ONE SINGLE GROUP. DO NOT classify a TRV sticker attached inside a passport as a Visitor Record (VR). A Visitor Record is a separate standalone document.
+               *CRITICAL RULE 3 (LOE vs Job Offer)*: A "Job Offer" outlines proposed terms of employment and typically requires signatures from BOTH the employer and employee. A "Letter of Employment" (LOE) certifies past/current employment status (e.g., "This certifies that X has been employed...") and is usually signed ONLY by the employer. DO NOT mix them up.
             3. ROTATION CHECK: Check if text is upside down or sideways (0, 90, 180, or 270).
             4. For EACH grouped document, generate an EXACT filename using our strict CRM manual rules provided below.
 
@@ -1056,10 +1055,11 @@ elif app_mode == MENU_4:
             21. Tuition Receipt: {{Name}}_Tuition Receipt_{{SchoolName}}
             22. Confirmation of Enrollment: {{Name}}_Confirmation of Enrollment_{{SchoolName}}
             23. Digital Photo / Passport Photo: {{Name}}_Digital Photo.jpg
-            24. T4 (Statement of Remuneration Paid): {{Name}}_T4_{{EmployerNameInEnglish}}_{{Year YYYY}} (e.g. 홍길동_T4_Provence Marinaside_2025)
+            24. T4 (Statement of Remuneration Paid): {{Name}}_T4_{{EmployerNameInEnglish}}_{{Year YYYY}}
+            25. Job Offer (Employment Agreement): {{Name}}_Job Offer_{{CompanyInEnglish}}
 
             [CRITICAL FALLBACK RULE FOR UNKNOWN DOCUMENTS]
-            - Step 1: If a document does NOT match any of the 24 categories above, extract the official document title printed at the top of the document (in English, Title Case) and format as: {{Name}}_{{DocumentTitleInEnglish}}.
+            - Step 1: If a document does NOT match any of the 25 categories above, extract the official document title printed at the top of the document (in English, Title Case) and format as: {{Name}}_{{DocumentTitleInEnglish}}.
             - Step 2: If the document title/type is completely ambiguous, unreadable, or unclassified, set suggested_filename as {{Name}}_Unclassified_확인필요.pdf and set "is_unclassified": true.
 
             Return ONLY a raw JSON object:
@@ -1169,7 +1169,7 @@ elif app_mode == MENU_4:
                                         page.set_rotation((page.rotation + rot) % 360)
                                 except: pass
                             merged_pdf_bytes_io = io.BytesIO()
-                            src_doc.save(merged_pdf_bytes_io) 
+                            src_doc.save(merged_pdf_bytes_io, deflate=True) 
                             src_doc.close()
                             merged_pdf_bytes = merged_pdf_bytes_io.getvalue()
                             final_processed_bytes = sanitize_and_unlock_pdf(merged_pdf_bytes)
