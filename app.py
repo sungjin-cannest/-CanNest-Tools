@@ -262,29 +262,23 @@ def is_minor(dob_str):
     except:
         return True
 
+# 💡 수정사항: 원본 복사(insert_pdf) 없이, 제자리에서 서명 잠금만 핀셋 해제하여 폼 데이터 100% 보존
 def sanitize_and_unlock_pdf(pdf_bytes):
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        clean_doc = fitz.open()
-
+        
+        # 문서 내 모든 서명 위젯 추적 및 삭제 (Acrobat 편집 잠금 해제용)
         for page in doc:
-            clean_doc.insert_pdf(doc, from_page=page.number, to_page=page.number)
-
-        for page in clean_doc:
             for widget in list(page.widgets()):
                 field_type_str = getattr(widget, "field_type_string", "").lower()
-                if "sig" in field_type_str:
-                    page.delete_widget(widget) 
-                else:
-                    if hasattr(widget, "field_flags"):
-                        widget.field_flags |= 1 
-                        widget.update()
-                        
-        clean_doc.set_metadata({}) 
+                if "sig" in field_type_str or widget.field_type == fitz.PDF_WIDGET_TYPE_SIGNATURE:
+                    page.delete_widget(widget)
+        
+        doc.set_metadata({}) 
         
         out_buf = io.BytesIO()
-        clean_doc.save(out_buf, clean=True, deflate=True)
-        clean_doc.close()
+        # clean=True 속성을 제거하여 폼 데이터 구조 변경(증발) 완벽 차단
+        doc.save(out_buf)
         doc.close()
         return out_buf.getvalue()
     except Exception:
@@ -348,7 +342,7 @@ def extract_all_passports_batch(has_non_acc, images):
 def extract_case_prep_info(tmpl_bytes, client_files):
     prompt = """
     You are an expert Canadian immigration case prep assistant.
-    The FIRST document is a BLANK reference IRCC IMM form template (such as IMM5710, IMM5709, IMM1294, IMM1295, IMM5708).
+    The FIRST document is a BLANK reference IRCC IMM form template.
     The REMAINING attached documents are client materials.
 
     Carefully scan ALL attached client documents to extract all required information matching the IMM form fields.
@@ -1154,8 +1148,6 @@ elif app_mode == MENU_4:
 
                 unique_src_files = list(set([p["original_name"] for p in group_pages]))
                 is_all_from_same_pdf = (len(unique_src_files) == 1 and "pdf" in group_pages[0]["mime_type"].lower())
-                
-                # 💡 회전 에러 원천 차단: AI 회전 명령이 있어도 메타데이터 조작 엔진을 사용하여 안전하게 회전 처리
                 needs_rotation = any(int(rotations.get(str(p["global_idx"]), 0)) != 0 for p in group_pages)
                 
                 try:
@@ -1174,11 +1166,10 @@ elif app_mode == MENU_4:
                                     rot = int(rotations.get(str(p_data["global_idx"]), 0))
                                     if rot != 0:
                                         page = src_doc[i]
-                                        # 💡 PyMuPDF 안전 회전 적용
                                         page.set_rotation((page.rotation + rot) % 360)
                                 except: pass
                             merged_pdf_bytes_io = io.BytesIO()
-                            src_doc.save(merged_pdf_bytes_io, deflate=True) 
+                            src_doc.save(merged_pdf_bytes_io) 
                             src_doc.close()
                             merged_pdf_bytes = merged_pdf_bytes_io.getvalue()
                             final_processed_bytes = sanitize_and_unlock_pdf(merged_pdf_bytes)
