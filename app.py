@@ -265,17 +265,26 @@ def is_minor(dob_str):
 def sanitize_and_unlock_pdf(pdf_bytes):
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        
+        clean_doc = fitz.open()
+
         for page in doc:
+            clean_doc.insert_pdf(doc, from_page=page.number, to_page=page.number)
+
+        for page in clean_doc:
             for widget in list(page.widgets()):
                 field_type_str = getattr(widget, "field_type_string", "").lower()
                 if "sig" in field_type_str or widget.field_type == fitz.PDF_WIDGET_TYPE_SIGNATURE:
-                    page.delete_widget(widget)
-        
-        doc.set_metadata({}) 
+                    page.delete_widget(widget) 
+                else:
+                    if hasattr(widget, "field_flags"):
+                        widget.field_flags |= 1 
+                        widget.update()
+                        
+        clean_doc.set_metadata({}) 
         
         out_buf = io.BytesIO()
-        doc.save(out_buf)
+        clean_doc.save(out_buf, clean=True, deflate=True)
+        clean_doc.close()
         doc.close()
         return out_buf.getvalue()
     except Exception:
@@ -516,7 +525,7 @@ def fill_consent_letter(template_bytes, data):
     return output_pdf
 
 # ==========================================
-# 5. CRM 스마트 압축 및 PDF 안전 병합 엔진
+# 5. CRM 스마트 압축 및 언락(Unlocking) 엔진
 # ==========================================
 def process_and_compress_file(file_bytes, mime_type, target_filename):
     is_jpeg = target_filename.lower().endswith(('.jpg', '.jpeg'))
@@ -1234,11 +1243,16 @@ elif app_mode == MENU_4:
                                 img = Image.open(io.BytesIO(p_data["file_bytes"]))
                                 img = ImageOps.exif_transpose(img) 
                                 if img.mode != "RGB": img = img.convert("RGB")
-                                if rot != 0: img = img.rotate(-rot, expand=True) 
+                                
+                                # 💡 다중 이미지 PDF 생성 전 사전 회전 보정
+                                if rot != 0: 
+                                    img = img.rotate(-rot, expand=True) 
+                                    
                                 img_buf = io.BytesIO()
                                 img.save(img_buf, format="JPEG", quality=95)
                                 pdf_page = new_doc.new_page(width=img.width, height=img.height)
                                 pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
+                                
                         merged_pdf_bytes_io = io.BytesIO()
                         new_doc.save(merged_pdf_bytes_io)
                         new_doc.close()
@@ -1264,7 +1278,6 @@ elif app_mode == MENU_4:
                                 if rot != 0: img = img.rotate(-rot, expand=True)
                             except: pass
                             
-                            # 💡 투명도(PNG 등) 에러 방지 안전 변환
                             if img.mode != "RGB": img = img.convert("RGB")
                             
                             img_buf = io.BytesIO()
