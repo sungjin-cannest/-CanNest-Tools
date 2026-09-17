@@ -1021,7 +1021,12 @@ elif app_mode == MENU_4:
                *CRITICAL MERGE RULE 2 (ID/License)*: For ID cards, Driver's Licences, and PR Cards, the page containing the primary bio-data (face photo, name, DOB) MUST be ordered as Page 1 (Front), and the backside as Page 2.
                *CRITICAL MERGE RULE 3 (Digital Photo)*: If you see a studio receipt/timestamp page along with a face photo, merge them into ONE single Digital Photo document.
                *CRITICAL MERGE RULE 4*: Merge ALL BANK STATEMENTS, PAYSTUBS, or UTILITY BILLS for the SAME client into a single group.
-            3. ROTATION CHECK: Check if text (English/Korean/Barcodes) is upside down or sideways. Determine the correct rotation (0, 90, 180, 270) based on readability. Double-check for upside-down text.
+            3. ROTATION CORRECTION (CRITICAL): Examine the document's visual orientation. You must output the exact degrees CLOCKWISE needed to make the document upright.
+               - "0": The document is already upright.
+               - "90": The document is lying on its left side (the top of the text/head is pointing LEFT). It needs 90 degrees clockwise rotation.
+               - "180": The document is completely upside down.
+               - "270": The document is lying on its right side (the top of the text/head is pointing RIGHT). It needs 270 degrees clockwise rotation.
+               *LANDMARK RULE*: Find the person's face or the main English title. The top of the head/letters is the TOP. If the TOP is pointing LEFT -> 90. If pointing RIGHT -> 270. If pointing DOWN -> 180.
             4. For EACH grouped document, generate an EXACT filename using our strict CRM manual rules provided below.
 
             [STRICT CRM MANUAL FILENAME RULES]
@@ -1149,7 +1154,6 @@ elif app_mode == MENU_4:
                 is_all_from_same_word = (len(unique_src_files) == 1 and group_pages[0]["is_word"])
                 needs_rotation = any(int(rotations.get(str(p["global_idx"]), 0)) != 0 for p in group_pages)
                 
-                # 이력서(Resume) 원본 워드파일 보존 로직
                 if is_resume and is_all_from_same_word:
                     base_name, _ = os.path.splitext(final_name)
                     orig_ext = os.path.splitext(group_pages[0]["original_name"])[1]
@@ -1259,6 +1263,9 @@ elif app_mode == MENU_4:
                                 rot = int(rotations.get(str(p_data["global_idx"]), 0))
                                 if rot != 0: img = img.rotate(-rot, expand=True)
                             except: pass
+                            
+                            # 💡 투명도(PNG 등) 에러 방지 안전 변환
+                            if img.mode != "RGB": img = img.convert("RGB")
                             
                             img_buf = io.BytesIO()
                             img.save(img_buf, format="JPEG", quality=95)
