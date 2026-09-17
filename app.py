@@ -566,19 +566,30 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
             target_dpi = 150
             quality = 65
             
+            # 💡 패치 지점: 회전된 pixmap 비율과 new_page 프레임 크기 동기화
             for page in doc:
+                rot = page.rotation % 360
+                if rot in (90, 270):
+                    eff_width = page.rect.height
+                    eff_height = page.rect.width
+                else:
+                    eff_width = page.rect.width
+                    eff_height = page.rect.height
+
                 zoom = target_dpi / 72.0
-                if max(page.rect.width, page.rect.height) > 2000:
+                if max(eff_width, eff_height) > 2000:
                     zoom = 1.0
-                    
+
                 pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                
+
                 img_buf = io.BytesIO()
                 img.save(img_buf, format="JPEG", quality=quality, optimize=True)
                 img_buf.seek(0)
-                
-                pdf_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
+
+                new_page_width = pix.width / zoom
+                new_page_height = pix.height / zoom
+                pdf_page = new_doc.new_page(width=new_page_width, height=new_page_height)
                 pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
                 
             output_pdf = io.BytesIO()
@@ -1019,7 +1030,6 @@ elif app_mode == MENU_4:
 
             status_text.text("2. AI가 페이지별 문맥을 분석하여 연관 서류를 묶거나 나누는 중입니다...")
             
-            # 💡 수정된 프롬프트: 글자(알파벳/숫자) 정자(Upright) 여부를 최우선으로 검토
             prompt = f"""
             You are an expert AI document classifier for a Canadian immigration firm.
             I am providing {len(global_pages)} pages of documents uploaded by a client. 
@@ -1032,12 +1042,14 @@ elif app_mode == MENU_4:
                *CRITICAL MERGE RULE 3 (Digital Photo)*: If you see a studio receipt/timestamp page along with a face photo, merge them into ONE single Digital Photo document.
                *CRITICAL MERGE RULE 4*: Merge ALL BANK STATEMENTS, PAYSTUBS, or UTILITY BILLS for the SAME client into a single group.
             3. ROTATION CORRECTION (CRITICAL - TEXT UPRIGHT CHECK): 
-               - Look strictly at the English alphabets and numbers in the image. Are they standing upright (readable normally)?
-               - If the letters and numbers are lying on their left side -> it needs 90 degrees clockwise rotation. Output 90.
-               - If the letters and numbers are upside down -> it needs 180 degrees clockwise rotation. Output 180.
-               - If the letters and numbers are lying on their right side -> it needs 270 degrees clockwise rotation. Output 270.
-               - If the letters and numbers are perfectly upright -> Output 0.
-               *In `rotation_reasoning`, you MUST explicitly write: "The alphabets/numbers are [upright / sideways / upside down]..." before giving the degree.*
+               - Look strictly at the MAIN English text/numbers (e.g., 'Canada', 'DRIVER'S LICENCE', 'KIM MIN') and face photo.
+               - SPECIAL RULE FOR BC DRIVER'S LICENCES: BC Licences have large text 'DRIVER'S LICENCE BRITISH COLUMBIA' running vertically along the right edge BY DESIGN. IGNORE this vertical side-text! Instead, look at the face photo and the horizontal text 'Canada', 'KIM MIN', 'DOB'. If the face photo is upright and 'KIM MIN' reads left-to-right, IT IS UPRIGHT (0 degrees)!
+               - Analyze step-by-step:
+                 1) Is the main body text (Name, DOB, Address) reading normally Left-to-Right? -> Output 0
+                 2) Is the main body text reading Bottom-to-Top (running vertically pointing left)? -> Output 90
+                 3) Is the main body text reading Top-to-Bottom (running vertically pointing right)? -> Output 270
+                 4) Is the main body text upside down? -> Output 180
+               *Write your physical observation in `rotation_reasoning` first.*
             4. For EACH grouped document, generate an EXACT filename using our strict CRM manual rules provided below.
 
             [STRICT CRM MANUAL FILENAME RULES]
@@ -1082,8 +1094,8 @@ elif app_mode == MENU_4:
               "page_details": [
                 {{
                   "page_index": 1,
-                  "rotation_reasoning": "The English alphabets and numbers are lying on their left side, so it needs 90 degrees rotation to be upright.",
-                  "rotation_needed_clockwise": 90
+                  "rotation_reasoning": "Main body text 'KIM MIN' reads horizontally Left-to-Right. Ignoring BC license vertical side-text. It is upright.",
+                  "rotation_needed_clockwise": 0
                 }}
               ],
               "documents": [
@@ -1259,7 +1271,6 @@ elif app_mode == MENU_4:
                                 img.save(img_buf, format="JPEG", quality=95)
                                 pdf_page = new_doc.new_page(width=img.width, height=img.height)
                                 pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
-                                
                         merged_pdf_bytes_io = io.BytesIO()
                         new_doc.save(merged_pdf_bytes_io)
                         new_doc.close()
