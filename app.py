@@ -1019,6 +1019,7 @@ elif app_mode == MENU_4:
 
             status_text.text("2. AI가 페이지별 문맥을 분석하여 연관 서류를 묶거나 나누는 중입니다...")
             
+            # 💡 수정된 프롬프트: 글자(알파벳/숫자) 정자(Upright) 여부를 최우선으로 검토
             prompt = f"""
             You are an expert AI document classifier for a Canadian immigration firm.
             I am providing {len(global_pages)} pages of documents uploaded by a client. 
@@ -1030,14 +1031,13 @@ elif app_mode == MENU_4:
                *CRITICAL MERGE RULE 2 (ID/License)*: For ID cards, Driver's Licences, and PR Cards, the page containing the primary bio-data (face photo, name, DOB) MUST be ordered as Page 1 (Front), and the backside as Page 2.
                *CRITICAL MERGE RULE 3 (Digital Photo)*: If you see a studio receipt/timestamp page along with a face photo, merge them into ONE single Digital Photo document.
                *CRITICAL MERGE RULE 4*: Merge ALL BANK STATEMENTS, PAYSTUBS, or UTILITY BILLS for the SAME client into a single group.
-            3. ROTATION CORRECTION (CRITICAL - CHAIN OF THOUGHT): 
-               - AI models often auto-read sideways text and forget to rotate the image. YOU MUST NOT DO THIS. 
-               - You MUST explicitly evaluate the physical orientation. If an ID card or Licence is taller than it is wide (portrait), but the text reads across the long edge, IT IS SIDEWAYS.
-               - Look at the text top or the person's head. 
-               - If it points LEFT -> output 90
-               - If it points RIGHT -> output 270
-               - If it points DOWN -> output 180
-               - If it points UP -> output 0
+            3. ROTATION CORRECTION (CRITICAL - TEXT UPRIGHT CHECK): 
+               - Look strictly at the English alphabets and numbers in the image. Are they standing upright (readable normally)?
+               - If the letters and numbers are lying on their left side -> it needs 90 degrees clockwise rotation. Output 90.
+               - If the letters and numbers are upside down -> it needs 180 degrees clockwise rotation. Output 180.
+               - If the letters and numbers are lying on their right side -> it needs 270 degrees clockwise rotation. Output 270.
+               - If the letters and numbers are perfectly upright -> Output 0.
+               *In `rotation_reasoning`, you MUST explicitly write: "The alphabets/numbers are [upright / sideways / upside down]..." before giving the degree.*
             4. For EACH grouped document, generate an EXACT filename using our strict CRM manual rules provided below.
 
             [STRICT CRM MANUAL FILENAME RULES]
@@ -1082,13 +1082,8 @@ elif app_mode == MENU_4:
               "page_details": [
                 {{
                   "page_index": 1,
-                  "rotation_reasoning": "The image is taller than it is wide, but the text runs sideways. The top of the text points to the left, so it needs 90 degrees.",
-                  "rotation_degrees": 90
-                }},
-                {{
-                  "page_index": 2,
-                  "rotation_reasoning": "The image is upright.",
-                  "rotation_degrees": 0
+                  "rotation_reasoning": "The English alphabets and numbers are lying on their left side, so it needs 90 degrees rotation to be upright.",
+                  "rotation_needed_clockwise": 90
                 }}
               ],
               "documents": [
@@ -1114,9 +1109,8 @@ elif app_mode == MENU_4:
                 clean_text = response.text.strip().replace('```json', '').replace('```', '')
                 data = json.loads(clean_text)
                 
-                # 새로운 랜드마크 기반 회전 정보 추출 (할루시네이션 완벽 방지)
                 page_details = data.get("page_details", [])
-                rotations = {str(item.get("page_index")): item.get("rotation_degrees", 0) for item in page_details}
+                rotations = {str(item.get("page_index")): item.get("rotation_needed_clockwise", 0) for item in page_details}
                 
                 raw_docs_info = data.get("documents", [])
                 
