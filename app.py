@@ -265,26 +265,17 @@ def is_minor(dob_str):
 def sanitize_and_unlock_pdf(pdf_bytes):
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        clean_doc = fitz.open()
-
+        
         for page in doc:
-            clean_doc.insert_pdf(doc, from_page=page.number, to_page=page.number)
-
-        for page in clean_doc:
             for widget in list(page.widgets()):
                 field_type_str = getattr(widget, "field_type_string", "").lower()
                 if "sig" in field_type_str or widget.field_type == fitz.PDF_WIDGET_TYPE_SIGNATURE:
-                    page.delete_widget(widget) 
-                else:
-                    if hasattr(widget, "field_flags"):
-                        widget.field_flags |= 1 
-                        widget.update()
-                        
-        clean_doc.set_metadata({}) 
+                    page.delete_widget(widget)
+        
+        doc.set_metadata({}) 
         
         out_buf = io.BytesIO()
-        clean_doc.save(out_buf, clean=True, deflate=True)
-        clean_doc.close()
+        doc.save(out_buf)
         doc.close()
         return out_buf.getvalue()
     except Exception:
@@ -525,7 +516,7 @@ def fill_consent_letter(template_bytes, data):
     return output_pdf
 
 # ==========================================
-# 5. CRM 스마트 압축 및 언락(Unlocking) 엔진
+# 5. CRM 스마트 압축 및 PDF 안전 병합 엔진
 # ==========================================
 def process_and_compress_file(file_bytes, mime_type, target_filename):
     is_jpeg = target_filename.lower().endswith(('.jpg', '.jpeg'))
@@ -955,7 +946,7 @@ elif app_mode == MENU_4:
                     draw.text((40, 40), disp_text, fill=(0, 0, 0))
                     
                     buf = io.BytesIO()
-                    img.save(buf, format="JPEG", quality=60)
+                    img.save(buf, format="JPEG", quality=75)
                     
                     global_pages.append({
                         "global_idx": page_counter,
@@ -976,7 +967,7 @@ elif app_mode == MENU_4:
                         pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2))
                         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                         buf = io.BytesIO()
-                        img.save(buf, format="JPEG", quality=60)
+                        img.save(buf, format="JPEG", quality=75)
                         
                         global_pages.append({
                             "global_idx": page_counter,
@@ -1001,7 +992,7 @@ elif app_mode == MENU_4:
                         ratio = 1200.0 / float(max_dim)
                         preview = preview.resize((int(preview.width * ratio), int(preview.height * ratio)), Image.Resampling.LANCZOS)
                     buf = io.BytesIO()
-                    preview.save(buf, format="JPEG", quality=60)
+                    preview.save(buf, format="JPEG", quality=75)
                     
                     global_pages.append({
                         "global_idx": page_counter,
@@ -1030,12 +1021,13 @@ elif app_mode == MENU_4:
                *CRITICAL MERGE RULE 2 (ID/License)*: For ID cards, Driver's Licences, and PR Cards, the page containing the primary bio-data (face photo, name, DOB) MUST be ordered as Page 1 (Front), and the backside as Page 2.
                *CRITICAL MERGE RULE 3 (Digital Photo)*: If you see a studio receipt/timestamp page along with a face photo, merge them into ONE single Digital Photo document.
                *CRITICAL MERGE RULE 4*: Merge ALL BANK STATEMENTS, PAYSTUBS, or UTILITY BILLS for the SAME client into a single group.
-            3. ROTATION CORRECTION (CRITICAL): Examine the document's visual orientation. You must output the exact degrees CLOCKWISE needed to make the document upright.
-               - "0": The document is already upright.
-               - "90": The document is lying on its left side (the top of the text/head is pointing LEFT). It needs 90 degrees clockwise rotation.
-               - "180": The document is completely upside down.
-               - "270": The document is lying on its right side (the top of the text/head is pointing RIGHT). It needs 270 degrees clockwise rotation.
-               *LANDMARK RULE*: Find the person's face or the main English title. The top of the head/letters is the TOP. If the TOP is pointing LEFT -> 90. If pointing RIGHT -> 270. If pointing DOWN -> 180.
+            3. ROTATION CORRECTION (CRITICAL - CHAIN OF THOUGHT): You must detect if the image/document is uploaded sideways or upside down.
+               - Look at the text (e.g., "Canada", "DRIVER'S LICENCE", names) and the person's face. Which way is the TOP of the text or the TOP of the head pointing?
+               - If the top points LEFT -> needs 90 degrees clockwise rotation.
+               - If the top points RIGHT -> needs 270 degrees clockwise rotation.
+               - If the top points DOWN -> needs 180 degrees clockwise rotation.
+               - If the top points UP -> needs 0 degrees (no rotation).
+               *You MUST write your observation in the `rotations_analysis` field BEFORE outputting the integer in `rotations`.*
             4. For EACH grouped document, generate an EXACT filename using our strict CRM manual rules provided below.
 
             [STRICT CRM MANUAL FILENAME RULES]
@@ -1077,16 +1069,20 @@ elif app_mode == MENU_4:
 
             Return ONLY a raw JSON object:
             {{
+              "rotations_analysis": {{
+                "1": "The top of the text 'Canada' points to the left, so it needs 90 degrees clockwise rotation.",
+                "2": "The text is upright, so it needs 0 degrees."
+              }},
               "rotations": {{
-                "1": 0,
-                "2": 180
+                "1": 90,
+                "2": 0
               }},
               "documents": [
                 {{
                   "client_name": "...",
                   "doc_category": "...",
                   "suggested_filename": "...",
-                  "page_indices": [2, 1],
+                  "page_indices": [1, 2],
                   "is_unclassified": false,
                   "is_resume": true
                 }}
@@ -1244,7 +1240,6 @@ elif app_mode == MENU_4:
                                 img = ImageOps.exif_transpose(img) 
                                 if img.mode != "RGB": img = img.convert("RGB")
                                 
-                                # 💡 다중 이미지 PDF 생성 전 사전 회전 보정
                                 if rot != 0: 
                                     img = img.rotate(-rot, expand=True) 
                                     
