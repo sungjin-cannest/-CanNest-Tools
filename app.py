@@ -1010,7 +1010,6 @@ elif app_mode == MENU_4:
 
             status_text.text("2. AI가 페이지별 문맥을 분석하여 연관 서류를 묶거나 나누는 중입니다...")
             
-            # 💡 수정된 프롬프트: Job Offer 카테고리(25) 및 LOE와 구분하는 강력한 규칙(RULE 3) 추가
             prompt = f"""
             You are an expert AI document classifier for a Canadian immigration firm.
             I am providing {len(global_pages)} pages of documents uploaded by a client. 
@@ -1018,10 +1017,11 @@ elif app_mode == MENU_4:
             Your task:
             1. Read ALL pages carefully.
             2. GROUP the pages that logically belong to the SAME document type for the SAME client. 
-               *CRITICAL MERGE RULE 1*: If you see multiple pages of BANK STATEMENTS, PAYSTUBS, or UTILITY BILLS for the SAME client (even if from different months), MERGE THEM ALL into a single group.
-               *CRITICAL MERGE RULE 2 (PASSPORT)*: Merge ALL PASSPORT PAGES (bio-data page, pages with entry stamps, and pages with TRV / Temporary Resident Visa stickers) for the same client into ONE SINGLE GROUP. DO NOT classify a TRV sticker attached inside a passport as a Visitor Record (VR). A Visitor Record is a separate standalone document.
-               *CRITICAL RULE 3 (LOE vs Job Offer)*: A "Job Offer" outlines proposed terms of employment and typically requires signatures from BOTH the employer and employee. A "Letter of Employment" (LOE) certifies past/current employment status (e.g., "This certifies that X has been employed...") and is usually signed ONLY by the employer. DO NOT mix them up.
-            3. ROTATION CHECK: Check if text is upside down or sideways (0, 90, 180, or 270).
+               *CRITICAL MERGE RULE 1 (Passport)*: If you see multiple passports for the same person, SEPARATE them into Old Passport and New Passport by checking the expiry dates. Any stamp or visa pages MUST be merged with the correct passport based on the stamp/visa dates matching the valid period of the passport. DO NOT classify a TRV sticker inside a passport as a Visitor Record.
+               *CRITICAL MERGE RULE 2 (ID/License)*: For ID cards, Driver's Licences, and PR Cards, the page containing the primary bio-data (face photo, name, DOB) MUST be ordered as Page 1 (Front), and the backside as Page 2.
+               *CRITICAL MERGE RULE 3 (Digital Photo)*: If you see a studio receipt/timestamp page along with a face photo, merge them into ONE single Digital Photo document.
+               *CRITICAL MERGE RULE 4*: Merge ALL BANK STATEMENTS, PAYSTUBS, or UTILITY BILLS for the SAME client into a single group.
+            3. ROTATION CHECK: Check if text (English/Korean/Barcodes) is upside down or sideways. Determine the correct rotation (0, 90, 180, 270) based on readability. Double-check for upside-down text.
             4. For EACH grouped document, generate an EXACT filename using our strict CRM manual rules provided below.
 
             [STRICT CRM MANUAL FILENAME RULES]
@@ -1032,49 +1032,49 @@ elif app_mode == MENU_4:
             Rule 5 (Capitalization): Every English word MUST be Title Case (Capitalize First Letter).
 
             [CATEGORIES & CMS SUFFIX RULES]
-            1. Passport (including all stamp/visa pages): {{Name}}_PP_{{ExpiryDate YYYY.MM.DD}}
+            1. Passport (including stamp/visa pages): {{Name}}_PP_{{ExpiryDate YYYY.MM.DD}}
             2. Work Permit / Study Permit / Visitor Record (IMM 1442) / Coop / PGWP / BOWP: {{Name}}_{{WP/SP/VR/Coop/PGWP/BOWP}}_{{ExpiryDate YYYY.MM.DD}}
             3. Questionnaire: {{Name}}_QA_{{Type}}_{{ReceivedDate YYYY.MM.DD}}
             4. Police Certificate: {{Name}}_Police Cert_{{CountryInEnglish}}
-            5. Employment Letter / Certificate of Employment / Confirmation of Employment: {{Name}}_LOE_{{CompanyInEnglish}} (CRITICAL: MUST use 'LOE', NEVER 'Employment Letter')
-            6. Paystub: {{Name}}_Paystub_{{CompanyInEnglish}}_{{StartDate-EndDate}}
-            7. Education Certificate / WES: {{Name}}_{{Diploma/Bachelor/Master/Highschool/Certificate/WES}}_{{SchoolName}} (If WES: {{Name}}_WES)
-            8. Certificate of Income / NOA (Notice of Assessment): {{Name}}_COI_{{Year YYYY}}
-            9. Official English Score: {{Name}}_{{IELTS/CELPIP}}_{{Date YYYY.MM.DD}}
-            10. Resume: {{Name}}_Resume_{{ReceivedDate YYYY.MM.DD}}
-            11. Medical Exam / Emedical: {{Name}}_Emedical_{{Year YYYY}}
-            12. Marriage Certificate: {{Name}}_Marriage Cert_{{IssueDate YYYY.MM.DD}}
-            13. Transcript: {{Name}}_Transcript_{{SchoolName}}
-            14. Bank Statement: {{Name}}_Bank Statement_{{Year YYYY}}
-            15. Family Certificate (가족관계증명서): {{Name}}_Family Cert_{{IssueDate YYYY.MM.DD}} (CRITICAL: MUST use 'Family Cert')
-            16. Basic Certificate (기본증명서): {{Name}}_Basic Cert
-            17. Birth Certificate (출생증명서): {{Name}}_Birth Cert
-            18. Travel Consent (한부모동의서): {{ChildName}}_Travel Consent
-            19. ECE License: {{Name}}_ECE License_{{Province}}
-            20. Letter of Acceptance (입학허가서): {{Name}}_LOA_{{SchoolName}}
-            21. Tuition Receipt: {{Name}}_Tuition Receipt_{{SchoolName}}
-            22. Confirmation of Enrollment: {{Name}}_Confirmation of Enrollment_{{SchoolName}}
-            23. Digital Photo / Passport Photo: {{Name}}_Digital Photo.jpg
+            5. Letter of Employment / Confirmation of Employment: {{Name}}_LOE_{{CompanyInEnglish}} (CRITICAL: MUST use 'LOE', NEVER 'Employment Letter'. ONLY for documents certifying past/current employment, usually 1 signature.)
+            6. Job Offer / Employment Agreement: {{Name}}_Job Offer_{{CompanyInEnglish}} (CRITICAL: Outlines future terms, usually has BOTH employer and employee signatures.)
+            7. Paystub: {{Name}}_Paystub_{{CompanyInEnglish}}_{{StartDate-EndDate}}
+            8. Education Certificate / WES: {{Name}}_{{Diploma/Bachelor/Master/Highschool/Certificate/WES}}_{{SchoolName}}
+            9. Certificate of Income / NOA: {{Name}}_COI_{{Year YYYY}}
+            10. Official English Score: {{Name}}_{{IELTS/CELPIP}}_{{Date YYYY.MM.DD}}
+            11. Resume: {{Name}}_Resume_{{ReceivedDate YYYY.MM.DD}} (Keep original .doc/.docx format if uploaded)
+            12. Medical Exam / Emedical: {{Name}}_Emedical_{{Year YYYY}}
+            13. Marriage Certificate: {{Name}}_Marriage Cert_{{IssueDate YYYY.MM.DD}}
+            14. Transcript: {{Name}}_Transcript_{{SchoolName}}
+            15. Bank Statement: {{Name}}_Bank Statement_{{Year YYYY}}
+            16. Family Certificate: {{Name}}_Family Cert_{{IssueDate YYYY.MM.DD}}
+            17. Basic Certificate: {{Name}}_Basic Cert
+            18. Birth Certificate: {{Name}}_Birth Cert
+            19. Travel Consent: {{ChildName}}_Travel Consent
+            20. Provincial ID / ECE Licence: {{Name}}_{{ID/ECE Licence}}_{{ExpiryDate YYYY.MM.DD}}
+            21. Driver's Licence: {{Name}}_Driver's Licence_{{ExpiryDate YYYY.MM.DD}} (Use 'Licence', not 'License')
+            22. Permanent Resident Card: {{Name}}_PR Card_{{ExpiryDate YYYY.MM.DD}}
+            23. Digital Photo / Passport Photo: {{Name}}_Digital Photo (Use .pdf if multiple pages, else .jpg)
             24. T4 (Statement of Remuneration Paid): {{Name}}_T4_{{EmployerNameInEnglish}}_{{Year YYYY}}
-            25. Job Offer (Employment Agreement): {{Name}}_Job Offer_{{CompanyInEnglish}}
 
             [CRITICAL FALLBACK RULE FOR UNKNOWN DOCUMENTS]
-            - Step 1: If a document does NOT match any of the 25 categories above, extract the official document title printed at the top of the document (in English, Title Case) and format as: {{Name}}_{{DocumentTitleInEnglish}}.
-            - Step 2: If the document title/type is completely ambiguous, unreadable, or unclassified, set suggested_filename as {{Name}}_Unclassified_확인필요.pdf and set "is_unclassified": true.
+            - Step 1: If a document does NOT match any categories above, extract the official document title printed at the top of the document (in English, Title Case) and format as: {{Name}}_{{DocumentTitleInEnglish}}.
+            - Step 2: If the document title/type is completely ambiguous, set suggested_filename as {{Name}}_Unclassified_확인필요.pdf and set "is_unclassified": true.
 
             Return ONLY a raw JSON object:
             {{
               "rotations": {{
                 "1": 0,
-                "2": 90
+                "2": 180
               }},
               "documents": [
                 {{
                   "client_name": "...",
                   "doc_category": "...",
                   "suggested_filename": "...",
-                  "page_indices": [1, 2, 3],
-                  "is_unclassified": false
+                  "page_indices": [2, 1],
+                  "is_unclassified": false,
+                  "is_resume": true
                 }}
               ]
             }}
@@ -1099,8 +1099,8 @@ elif app_mode == MENU_4:
                     
                     existing = None
                     for item in docs_info:
-                        name1 = item.get("suggested_filename", "").replace(".pdf", "").replace(".jpg", "").strip()
-                        name2 = d.get("suggested_filename", "").replace(".pdf", "").replace(".jpg", "").strip()
+                        name1 = item.get("suggested_filename", "").replace(".pdf", "").replace(".jpg", "").replace(".docx", "").replace(".doc", "").strip()
+                        name2 = d.get("suggested_filename", "").replace(".pdf", "").replace(".jpg", "").replace(".docx", "").replace(".doc", "").strip()
                         if name1 == name2:
                             existing = item
                             break
@@ -1110,7 +1110,10 @@ elif app_mode == MENU_4:
                                 break
                                 
                     if existing:
-                        existing["page_indices"] = sorted(list(set(existing.get("page_indices", []) + d.get("page_indices", []))))
+                        new_indices = d.get("page_indices", [])
+                        for ni in new_indices:
+                            if ni not in existing["page_indices"]:
+                                existing["page_indices"].append(ni)
                     else:
                         docs_info.append(d)
                         
@@ -1130,13 +1133,8 @@ elif app_mode == MENU_4:
                 
                 final_name = doc_info.get("suggested_filename", f"Document_{idx+1}")
                 is_unclassified = doc_info.get("is_unclassified", False) or "확인필요" in final_name
+                is_resume = doc_info.get("is_resume", False) or "resume" in final_name.lower()
                 
-                if not (final_name.lower().endswith(".pdf") or final_name.lower().endswith(".jpg") or final_name.lower().endswith(".jpeg")):
-                    if "photo" in final_name.lower() and len(indices) == 1:
-                        final_name += ".jpg"
-                    else:
-                        final_name += ".pdf"
-                        
                 source_names = []
                 group_pages = []
                 for p_idx in indices:
@@ -1148,8 +1146,43 @@ elif app_mode == MENU_4:
 
                 unique_src_files = list(set([p["original_name"] for p in group_pages]))
                 is_all_from_same_pdf = (len(unique_src_files) == 1 and "pdf" in group_pages[0]["mime_type"].lower())
+                is_all_from_same_word = (len(unique_src_files) == 1 and group_pages[0]["is_word"])
                 needs_rotation = any(int(rotations.get(str(p["global_idx"]), 0)) != 0 for p in group_pages)
                 
+                # 이력서(Resume) 원본 워드파일 보존 로직
+                if is_resume and is_all_from_same_word:
+                    base_name, _ = os.path.splitext(final_name)
+                    orig_ext = os.path.splitext(group_pages[0]["original_name"])[1]
+                    final_name = base_name + orig_ext
+                    
+                    comp_bytes = group_pages[0]["file_bytes"]
+                    out_mime = group_pages[0]["mime_type"]
+                    orig_kb = len(comp_bytes) / 1024
+                    comp_kb = orig_kb
+                    
+                    src_display = ", ".join(source_names)
+                    if len(src_display) > 30: src_display = src_display[:27] + "..."
+                    
+                    results.append({
+                        "original_name": f"분석결과 ({src_display})",
+                        "suggested_filename": final_name,
+                        "category": doc_info.get("doc_category", "기타"),
+                        "client_name": doc_info.get("client_name", ""),
+                        "mime": out_mime,
+                        "orig_kb": orig_kb,
+                        "comp_kb": comp_kb,
+                        "bytes": comp_bytes,
+                        "is_unclassified": is_unclassified
+                    })
+                    progress_bar.progress(min((idx + 1) * progress_step, 1.0))
+                    continue
+
+                if not (final_name.lower().endswith(".pdf") or final_name.lower().endswith(".jpg") or final_name.lower().endswith(".jpeg") or final_name.lower().endswith(".doc") or final_name.lower().endswith(".docx")):
+                    if "photo" in final_name.lower() and len(indices) == 1:
+                        final_name += ".jpg"
+                    else:
+                        final_name += ".pdf"
+                        
                 try:
                     if is_all_from_same_pdf:
                         src_doc = fitz.open(stream=group_pages[0]["file_bytes"], filetype="pdf")
@@ -1169,7 +1202,7 @@ elif app_mode == MENU_4:
                                         page.set_rotation((page.rotation + rot) % 360)
                                 except: pass
                             merged_pdf_bytes_io = io.BytesIO()
-                            src_doc.save(merged_pdf_bytes_io, deflate=True) 
+                            src_doc.save(merged_pdf_bytes_io) 
                             src_doc.close()
                             merged_pdf_bytes = merged_pdf_bytes_io.getvalue()
                             final_processed_bytes = sanitize_and_unlock_pdf(merged_pdf_bytes)
