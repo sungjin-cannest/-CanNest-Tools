@@ -265,17 +265,26 @@ def is_minor(dob_str):
 def sanitize_and_unlock_pdf(pdf_bytes):
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        
+        clean_doc = fitz.open()
+
         for page in doc:
+            clean_doc.insert_pdf(doc, from_page=page.number, to_page=page.number)
+
+        for page in clean_doc:
             for widget in list(page.widgets()):
                 field_type_str = getattr(widget, "field_type_string", "").lower()
                 if "sig" in field_type_str or widget.field_type == fitz.PDF_WIDGET_TYPE_SIGNATURE:
-                    page.delete_widget(widget)
-        
-        doc.set_metadata({}) 
+                    page.delete_widget(widget) 
+                else:
+                    if hasattr(widget, "field_flags"):
+                        widget.field_flags |= 1 
+                        widget.update()
+                        
+        clean_doc.set_metadata({}) 
         
         out_buf = io.BytesIO()
-        doc.save(out_buf)
+        clean_doc.save(out_buf, clean=True, deflate=True)
+        clean_doc.close()
         doc.close()
         return out_buf.getvalue()
     except Exception:
@@ -946,7 +955,7 @@ elif app_mode == MENU_4:
                     draw.text((40, 40), disp_text, fill=(0, 0, 0))
                     
                     buf = io.BytesIO()
-                    img.save(buf, format="JPEG", quality=75)
+                    img.save(buf, format="JPEG", quality=60)
                     
                     global_pages.append({
                         "global_idx": page_counter,
@@ -967,7 +976,7 @@ elif app_mode == MENU_4:
                         pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2))
                         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                         buf = io.BytesIO()
-                        img.save(buf, format="JPEG", quality=75)
+                        img.save(buf, format="JPEG", quality=60)
                         
                         global_pages.append({
                             "global_idx": page_counter,
@@ -992,7 +1001,7 @@ elif app_mode == MENU_4:
                         ratio = 1200.0 / float(max_dim)
                         preview = preview.resize((int(preview.width * ratio), int(preview.height * ratio)), Image.Resampling.LANCZOS)
                     buf = io.BytesIO()
-                    preview.save(buf, format="JPEG", quality=75)
+                    preview.save(buf, format="JPEG", quality=60)
                     
                     global_pages.append({
                         "global_idx": page_counter,
@@ -1021,13 +1030,14 @@ elif app_mode == MENU_4:
                *CRITICAL MERGE RULE 2 (ID/License)*: For ID cards, Driver's Licences, and PR Cards, the page containing the primary bio-data (face photo, name, DOB) MUST be ordered as Page 1 (Front), and the backside as Page 2.
                *CRITICAL MERGE RULE 3 (Digital Photo)*: If you see a studio receipt/timestamp page along with a face photo, merge them into ONE single Digital Photo document.
                *CRITICAL MERGE RULE 4*: Merge ALL BANK STATEMENTS, PAYSTUBS, or UTILITY BILLS for the SAME client into a single group.
-            3. ROTATION CORRECTION (CRITICAL - CHAIN OF THOUGHT): You must detect if the image/document is uploaded sideways or upside down.
-               - Look at the text (e.g., "Canada", "DRIVER'S LICENCE", names) and the person's face. Which way is the TOP of the text or the TOP of the head pointing?
-               - If the top points LEFT -> needs 90 degrees clockwise rotation.
-               - If the top points RIGHT -> needs 270 degrees clockwise rotation.
-               - If the top points DOWN -> needs 180 degrees clockwise rotation.
-               - If the top points UP -> needs 0 degrees (no rotation).
-               *You MUST write your observation in the `rotations_analysis` field BEFORE outputting the integer in `rotations`.*
+            3. ROTATION CORRECTION (CRITICAL - CHAIN OF THOUGHT): 
+               - AI models often auto-read sideways text and forget to rotate the image. YOU MUST NOT DO THIS. 
+               - You MUST explicitly evaluate the physical orientation. If an ID card or Licence is taller than it is wide (portrait), but the text reads across the long edge, IT IS SIDEWAYS.
+               - Look at the text top or the person's head. 
+               - If it points LEFT -> output 90
+               - If it points RIGHT -> output 270
+               - If it points DOWN -> output 180
+               - If it points UP -> output 0
             4. For EACH grouped document, generate an EXACT filename using our strict CRM manual rules provided below.
 
             [STRICT CRM MANUAL FILENAME RULES]
@@ -1067,16 +1077,20 @@ elif app_mode == MENU_4:
             - Step 1: If a document does NOT match any categories above, extract the official document title printed at the top of the document (in English, Title Case) and format as: {{Name}}_{{DocumentTitleInEnglish}}.
             - Step 2: If the document title/type is completely ambiguous, set suggested_filename as {{Name}}_Unclassified_확인필요.pdf and set "is_unclassified": true.
 
-            Return ONLY a raw JSON object:
+            Return ONLY a raw JSON object formatted EXACTLY like this:
             {{
-              "rotations_analysis": {{
-                "1": "The top of the text 'Canada' points to the left, so it needs 90 degrees clockwise rotation.",
-                "2": "The text is upright, so it needs 0 degrees."
-              }},
-              "rotations": {{
-                "1": 90,
-                "2": 0
-              }},
+              "page_details": [
+                {{
+                  "page_index": 1,
+                  "rotation_reasoning": "The image is taller than it is wide, but the text runs sideways. The top of the text points to the left, so it needs 90 degrees.",
+                  "rotation_degrees": 90
+                }},
+                {{
+                  "page_index": 2,
+                  "rotation_reasoning": "The image is upright.",
+                  "rotation_degrees": 0
+                }}
+              ],
               "documents": [
                 {{
                   "client_name": "...",
@@ -1084,7 +1098,7 @@ elif app_mode == MENU_4:
                   "suggested_filename": "...",
                   "page_indices": [1, 2],
                   "is_unclassified": false,
-                  "is_resume": true
+                  "is_resume": false
                 }}
               ]
             }}
@@ -1099,8 +1113,12 @@ elif app_mode == MENU_4:
                 response = safe_generate_content(contents)
                 clean_text = response.text.strip().replace('```json', '').replace('```', '')
                 data = json.loads(clean_text)
+                
+                # 새로운 랜드마크 기반 회전 정보 추출 (할루시네이션 완벽 방지)
+                page_details = data.get("page_details", [])
+                rotations = {str(item.get("page_index")): item.get("rotation_degrees", 0) for item in page_details}
+                
                 raw_docs_info = data.get("documents", [])
-                rotations = data.get("rotations", {})
                 
                 docs_info = []
                 for d in raw_docs_info:
