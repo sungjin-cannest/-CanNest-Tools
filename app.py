@@ -1,843 +1,1396 @@
-"""
-CanNest 잡오퍼 DOCX 생성기 (v10)
-----------------------------------
-v9 대비 변경점:
-  1) 최종 다운로드 파일에서 이메일 찌꺼기 제거: 다운로드 직전 이메일 문자열에 'protected'가 포함된 경우 강제 빈칸("") 처리.
-  2) 기존 파일 스캔 및 클렌징: 업로드된 기존 DOCX 내부에 이미 '[email protected]' 텍스트가 박혀있을 경우, 진짜 이메일로 덮어쓰거나 흔적 없이 삭제하는 클렌징 로직 추가.
-"""
-
 import streamlit as st
 
-st.set_page_config(page_title="CanNest 잡오퍼 DOCX 생성기 (v10)", layout="wide")
+# 📌 가장 먼저 실행되어야 하는 Streamlit 페이지 설정
+st.set_page_config(page_title="CanNest 통합 업무 시스템", layout="wide")
 
-import os
-import io
-import re
-import copy
-import json
-import socket
-import ipaddress
-import datetime
-import urllib.request
-import urllib.parse
-import urllib.error
-
+import google.generativeai as genai
 import fitz  # PyMuPDF
-from PIL import Image, ImageOps
-import pillow_heif
-import pandas as pd
+from PIL import Image, ImageOps, ImageDraw, ImageFont
+import pillow_heif  # HEIC 지원 라이브러리
+import io
+import zipfile
+import json
+import os
+import datetime
+import time
+import uuid
+import re 
+from concurrent.futures import ThreadPoolExecutor
 
-import docx
-from docx.oxml.ns import qn
+# DOCX 및 DOC 파일 파싱 지원
+try:
+    import docx
+except ImportError:
+    pass
 
-# 신규 Gemini SDK
-from google import genai
-from google.genai import types
-
+# HEIC 이미지 지원 등록 및 고해상도 제한 해제
 pillow_heif.register_heif_opener()
 Image.MAX_IMAGE_PIXELS = None
 
-TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "Job_Offer_Template.docx")
-
 # ==========================================
-# 0. 인증
+# 0. Secrets 안전 검사 및 보안 비밀번호 설정
 # ==========================================
 if "APP_PASSWORD" not in st.secrets or "GEMINI_API_KEY" not in st.secrets:
     st.error("⚠️ Streamlit Cloud의 Secrets 설정이 필요합니다.")
+    st.info("우측 하단 [Manage app] -> [Settings] -> [Secrets]에 GEMINI_API_KEY와 APP_PASSWORD를 입력해 주세요.")
     st.stop()
 
 def check_password():
-    if st.session_state.get("password_correct", False):
-        return True
-    st.title("🔒 CanNest 잡오퍼 생성기")
-    pwd = st.text_input("접속 비밀번호를 입력하세요", type="password")
-    if st.button("확인"):
-        if pwd == st.secrets["APP_PASSWORD"]:
+    def password_entered():
+        if st.session_state["password"] == st.secrets["APP_PASSWORD"]:
             st.session_state["password_correct"] = True
-            st.rerun()
+            del st.session_state["password"]
         else:
-            st.error("비밀번호가 틀렸습니다.")
-    return False
+            st.session_state["password_correct"] = False
+
+    if "password_correct" not in st.session_state:
+        st.title("🔒 CanNest 통합 업무 시스템")
+        st.text_input("접속 비밀번호를 입력하세요", type="password", on_change=password_entered, key="password")
+        return False
+    elif not st.session_state["password_correct"]:
+        st.title("🔒 CanNest 통합 업무 시스템")
+        st.text_input("접속 비밀번호를 입력하세요", type="password", on_change=password_entered, key="password")
+        st.error("비밀번호가 틀렸습니다.")
+        return False
+    return True
 
 if not check_password():
     st.stop()
 
 # ==========================================
-# 1. Gemini 클라이언트
+# 1. API 키 및 모델 설정
 # ==========================================
-_client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+genai.configure(api_key=GEMINI_API_KEY)
 
-MODEL_CANDIDATES = [
-    "gemini-2.5-flash",
-    "gemini-3.7-flash",
-    "gemini-2.5-pro",
-]
-
-def call_gemini(parts, response_schema=None):
-    contents = []
-    for p in parts:
-        if isinstance(p, str):
-            contents.append(p)
-        elif isinstance(p, Image.Image):
-            buf = io.BytesIO()
-            p.save(buf, format="JPEG")
-            contents.append(types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"))
-        else:
-            contents.append(p)
-
-    config = {}
-    if response_schema is not None:
-        config["response_mime_type"] = "application/json"
-        config["response_schema"] = response_schema
-
+def safe_generate_content(contents):
+    candidate_models = ['gemini-3.6-flash']
     last_error = None
-    for model_name in MODEL_CANDIDATES:
+    for model_name in candidate_models:
         try:
-            response = _client.models.generate_content(
-                model=model_name, contents=contents, config=config or None
-            )
+            mod = genai.GenerativeModel(model_name)
+            response = mod.generate_content(contents)
             return response
         except Exception as e:
             last_error = e
-            continue
-    raise Exception(f"Gemini API 호출 실패 (모든 모델 시도함): {last_error}")
+            if "404" in str(e) or "not found" in str(e).lower():
+                continue
+            else:
+                raise e
+    raise last_error
 
-def call_gemini_json(parts, response_schema):
+# ==========================================
+# 2. MS Word (.doc / .docx) 텍스트 추출 엔진
+# ==========================================
+def read_word_document_text(file_bytes, file_name=""):
     try:
-        response = call_gemini(parts, response_schema=response_schema)
-        return json.loads(response.text)
-    except Exception as e:
-        st.warning(f"AI 분석 중 경고: {e}")
-        return None
-
-PASSPORT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "surname": {"type": "string"},
-        "given_name": {"type": "string"},
-        "dob": {"type": "string", "description": "YYYY-MM-DD"},
-        "uci": {"type": "string"},
-    },
-    "required": ["surname", "given_name"],
-}
-
-JOB_POSTING_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "employer_name": {"type": "string"},
-        "job_title": {"type": "string"},
-        "noc_code": {"type": "string"},
-        "wage": {"type": "string"},
-        "hours": {"type": "string"},
-        "job_location": {"type": "string"},
-        "employer_address": {"type": "string"},
-        "employer_phone": {"type": "string"},
-        "employer_email": {"type": "string"},
-        "benefits": {"type": "string"},
-        "job_duties": {"type": "array", "items": {"type": "string"}},
-    },
-}
-
-EXISTING_OFFER_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "client_name": {"type": "string"},
-        "client_dob": {"type": "string"},
-        "employer_name": {"type": "string"},
-        "signer_name": {"type": "string"},
-        "signer_title": {"type": "string"},
-        "employer_address": {"type": "string"},
-        "employer_phone": {"type": "string"},
-        "employer_email": {"type": "string"},
-        "job_title": {"type": "string"},
-        "wage": {"type": "string"},
-        "hours": {"type": "string"},
-        "job_location": {"type": "string"},
-        "benefits": {"type": "string"},
-        "job_duties": {"type": "array", "items": {"type": "string"}},
-    },
-}
+        doc_obj = docx.Document(io.BytesIO(file_bytes))
+        text_list = [p.text for p in doc_obj.paragraphs if p.text.strip()]
+        for table in doc_obj.tables:
+            for row in table.rows:
+                row_txt = " | ".join([cell.text.strip() for cell in row.cells if cell.text.strip()])
+                if row_txt:
+                    text_list.append(row_txt)
+        full_text = "\n".join(text_list)
+        if len(full_text.strip()) > 10:
+            return full_text
+    except Exception:
+        pass
+        
+    try:
+        raw_bytes = file_bytes
+        text_utf16 = raw_bytes.decode('utf-16le', errors='ignore')
+        cleaned = re.sub(r'[^\w\s\.,\-\:\/@\(\)\?\!\'\"]+', ' ', text_utf16)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        if len(cleaned) > 30:
+            return cleaned
+    except Exception:
+        pass
+        
+    try:
+        text_ascii = file_bytes.decode('latin1', errors='ignore')
+        cleaned = re.sub(r'[^\w\s\.,\-\:\/@\(\)\?\!\'\"]+', ' ', text_ascii)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        return cleaned
+    except Exception:
+        return ""
 
 # ==========================================
-# 2. 이미지 / 파일 헬퍼
+# 3. 공통 캐싱 및 스마트 글자 크기 조절 함수
 # ==========================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_pdf_bytes_cached(file_path):
+    if os.path.exists(file_path):
+        with open(file_path, "rb") as f:
+            return f.read()
+    return None
+
+def get_preloaded_file_bytes(file_names):
+    for fn in file_names:
+        data = load_pdf_bytes_cached(fn)
+        if data:
+            return data
+    return None
+
 def process_uploaded_file_to_image(file_obj):
-    if file_obj.type == "application/pdf":
-        doc = fitz.open(stream=file_obj.read(), filetype="pdf")
+    file_bytes = file_obj.getvalue()
+    fname = file_obj.name.lower()
+    
+    if fname.endswith(('.doc', '.docx')):
+        text = read_word_document_text(file_bytes, file_obj.name)
+        img = Image.new('RGB', (800, 1000), color=(255, 255, 255))
+        draw = ImageDraw.Draw(img)
+        display_str = f"[Word Document: {file_obj.name}]\n\n" + (text[:800] if text else "Word Document Content")
+        draw.text((40, 40), display_str, fill=(0, 0, 0))
+        return img
+    elif file_obj.type == "application/pdf" or fname.endswith('.pdf'):
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
         page = doc.load_page(0)
         pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     else:
-        img = Image.open(file_obj)
+        img = Image.open(io.BytesIO(file_bytes))
         img = ImageOps.exif_transpose(img)
         if img.mode != "RGB":
             img = img.convert("RGB")
-
+    
     max_dim = max(img.width, img.height)
     if max_dim > 1800:
         ratio = 1800.0 / float(max_dim)
-        img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.Resampling.LANCZOS)
-
+        new_size = (int(img.width * ratio), int(img.height * ratio))
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+    
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=75)
     buf.seek(0)
     return Image.open(buf)
 
 def format_full_name(surname, given_name):
-    s = str(surname).strip() if surname else ""
-    g = str(given_name).strip() if given_name else ""
+    s = surname.strip()
+    g = given_name.strip()
     if not s and not g: return ""
-    full_name = f"{g} {s}".strip()
-    return full_name.title()
+    if not s: return g
+    if not g: return s
+    return f"{g} {s}"
+
+# 💡 Courier New 폰트 무조건 적용 함수
+def set_smart_widget_value(widget, value, default_fontsize=11, min_fontsize=5.5):
+    val_str = str(value) if value is not None else ""
+    widget.field_value = val_str
+    
+    if hasattr(widget, "field_flags") and widget.field_flags:
+        widget.field_flags &= ~1 
+        
+    try:
+        # 무조건 Courier New로 지정
+        widget.text_font = "CourierNew"
+    except:
+        try:
+            widget.text_font = "Cour"
+        except:
+            pass
+        
+    if val_str and hasattr(widget, "rect"):
+        box_width = widget.rect.width - 4 
+        if box_width > 0:
+            try:
+                # Courier New 고정폭 메트릭 기반 길이 계산
+                font = fitz.Font("courier") 
+                len_at_default = font.text_length(val_str, fontsize=default_fontsize)
+                if len_at_default > box_width:
+                    len_at_1 = font.text_length(val_str, fontsize=1)
+                    if len_at_1 > 0:
+                        scaled_size = box_width / len_at_1
+                        widget.text_fontsize = max(min_fontsize, min(default_fontsize, scaled_size))
+                    else:
+                        widget.text_fontsize = default_fontsize
+                else:
+                    widget.text_fontsize = default_fontsize
+            except Exception:
+                widget.text_fontsize = default_fontsize
+        else:
+            widget.text_fontsize = default_fontsize
+    else:
+        widget.text_fontsize = default_fontsize
+        
+    widget.update()
 
 def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
     ext = os.path.splitext(file_name)[1].lower() if file_name else ""
-    if "word" in mime_type.lower() or "doc" in mime_type.lower() or ext in [".doc", ".docx"]:
-        try:
-            doc_obj = docx.Document(io.BytesIO(file_bytes))
-            text_list = [p.text for p in doc_obj.paragraphs if p.text.strip()]
-            for table in doc_obj.tables:
-                for row in table.rows:
-                    row_txt = " | ".join([c.text.strip() for c in row.cells if c.text.strip()])
-                    if row_txt: text_list.append(row_txt)
-            full_text = "\n".join(text_list)
-            if full_text.strip():
-                return [f"\n--- [Word Document: {file_name}] ---\n{full_text[:20000]}\n"]
-        except Exception:
-            pass
-
-    if "pdf" in mime_type.lower() or ext == ".pdf":
+    if "word" in mime_type.lower() or "doc" in mime_type.lower() or ext in ['.doc', '.docx']:
+        word_text = read_word_document_text(file_bytes, file_name)
+        if word_text:
+            return [f"\n--- [Word Document: {file_name}] ---\n{word_text[:20000]}\n"]
+            
+    if "pdf" in mime_type.lower():
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
-            text = "".join(page.get_text("text") + "\n" for page in doc)
+            text = ""
+            for page in doc:
+                text += page.get_text("text") + "\n"
+            
             if len(text.strip()) > 100:
                 return [f"\n--- [Document: {file_name}] ---\n{text[:20000]}\n"]
-        except Exception:
+            else:
+                images = []
+                for page_num in range(min(len(doc), 10)):
+                    page = doc.load_page(page_num)
+                    pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=70)
+                    buf.seek(0)
+                    images.append({"mime_type": "image/jpeg", "data": buf.getvalue()})
+                return images
+        except:
             pass
-    return [types.Part.from_bytes(data=file_bytes, mime_type=mime_type)]
+    return [{"mime_type": mime_type, "data": file_bytes}]
 
-def extract_imm5476_info(image):
-    prompt = "Analyze this identity document and extract the requested fields exactly."
-    return call_gemini_json([prompt, image], PASSPORT_SCHEMA)
+def batch_process_client_files(client_files):
+    def worker(f):
+        mime = f.type if f.type else "application/pdf"
+        return prepare_document_for_gemini(f.getvalue(), mime, f.name)
 
-def parse_existing_job_offer(file_bytes, mime_type, filename="Existing_Job_Offer.pdf"):
-    prompt = "Analyze this existing Job Offer document and extract the requested fields exactly."
-    contents = prepare_document_for_gemini(file_bytes, mime_type, filename)
-    return call_gemini_json([prompt] + contents, EXISTING_OFFER_SCHEMA) or {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(worker, client_files))
 
-# ==========================================
-# 3. URL 보안 강화 fetch + Cloudflare 디코딩
-# ==========================================
-def _is_hostname_safe(hostname: str) -> bool:
-    try: infos = socket.getaddrinfo(hostname, None)
-    except socket.gaierror: return False
-    if not infos: return False
-    for info in infos:
-        ip_str = info[4][0]
-        try: ip = ipaddress.ip_address(ip_str)
-        except ValueError: return False
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
-            return False
-    return True
+    flat_contents = []
+    for res in results:
+        flat_contents.extend(res)
+    return flat_contents
 
-class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        parsed = urllib.parse.urlparse(newurl)
-        if parsed.scheme not in ("http", "https") or not parsed.hostname or not _is_hostname_safe(parsed.hostname):
-            raise urllib.error.URLError(f"차단된 리다이렉트 대상: {newurl}")
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-def _decode_cf_email(cfemail_hex: str) -> str:
+def is_minor(dob_str):
     try:
-        r = int(cfemail_hex[:2], 16)
-        return "".join(chr(int(cfemail_hex[i:i + 2], 16) ^ r) for i in range(2, len(cfemail_hex), 2))
-    except Exception:
-        return ""
-
-_CF_EMAIL_RE = re.compile(r'data-cfemail="([0-9a-fA-F]+)"[^>]*>\s*\[email\s*protected\]\s*<', re.IGNORECASE)
-
-def _decloak_cloudflare_emails(html: str) -> str:
-    return _CF_EMAIL_RE.sub(lambda m: _decode_cf_email(m.group(1)) + "<", html)
-
-def fetch_url_content_safe(url: str, timeout: int = 12, max_bytes: int = 2_000_000):
-    target_url = url.strip()
-    if not re.match(r"^https?://", target_url, re.IGNORECASE): target_url = "https://" + target_url
-    parsed = urllib.parse.urlparse(target_url)
-    if parsed.scheme not in ("http", "https"): return "", "허용되지 않는 URL 스킴입니다."
-    if not parsed.hostname or not _is_hostname_safe(parsed.hostname): return "", "내부망/사설 IP로 확인되어 요청을 차단했습니다."
-
-    opener = urllib.request.build_opener(_SafeRedirectHandler)
-    req = urllib.request.Request(target_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"})
-    try:
-        with opener.open(req, timeout=timeout) as resp:
-            raw = resp.read(max_bytes + 1)
-            if len(raw) > max_bytes: raw = raw[:max_bytes]
-            html = raw.decode("utf-8", errors="ignore")
-    except Exception as e: return "", f"URL 요청 실패: {e}"
-
-    html = _decloak_cloudflare_emails(html)
-    text = re.sub(r"<script\b[^<]*(?:(?!</script>)<[^<]*)*</script>", "", html, flags=re.IGNORECASE)
-    text = re.sub(r"<style\b[^<]*(?:(?!</style>)<[^<]*)*</style>", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[:15000], None
-
-# ==========================================
-# 4. 전체 13개 주/준주 데이터
-# ==========================================
-BACKUP_WAGE_AS_OF = "2026-01"
-PROVINCES = {
-    "BC": {"names": ["British Columbia", "BC"], "backup_wage": 38.40, "overtime": "Overtime will be paid in accordance with BC employment standards legislation:\n1.5 times regular wage for hours over 8/day or 40/week; and\n2 times regular wage for hours over 12/day."},
-    "AB": {"names": ["Alberta", "AB"], "backup_wage": 37.50, "overtime": "Overtime will be paid in accordance with AB employment standards legislation:\n1.5 times regular rate of pay for hours in excess of 8 hours/day or 44 hours/week."},
-    "ON": {"names": ["Ontario", "ON"], "backup_wage": 36.92, "overtime": "Overtime will be paid in accordance with ON employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 44 hours per week."},
-    "SK": {"names": ["Saskatchewan", "SK"], "backup_wage": 34.62, "overtime": "Overtime will be paid in accordance with SK employment standards legislation:\n1.5 times regular rate of pay for hours over 8 hours/day or 40 hours/week."},
-    "MB": {"names": ["Manitoba", "MB"], "backup_wage": 31.33, "overtime": "Overtime will be paid in accordance with MB employment standards legislation:\n1.5 times regular rate of pay for hours over 8 hours/day or 40 hours/week."},
-    "NB": {"names": ["New Brunswick", "NB"], "backup_wage": 31.73, "overtime": "Overtime will be paid in accordance with NB employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 44 hours per week."},
-    "NS": {"names": ["Nova Scotia", "NS"], "backup_wage": 31.96, "overtime": "Overtime will be paid in accordance with NS employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 48 hours per week."},
-    "PE": {"names": ["Prince Edward Island"], "backup_wage": 31.20, "overtime": "Overtime will be paid in accordance with PE employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 48 hours per week."},
-    "NL": {"names": ["Newfoundland and Labrador", "NL"], "backup_wage": 33.60, "overtime": "Overtime will be paid in accordance with NL employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 40 hours per week."},
-    "YT": {"names": ["Yukon", "YT"], "backup_wage": 45.60, "overtime": "Overtime will be paid in accordance with YT employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 8 hours/day or 40 hours/week."},
-    "NT": {"names": ["Northwest Territories", "NT"], "backup_wage": 48.00, "overtime": "Overtime will be paid in accordance with NT employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 8 hours/day or 40 hours/week."},
-    "NU": {"names": ["Nunavut", "NU"], "backup_wage": 45.00, "overtime": "Overtime will be paid in accordance with NU employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 8 hours/day or 40 hours/week."},
-    "QC": {"names": ["Quebec", "Québec", "QC"], "backup_wage": 36.00, "overtime": "Overtime will be paid in accordance with QC employment standards legislation:\n1.5 times regular rate of pay for hours worked in excess of 40 hours per week."},
-}
-BACKUP_WAGES = {code: v["backup_wage"] for code, v in PROVINCES.items()}
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_live_esdc_median_wages():
-    url = "https://www.canada.ca/en/employment-social-development/services/foreign-workers/median-wage.html"
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-        tables = pd.read_html(io.StringIO(html))
-        wages = {}
-        name_to_code = {n.upper(): code for code, v in PROVINCES.items() for n in v["names"]}
-        for table in tables:
-            table.columns = [str(c) for c in table.columns]
-            for _, row in table.iterrows():
-                row_text = " ".join(str(x) for x in row.values)
-                for name_upper, code in name_to_code.items():
-                    if name_upper in row_text.upper():
-                        dollar_matches = re.findall(r"\$\s*(\d+(?:\.\d+)?)", row_text)
-                        if dollar_matches: wages[code] = float(dollar_matches[-1])
-        if wages: return wages, "Canada.ca ESDC 실시간 데이터", datetime.date.today().strftime("%Y-%m-%d")
-    except Exception: pass
-    return dict(BACKUP_WAGES), "ESDC 백업 기준표 (네트워크 조회 실패)", BACKUP_WAGE_AS_OF
-
-def detect_province(address_text: str) -> str:
-    addr_upper = str(address_text).upper()
-    for code, v in PROVINCES.items():
-        for name in v["names"]:
-            if re.search(r"\b" + re.escape(name.upper()) + r"\b", addr_upper): return code
-    return "BC"
-
-def calculate_employment_term(wage_val, address_text):
-    try:
-        wage_match = re.search(r"(\d+(?:\.\d+)?)", str(wage_val))
-        wage = float(wage_match.group(1)) if wage_match else 0.0
-        detected_prov = detect_province(address_text)
-        live_wages, source_tag, as_of = get_live_esdc_median_wages()
-        median_wage = live_wages.get(detected_prov, BACKUP_WAGES[detected_prov])
-        stream = "High-Wage Stream (3년 오퍼)" if wage >= median_wage else "Low-Wage Stream (1년 오퍼)"
-        term = "3-year" if wage >= median_wage else "1-year"
-        return term, median_wage, f"{detected_prov} 중위임금 ${median_wage:.2f} ({source_tag}, 기준일 {as_of}) → {stream}", detected_prov
-    except Exception:
-        return "3-year", 38.40, "기본값 적용 (계산 실패)", "BC"
-
-def get_provincial_overtime_clause(address_text): return PROVINCES[detect_province(address_text)]["overtime"]
-def get_provincial_overtime_bullets(address_text):
-    lines = [l.strip() for l in PROVINCES[detect_province(address_text)]["overtime"].split("\n") if l.strip()]
-    if lines and lines[0].lower().startswith("overtime will be paid"): lines = lines[1:]
-    return lines
-
-# ==========================================
-# 5. DOCX 엔진
-# ==========================================
-def _iter_paragraphs_in_cell(cell):
-    for p in cell.paragraphs: yield p
-    for table in cell.tables:
-        for row in table.rows:
-            for c in row.cells: yield from _iter_paragraphs_in_cell(c)
-
-def iter_all_paragraphs(doc):
-    for p in doc.paragraphs: yield p
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells: yield from _iter_paragraphs_in_cell(cell)
-    for section in doc.sections:
-        for hf in (section.header, section.footer):
-            for p in hf.paragraphs: yield p
-
-def set_paragraph_text(paragraph, new_text):
-    if not paragraph.runs:
-        paragraph.add_run(new_text)
-        return
-    for r in paragraph.runs: r.text = ""
-    paragraph.runs[0].text = new_text
-
-def replace_placeholders(doc, mapping: dict):
-    pattern = re.compile("|".join(re.escape(k) for k in mapping.keys()))
-    for p in iter_all_paragraphs(doc):
-        full_text = "".join(r.text for r in p.runs)
-        if not full_text or not pattern.search(full_text): continue
-        new_text = pattern.sub(lambda m: str(mapping[m.group(0)]), full_text)
-        if new_text != full_text: set_paragraph_text(p, new_text)
-
-def find_paragraph_starting_with(doc, prefix):
-    for p in doc.paragraphs:
-        if p.text.strip().lower().startswith(prefix.lower()): return p
-    return None
-
-def insert_bullets_after(anchor_paragraph, texts, template_bullet_xml):
-    ref = anchor_paragraph._p
-    for text in texts:
-        new_p = copy.deepcopy(template_bullet_xml)
-        ref.addnext(new_p)
-        ref = new_p
-        wrapped = docx.text.paragraph.Paragraph(new_p, anchor_paragraph._parent)
-        set_paragraph_text(wrapped, text)
-
-def replace_overtime_block(doc, overtime_lines):
-    intro = find_paragraph_starting_with(doc, "Overtime will be paid")
-    if intro is None: return
-    bullets = []
-    node = intro._p.getnext()
-    while node is not None and node.tag == qn("w:p"):
-        wrapped = docx.text.paragraph.Paragraph(node, intro._parent)
-        if wrapped.style.name == "List Paragraph":
-            bullets.append(node)
-            node = node.getnext()
-        else: break
-    if not bullets: return
-    template_xml = copy.deepcopy(bullets[0])
-    anchor = bullets[0].getprevious()
-    for b in bullets: b.getparent().remove(b)
-    ref = anchor
-    for line in overtime_lines:
-        new_p = copy.deepcopy(template_xml)
-        ref.addnext(new_p)
-        ref = new_p
-        wrapped = docx.text.paragraph.Paragraph(new_p, intro._parent)
-        set_paragraph_text(wrapped, line)
-
-def insert_logo(doc, logo_bytes):
-    for p in doc.paragraphs:
-        if "[Company Logo]" in p.text:
-            set_paragraph_text(p, "")
-            if logo_bytes:
-                run = p.add_run()
-                try: run.add_picture(io.BytesIO(logo_bytes), width=docx.shared.Inches(2.0))
-                except Exception: pass
-            return
-
-def clean_wage(value) -> str:
-    m = re.search(r"\d+(?:\.\d+)?", str(value))
-    return m.group(0) if m else str(value).strip()
-
-def clean_hours(value) -> str:
-    text = re.sub(r"(?i)\b(hours?|hrs?)\b", "", str(value))
-    return re.sub(r"(?i)(per\s*week|/\s*week)", "", text).strip(" -/\t")
-
-def build_wage_sentence(wage, hours) -> str:
-    return f"The employee will be paid ${clean_wage(wage)}/hour, based on a minimum of {clean_hours(hours)} hours per week."
-
-def build_term_sentence(term_years: str) -> str:
-    return f"This is a full-time, {term_years} employment term starting from the date agreed upon by the employer and employee."
-
-def generate_job_offer_docx(data: dict) -> bytes:
-    doc = docx.Document(TEMPLATE_PATH)
-    duties = data.get("job_duties", [])
-    if isinstance(duties, str): duties = [re.sub(r"^[•\-\*]\s*", "", d.strip()) for d in duties.split("\n") if d.strip()]
-
-    insert_logo(doc, data.get("logo_bytes"))
-
-    for p in iter_all_paragraphs(doc):
-        full_text = "".join(r.text for r in p.runs)
-        if "[City, Province, Postal Code]" in full_text:
-            set_paragraph_text(p, data.get("job_location", ""))
-            break
-
-    noc_code = str(data.get("noc_code", "")).strip()
-    if not noc_code:
-        for p in iter_all_paragraphs(doc):
-            full_text = "".join(r.text for r in p.runs)
-            if "(NOC [Code])" in full_text:
-                set_paragraph_text(p, full_text.replace(" (NOC [Code])", ""))
-                break
-
-    mapping = {
-        "[Company Name]": data.get("employer_name", ""),
-        "[Company Address]": data.get("employer_address", ""),
-        "[Company Number]": data.get("employer_phone", ""),
-        "[Date]": data.get("offer_date", datetime.date.today().strftime("%B %d, %Y")),
-        "[Employee Name]": data.get("client_name", ""),
-        "[Job Title]": data.get("job_title", ""),
-        "[Employment Term]": data.get("employment_term", ""),
-        "[Code]": noc_code,
-        "[Hourly Wage]": clean_wage(data.get("wage", "")),
-        "[Minimum Weekly Hours]": clean_hours(data.get("hours", "")),
-        "[Vacation Pay / Benefits]": data.get("benefits", ""),
-        "[Authorized Representative Name]": data.get("signer_name", ""),
-        "[Representative Title]": data.get("signer_title", ""),
-        "[Representative Phone Number]": data.get("employer_phone", ""),
-        "[Representative email address]": data.get("employer_email", ""),
-        "[Date of Birth]": data.get("client_dob", ""),
-    }
-    replace_placeholders(doc, mapping)
-
-    duties_anchor = find_paragraph_starting_with(doc, "Job Duties:")
-    if duties_anchor is not None and duties:
-        list_bullets = [p for p in doc.paragraphs if p.style.name == "List Paragraph"]
-        if list_bullets:
-            insert_bullets_after(duties_anchor, duties, copy.deepcopy(list_bullets[0]._p))
-
-    overtime_text = data.get("overtime_clause", "")
-    overtime_lines = [l.strip() for l in overtime_text.split("\n") if l.strip()]
-    if overtime_lines: replace_overtime_block(doc, overtime_lines)
-
-    buf = io.BytesIO()
-    doc.save(buf)
-    return buf.getvalue()
-
-def _replace_label_and_value(doc, label, new_value):
-    p = find_paragraph_starting_with(doc, label)
-    if p is None: return False
-    if len(p.text.strip()) > len(label) + 1:
-        set_paragraph_text(p, f"{label} {new_value}")
+        birth_date = datetime.datetime.strptime(dob_str, "%Y-%m-%d").date()
+        today = datetime.date.today()
+        age = today.year - birth_date.year - ((today.month, today.day) < (birth_date.month, birth_date.day))
+        return age < 19
+    except:
         return True
-    else:
-        nxt = p._p.getnext()
-        if nxt is not None and nxt.tag == qn("w:p"):
-            set_paragraph_text(docx.text.paragraph.Paragraph(nxt, p._parent), new_value)
-            return True
-    return False
 
-def _replace_bullets_after(doc, label, new_lines):
-    anchor = find_paragraph_starting_with(doc, label)
-    if anchor is None or not new_lines: return False
-    node = anchor._p.getnext()
-    while node is not None and node.tag == qn("w:p"):
-        wrapped = docx.text.paragraph.Paragraph(node, anchor._parent)
-        if wrapped.style.name == "List Paragraph": break
-        node = node.getnext()
+def sanitize_and_unlock_pdf(pdf_bytes):
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        clean_doc = fitz.open()
 
-    bullets = []
-    while node is not None and node.tag == qn("w:p"):
-        wrapped = docx.text.paragraph.Paragraph(node, anchor._parent)
-        if wrapped.style.name != "List Paragraph": break
-        bullets.append(node)
-        node = node.getnext()
+        for page in doc:
+            clean_doc.insert_pdf(doc, from_page=page.number, to_page=page.number)
 
-    if not bullets: return False
-    template_xml = copy.deepcopy(bullets[0])
-    ref = bullets[0].getprevious()
-    for b in bullets: b.getparent().remove(b)
-    for line in new_lines:
-        new_p = copy.deepcopy(template_xml)
-        ref.addnext(new_p)
-        ref = new_p
-        set_paragraph_text(docx.text.paragraph.Paragraph(new_p, anchor._parent), line)
-    return True
-
-def _update_salutation(doc, new_name):
-    p = find_paragraph_starting_with(doc, "Dear ")
-    if p is None: return False
-    set_paragraph_text(p, re.sub(r"^Dear .+?,", f"Dear {new_name},", p.text))
-    return True
-
-def _update_job_title_line(doc, job_title, noc_code):
-    p = find_paragraph_starting_with(doc, "Job Title:")
-    if p is None: return False
-    new_text = f"Job Title: {job_title} (NOC {noc_code})" if noc_code and str(noc_code).strip() else f"Job Title: {job_title}"
-    set_paragraph_text(p, new_text)
-    return True
-
-def _update_intro_paragraph(doc, term, job_title):
-    for p in doc.paragraphs:
-        lower_text = p.text.lower()
-        if "pleased to offer you" in lower_text or ("offer you" in lower_text and "position" in lower_text):
-            new_text = p.text
-            if term: new_text = re.sub(r"\b\d+-year\b", term, new_text, flags=re.IGNORECASE)
-            if job_title: new_text = re.sub(r"of the\s+(.+?)\s+position", f"of the {job_title} position", new_text, flags=re.IGNORECASE)
-            if new_text != p.text: set_paragraph_text(p, new_text)
-            break
-
-def _update_employee_signature(doc, name, dob):
-    for p in reversed(doc.paragraphs):
-        text = p.text.strip()
-        if "DOB:" in text or "Date of Birth:" in text:
-            set_paragraph_text(p, f"{name} (DOB: {dob})")
-            break
-
-def generate_job_offer_from_existing(existing_file_bytes: bytes, data: dict) -> bytes:
-    doc = docx.Document(io.BytesIO(existing_file_bytes))
-
-    # [핵심 클렌징 로직] 업로드된 파일 내부에 [email protected] 찌꺼기가 있으면 진짜 이메일로 덮어쓰거나 완전히 삭제
-    target_email = data.get("employer_email", "").strip()
-    if "protected" in target_email.lower():
-        target_email = ""  # 절대 protected가 들어가지 못하도록 방어
+        for page in clean_doc:
+            for widget in list(page.widgets()):
+                field_type_str = getattr(widget, "field_type_string", "").lower()
+                if "sig" in field_type_str or widget.field_type == fitz.PDF_WIDGET_TYPE_SIGNATURE:
+                    page.delete_widget(widget) 
+                else:
+                    if hasattr(widget, "field_flags"):
+                        widget.field_flags |= 1 
+                        widget.update()
+                        
+        clean_doc.set_metadata({}) 
         
-    for p in iter_all_paragraphs(doc):
-        if "protected" in p.text.lower():
-            # [email protected] 텍스트를 대상 이메일로 치환 (비어있으면 삭제됨)
-            new_text = re.sub(r'\[?\s*email\s*protected\s*\]?', target_email, p.text, flags=re.IGNORECASE)
-            if new_text != p.text:
-                set_paragraph_text(p, new_text)
-
-    if data.get("offer_date"):
-        for p in doc.paragraphs[:5]:
-            if re.match(r"^[A-Z][a-z]+ \d{1,2},? \d{4}$", p.text.strip()):
-                set_paragraph_text(p, data["offer_date"])
-                break
-
-    if data.get("client_name"): _update_salutation(doc, data["client_name"])
-    _update_intro_paragraph(doc, data.get("employment_term"), data.get("job_title"))
-    if data.get("job_title"): _update_job_title_line(doc, data["job_title"], data.get("noc_code", ""))
-
-    duties = data.get("job_duties", [])
-    if isinstance(duties, str): duties = [re.sub(r"^[•\-\*]\s*", "", d.strip()) for d in duties.split("\n") if d.strip()]
-    if duties: _replace_bullets_after(doc, "Job Duties:", duties)
-
-    if data.get("wage") and data.get("hours"):
-        sentence = build_wage_sentence(data["wage"], data["hours"])
-        if not _replace_label_and_value(doc, "Hourly wage and hours", sentence):
-            _replace_label_and_value(doc, "Hourly Wage and Hours", sentence)
-
-    if data.get("employment_term"): _replace_label_and_value(doc, "Terms of Employment:", build_term_sentence(data["employment_term"]))
-    if data.get("job_location"): _replace_label_and_value(doc, "Job Location:", data["job_location"])
-    
-    bullets = get_provincial_overtime_bullets(data.get("job_location", ""))
-    if bullets: _replace_bullets_after(doc, "Overtime:", bullets)
-    if data.get("start_date"): _replace_label_and_value(doc, "Start Date:", data["start_date"])
-    if data.get("client_name") and data.get("client_dob"): _update_employee_signature(doc, data["client_name"], data["client_dob"])
-
-    buf = io.BytesIO()
-    doc.save(buf)
-    return buf.getvalue()
+        out_buf = io.BytesIO()
+        clean_doc.save(out_buf, clean=True, deflate=True)
+        clean_doc.close()
+        doc.close()
+        return out_buf.getvalue()
+    except Exception:
+        return pdf_bytes
 
 # ==========================================
-# 6. Streamlit UI
+# 4. PDF 서식 채우기 로직
 # ==========================================
-st.title("📄 잡오퍼 DOCX 생성기 (v10)")
-st.caption("완벽한 초기화 · PDF 지원 · 이메일 강제 추출 및 최종 파일 내 찌꺼기(protected) 완벽 제거")
+def extract_imm5476_info(image):
+    prompt = """
+    Analyze this identity document (passport/permit/visa) carefully.
+    Extract the following details into exact JSON structure:
+    - surname: Family name converted to Title Case (First letter capitalized, e.g., 'KIM' -> 'Kim')
+    - given_name: Given names converted to Title Case (e.g., 'EUN SUN' -> 'Eun Sun')
+    - dob: Date of birth in YYYY-MM-DD format
+    - uci: UCI numbers only if present (10 digits or 8 digits), else empty string
+    Return ONLY raw valid JSON object without markdown or code formatting.
+    """
+    try:
+        response = safe_generate_content([prompt, image])
+        clean_text = response.text.strip().replace('```json', '').replace('```', '')
+        return json.loads(clean_text)
+    except Exception as e:
+        st.error(f"정보 추출 오류: {e}")
+        return None
 
-if "job_offer_data" not in st.session_state:
-    st.session_state.job_offer_data = {}
+def extract_all_passports_batch(has_non_acc, images):
+    prompt = f"""
+    You are an expert OCR system specialized in international passports.
+    I am providing {len(images)} passport image(s) in exact order.
+    Order structure:
+    - {'Image 1 is the non-accompanying parent passport.' if has_non_acc else 'There is no non-accompanying parent passport provided.'}
+    - {'Remaining images are accompanying family members.' if (len(images) > (1 if has_non_acc else 0)) else 'No family passports provided.'}
 
-st.markdown("---")
-st.subheader("1. 서류 업로드")
+    For EACH passport image, extract:
+    - surname: Surname / Family name converted to Title Case
+    - given_name: Given name(s) converted to Title Case
+    - dob: Date of birth in YYYY-MM-DD format
+    - passport_number: Passport number in uppercase alphanumeric
+    - gender: Sex of the person, strictly "F" or "M"
 
-passport_file = st.file_uploader("손님 여권 이미지 또는 PDF", type=["jpg", "jpeg", "png", "pdf", "heic", "HEIC"], key="jo_passport")
-old_jo_file = st.file_uploader("기준으로 사용할 기존 잡오퍼 (DOCX 업로드 시 서식 유지 편집 / PDF 업로드 시 내용 추출 후 새 DOCX로 변환)", type=["docx", "pdf"], key="jo_old_file")
+    Return ONLY a raw valid JSON object:
+    {{
+      "non_accompanying_parent": {{
+        "surname": "...", "given_name": "...", "dob": "YYYY-MM-DD", "passport_number": "...", "gender": "M"
+      }} or null,
+      "family_members": [
+        {{ "surname": "...", "given_name": "...", "dob": "YYYY-MM-DD", "passport_number": "...", "gender": "F" }}
+      ]
+    }}
+    """
+    contents = [prompt] + images
+    try:
+        response = safe_generate_content(contents)
+        clean_text = response.text.strip().replace('```json', '').replace('```', '')
+        return json.loads(clean_text)
+    except Exception as e:
+        st.error(f"여권 일괄 추출 오류: {e}")
+        return None
 
-st.info("💡 **Tip:** JobSpider 등 보안이 강력한 구인 사이트는 URL을 넣으면 정보 추출이 차단될 수 있습니다. 이메일 등 누락되는 항목이 있다면, **공고 내용을 텍스트로 전부 드래그하여 아래 칸에 직접 붙여넣어주세요.**")
-job_posting_text = st.text_area("채용 공고 링크(URL) 또는 공고 텍스트 전체 복사/붙여넣기", height=150, key="job_posting_text")
+def extract_case_prep_info(tmpl_bytes, client_files):
+    prompt = """
+    You are an expert Canadian immigration case prep assistant.
+    The FIRST document is a BLANK reference IRCC IMM form template.
+    The REMAINING attached documents are client materials.
 
-logo_file = st.file_uploader("회사 로고 이미지 (기존 잡오퍼 DOCX 편집 모드에서는 무시됩니다 — 원본 로고 유지)", type=["jpg", "jpeg", "png"], key="jo_logo")
+    Carefully scan ALL attached client documents to extract all required information matching the IMM form fields.
 
-if st.button("AI 분석 시작", type="primary", use_container_width=True):
-    with st.spinner("정보 추출 중..."):
-        extracted_info = {}
-        old_info = {}
-        ad_info = {}
+    [CRITICAL DETAILED EXTRACTION RULES]
 
-        if logo_file and not (old_jo_file and old_jo_file.name.lower().endswith(".docx")):
-            extracted_info["logo_bytes"] = logo_file.getvalue()
+    1. NAMES & GENERAL:
+       - Convert ALL CAPS names to Title Case (e.g., 'Eun Sun Kim', 'Alexis Antonio').
 
-        # [우선순위 1번] 여권 정보 파싱
-        if passport_file:
-            pass_img = process_uploaded_file_to_image(passport_file)
-            pass_data = extract_imm5476_info(pass_img)
-            if pass_data:
-                extracted_info["client_name"] = format_full_name(pass_data.get("surname", ""), pass_data.get("given_name", ""))
-                extracted_info["client_dob"] = pass_data.get("dob", "")
+    2. CONTACT INFORMATION:
+       - Extract Telephone Number thoroughly: Type (Cell/Home/Business), Country Code, Area Code & Number, Extension.
+       - Extract Mailing Address & Residential Address completely.
 
-        # 기존 잡오퍼 파싱 (PDF, DOCX 공통 내용 추출)
-        if old_jo_file:
-            mime_type = old_jo_file.type or ("application/pdf" if old_jo_file.name.lower().endswith(".pdf") else "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-            is_pdf = old_jo_file.name.lower().endswith(".pdf") or "pdf" in mime_type.lower()
-            
-            existing_parsed = parse_existing_job_offer(old_jo_file.getvalue(), mime_type, filename=old_jo_file.name)
-            if existing_parsed:
-                old_info = existing_parsed
-                for k, v in existing_parsed.items():
-                    if k in ["client_name", "client_dob"] and extracted_info.get(k): continue
-                    extracted_info[k] = v
-            
-            # PDF는 기존 틀을 덮어씌울 수 없으므로, 바이트 저장(편집용)을 생략하여 새 템플릿 사용을 유도
-            if is_pdf:
-                st.session_state.pop("_old_jo_bytes", None)
-                st.toast("PDF 형식의 잡오퍼가 업로드되었습니다! 내용은 모두 추출되었으며, 다운로드 시 새 DOCX 파일로 깔끔하게 변환됩니다.", icon="✅")
-            else:
-                st.session_state["_old_jo_bytes"] = old_jo_file.getvalue()
-        else:
-            st.session_state.pop("_old_jo_bytes", None)
+    3. MARITAL STATUS (Current & Previous):
+       - Current Marital Status: Status, Date of Marriage/Common-Law (YYYY-MM-DD), Current Spouse Full Name, Is Spouse Canadian Citizen/PR?
+       - Previous Marital Status: Has client been previously married/common-law? (Yes/No). If Yes, extract Previous Spouse Full Name, Relationship Type, From Date (YYYY-MM-DD), To Date (YYYY-MM-DD), Previous Spouse Date of Birth (YYYY-MM-DD).
 
-        # 채용공고(광고) 파싱
-        if job_posting_text.strip():
-            raw_input = job_posting_text.strip()
-            is_url = bool(re.search(r"^https?://[^\s]+|^www\.[^\s]+", raw_input))
-            if is_url:
-                url_match = re.search(r"(https?://[^\s]+|www\.[^\s]+)", raw_input).group(0)
-                fetched_text, err = fetch_url_content_safe(url_match)
-                if err: st.warning(f"URL 조회 실패: {err} (해당 사이트는 봇 차단이 설정되어 있습니다. 텍스트를 직접 복사해서 붙여넣는 것을 권장합니다.)")
-                text_to_analyze = fetched_text if fetched_text else raw_input
-            else:
-                text_to_analyze = raw_input
+    4. EDUCATION (ALL Post-Secondary Entries):
+       - DO NOT extract only the highest level. Extract ALL post-secondary education history found in questionnaires, WES, transcripts, or resumes.
+       - For EACH education entry, format fields with entry labels like 'Education Entry 1 - Dates', 'Education Entry 1 - Field & Level of Study', 'Education Entry 1 - School Name', 'Education Entry 1 - Location'.
+       - For EACH entry, extract:
+         * From Date (YYYY-MM) & To Date (YYYY-MM)
+         * Field and Level of Study
+         * School / Facility Name
+         * City/Town, Country or Territory, Province/State (if applicable)
 
-            job_extracted = call_gemini_json([f"Analyze this job posting content and extract the requested fields:\n\n{text_to_analyze}"], JOB_POSTING_SCHEMA)
-            
-            if job_extracted is not None:
-                current_em = job_extracted.get("employer_email", "")
-                if not current_em or "protected" in current_em.lower():
-                    email_match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text_to_analyze)
-                    if email_match:
-                        job_extracted["employer_email"] = email_match.group(0)
+    5. EMPLOYMENT (10-Year History with Full Location):
+       - Extract ALL employment/activity entries for the past 10 years.
+       - For EACH entry, format fields with entry labels like 'Employment Entry 1 - Dates', 'Employment Entry 1 - Job Title', 'Employment Entry 1 - Company Name', 'Employment Entry 1 - Location'.
+       - For EACH entry, extract:
+         * From Date (YYYY-MM) & To Date (YYYY-MM)
+         * Activity / Occupation / Job Title
+         * Company / Employer Name
+         * City/Town, Country or Territory, Province/State
 
-                ad_info = job_extracted
-                for k, v in job_extracted.items():
-                    if k not in ["client_name", "client_dob"]: extracted_info[k] = v
+    6. BACKGROUND INFORMATION (Refusals, Criminality, Military, Medical):
+       - Refusal / Visa History (Q2): Has client ever overstayed status, been refused a visa/permit, or been denied entry/ordered to leave Canada or any other country? (Yes/No). Provide full details/explanation if Yes.
+       - Criminal History (Q3): Has client ever committed, been arrested for, charged with, or convicted of any criminal offense? (Yes/No). Provide full details if Yes.
+       - Military / Police / Defense Service (Q4): Did client serve in military, militia, police, or civil defense unit? (Yes/No). If Yes, provide exact dates of service and countries served.
+       - Medical History (Q1): Any TB history or physical/mental disorder requiring social/health services? (Yes/No) + details.
 
-        st.session_state.old_info_backup = old_info
-        st.session_state.ad_info_backup = ad_info
-        st.session_state.job_offer_data.update(extracted_info)
-        st.success("분석이 완료되었습니다.")
+    7. CURRENT RESIDENCE PERMIT DATES:
+       - Status, From date (YYYY-MM-DD), and To date (YYYY-MM-DD) MUST be extracted directly from current permit/visa documents.
 
-st.markdown("---")
-st.subheader("2. 최종 잡오퍼 정보 확인 및 수정")
+    8. MISMATCH DETECTION:
+       - If there is a mismatch across documents for any field, set value strictly as:
+         "⚠️ 정보 불일치 (재확인 필요): [Doc A] ValueA vs [Doc B] ValueB"
 
-jo_data = st.session_state.job_offer_data
-ad_b = st.session_state.get("ad_info_backup", {})
-old_b = st.session_state.get("old_info_backup", {})
-
-conflicts = []
-for key, label in [("employer_name", "회사명"), ("employer_address", "회사 주소"), ("employer_phone", "회사 전화번호"), ("employer_email", "회사 이메일")]:
-    a_val = ad_b.get(key, "").strip()
-    o_val = old_b.get(key, "").strip()
-    if a_val and o_val and a_val.lower() != o_val.lower():
-        conflicts.append((key, label, a_val, o_val))
-
-if conflicts:
-    st.markdown("#### 🔍 정보 충돌 해결 (채용공고 vs 기존 문서)")
-    st.info("광고와 기존 잡오퍼 문서에서 서로 다른 정보가 발견되었습니다. 입력란에 반영할 정보를 선택해주세요. (기본값: 최신 광고 정보)")
-    for key, label, a_val, o_val in conflicts:
-        st.radio(f"**{label}** 충돌", options=[f"채용공고 (우선): {a_val}", f"기존 문서: {o_val}"], key=f"resolve_{key}")
-
-def get_resolved_val(key, default_dict):
-    a_val = ad_b.get(key, "").strip()
-    o_val = old_b.get(key, "").strip()
-    
-    if key == "employer_email":
-        if "protected" in a_val.lower(): a_val = ""
-        if "protected" in o_val.lower(): o_val = ""
-
-    if a_val and o_val and a_val.lower() != o_val.lower():
-        choice = st.session_state.get(f"resolve_{key}", "")
-        if "기존 문서" in choice: return o_val
-        return a_val
-        
-    fallback = a_val if a_val else (o_val if o_val else default_dict.get(key, ""))
-    
-    # 마지막 안전망: fallback 에도 protected가 포함되어 있다면 빈칸 처리
-    if key == "employer_email" and "protected" in fallback.lower():
-        fallback = ""
-        
-    return fallback
-
-resolved_emp_addr = get_resolved_val("employer_address", jo_data)
-if not resolved_emp_addr:
-    resolved_emp_addr = get_resolved_val("job_location", jo_data)
-
-temp_wage = jo_data.get("wage", "20.15")
-temp_loc = resolved_emp_addr
-calc_term, calc_median, calc_reason, calc_prov = calculate_employment_term(temp_wage, temp_loc)
-
-col_c1, col_c2 = st.columns(2)
-with col_c1:
-    c_name = st.text_input("손님 성명", value=jo_data.get("client_name", ""))
-    offer_dt = st.date_input("오퍼 작성일", datetime.date.today()).strftime("%B %d, %Y")
-    term_str = st.text_input("계약 기간", value=jo_data.get("employment_term", calc_term))
-    st.info(f"🌐 **판정 근거 (주: {calc_prov}):** {calc_reason}")
-with col_c2:
-    c_dob = st.text_input("손님 생년월일", value=jo_data.get("client_dob", ""))
-    start_dt_str = st.text_input("근무 시작일", value=jo_data.get("start_date", "The employment start date will be as soon as possible upon the employee’s authorization to work in Canada."))
-
-st.markdown("#### 🏢 고용주 및 회사 정보")
-col_e1, col_e2 = st.columns(2)
-with col_e1:
-    emp_name = st.text_input("회사명", value=get_resolved_val("employer_name", jo_data))
-    signer_n = st.text_input("대표자 성명", value=jo_data.get("signer_name", ""))
-    signer_t = st.text_input("대표자 직책", value=jo_data.get("signer_title", "Director"))
-with col_e2:
-    emp_addr = st.text_input("회사 대표 주소", value=resolved_emp_addr)
-    emp_phone = st.text_input("회사 전화번호", value=get_resolved_val("employer_phone", jo_data))
-    emp_email = st.text_input("회사 이메일", value=get_resolved_val("employer_email", jo_data), placeholder="예: hiring@company.com")
-
-st.markdown("#### 💼 근무 조건")
-col_j1, col_j2 = st.columns(2)
-with col_j1:
-    j_title = st.text_input("직책", value=jo_data.get("job_title", ""))
-    j_wage = st.text_input("시급 (CAD)", value=str(jo_data.get("wage", "20.15")))
-    j_hours = st.text_input("주당 근무시간", value=str(jo_data.get("hours", "30-40")))
-with col_j2:
-    j_loc = st.text_input("근무지 주소", value=get_resolved_val("job_location", jo_data) or emp_addr)
-    j_benefits = st.text_input("혜택", value=jo_data.get("benefits", "4% vacation pay"))
-    j_noc = st.text_input("NOC 코드", value=jo_data.get("noc_code", ""))
-
-auto_ot_clause = get_provincial_overtime_clause(j_loc or emp_addr)
-j_ot = st.text_area("오버타임 조항 (주별 기준 자동 적용, 신규 생성 시에만 사용됨)", value=auto_ot_clause, height=100)
-
-duties_input_str = jo_data.get("job_duties", [])
-if isinstance(duties_input_str, list): duties_input_str = "\n".join(duties_input_str)
-j_duties_text = st.text_area("주요 직무 (한 줄에 하나씩)", value=duties_input_str, height=150)
-
-if st.session_state.get("_old_jo_bytes"):
-    st.info("📎 기존 잡오퍼 문서(DOCX)를 그대로 편집합니다. 로고/서명/회사 헤더는 원본 그대로 유지됩니다.")
-else:
-    if old_jo_file and old_jo_file.name.lower().endswith(".pdf"):
-        st.info("📎 PDF 파일이 업로드되었습니다. 데이터는 성공적으로 추출되었으며, 다운로드 시 새 DOCX 문서로 생성됩니다.")
-
-st.markdown("---")
-
-if st.button("📄 MS Word (.docx) 생성 및 다운로드", type="primary", use_container_width=True):
-    if not c_name or not emp_name or not j_title:
-        st.error("손님 성명, 회사명, 직책은 필수 입력 항목입니다.")
-    else:
-        # 다운로드 직전 이메일 다시 한번 검열
-        final_email = emp_email.strip()
-        if "protected" in final_email.lower():
-            final_email = ""
-            
-        final_jo_dict = {
-            "client_name": c_name, "client_dob": c_dob, "offer_date": offer_dt, "employment_term": term_str,
-            "start_date": start_dt_str, "employer_name": emp_name, "signer_name": signer_n, "signer_title": signer_t,
-            "employer_address": emp_addr, "employer_phone": emp_phone, "employer_email": final_email,
-            "job_title": j_title, "noc_code": j_noc, "wage": j_wage, "hours": j_hours, "job_location": j_loc,
-            "benefits": j_benefits, "overtime_clause": j_ot, "job_duties": j_duties_text,
-            "logo_bytes": jo_data.get("logo_bytes"),
+    Return ONLY a raw valid JSON object in this exact shape:
+    {
+      "sections": [
+        {
+          "section": "Section Name (e.g. Personal Details, Contact Information, Education, Employment, Background Information)",
+          "fields": [
+            { "field": "Field Label", "value": "Extracted Value or Mismatch Warning", "source": "Source Doc Name(s)" }
+          ]
         }
+      ]
+    }
+    """
+    
+    contents = [prompt]
+    contents.extend(prepare_document_for_gemini(tmpl_bytes, "application/pdf", "Blank_IMM_Form.pdf"))
+    contents.extend(batch_process_client_files(client_files))
 
-        old_bytes = st.session_state.get("_old_jo_bytes")
-        if old_bytes:
-            docx_bytes = generate_job_offer_from_existing(old_bytes, final_jo_dict)
+    try:
+        response = safe_generate_content(contents)
+        clean_text = response.text.strip().replace('```json', '').replace('```', '')
+        return json.loads(clean_text)
+    except Exception as e:
+        st.error(f"서류 정리 오류: {e}")
+        return None
+
+def fill_imm5476(template_bytes, data):
+    doc = fitz.open(stream=template_bytes, filetype="pdf")
+    target_data = {
+        "surname": data.get("surname", ""), "given": data.get("given_name", ""),
+        "dob": data.get("dob", ""), "email": data.get("email", ""),
+        "address_phone": data.get("address_phone", ""),
+        "uci": data.get("uci", "").replace("-", ""), "signDate": data.get("signDate", "")  
+    }
+    flags = {"surname": False, "given": False, "dob": False, "email": False, "address_phone": False, "uci": False}
+    
+    page_date_counters = {}
+    
+    for page_idx, page in enumerate(doc):
+        page_date_counters[page_idx] = 0
+        for widget in page.widgets():
+            field_name = widget.field_name
+            if not field_name: continue
+            fname_lower = field_name.lower()
+            
+            val_to_set = None
+            if "family name" in fname_lower and not flags["surname"]:
+                val_to_set = target_data["surname"]; flags["surname"] = True
+            elif "given name" in fname_lower and not flags["given"]:
+                val_to_set = target_data["given"]; flags["given"] = True
+            elif "date of birth" in fname_lower and not flags["dob"]:
+                val_to_set = target_data["dob"]; flags["dob"] = True
+            elif "email" in fname_lower and not flags["email"]:
+                val_to_set = target_data["email"]; flags["email"] = True
+            elif ("telephone" in fname_lower or "address" in fname_lower) and page_idx == 0 and not flags["address_phone"]:
+                val_to_set = target_data["address_phone"]; flags["address_phone"] = True
+            elif ("uci" in fname_lower or "unique client identifier" in fname_lower) and not flags["uci"]:
+                val_to_set = target_data["uci"]; flags["uci"] = True
+            elif "date" in fname_lower and "birth" not in fname_lower:
+                page_date_counters[page_idx] += 1
+                
+                if page_idx == 2 and page_date_counters[page_idx] == 1:
+                    val_to_set = target_data["signDate"]
+                elif page_idx == 3 and page_date_counters[page_idx] == 1:
+                    val_to_set = target_data["signDate"]
+                
+            if val_to_set is not None:
+                set_smart_widget_value(widget, val_to_set, default_fontsize=9)
+
+    output_pdf = io.BytesIO()
+    doc.save(output_pdf); doc.close(); output_pdf.seek(0)
+    return output_pdf
+
+def fill_consent_letter(template_bytes, data):
+    doc = fitz.open(stream=template_bytes, filetype="pdf")
+    children = data.get("children", [])
+    num_pages_needed = max(1, (len(children) + 2) // 3)
+    for _ in range(num_pages_needed - 1): doc.insert_pdf(doc, from_page=0, to_page=0)
+        
+    for page_num in range(num_pages_needed):
+        page = doc[page_num]
+        page_children = children[page_num * 3 : (page_num + 1) * 3]
+        child_widgets = [("Information about travelling children", "yyyymmdd"), ("1_2", "2_2"), ("1_3", "2_3")]
+        
+        for widget in page.widgets():
+            fname = widget.field_name.strip() if widget.field_name else ""
+            if not fname: continue
+            fname_lower = fname.lower()
+            
+            field_type_str = getattr(widget, "field_type_string", "").lower()
+            if "check" in field_type_str or "radio" in field_type_str or "check box" in fname_lower or "checkbox" in fname_lower or "alone" in fname_lower:
+                try:
+                    widget.field_value = "Off" 
+                    widget.update()
+                except: pass
+                continue
+            
+            val_to_set = None
+            if fname == "1": val_to_set = data.get("non_acc_name", "")
+            elif fname == "2": val_to_set = data.get("non_acc_address", "")
+            elif fname == "3": val_to_set = data.get("non_acc_phone", "")
+            elif fname == "email": val_to_set = data.get("non_acc_email", "")
+            elif fname == "This child or these children hashave my or our consent to travel with": val_to_set = data.get("acc_name", "")
+            elif fname == "Relationship with Children 1": val_to_set = data.get("acc_relationship", "")
+            elif fname == "Relationship with Children 2": val_to_set = data.get("acc_passport", "")
+            elif fname == "I give my consent for this child to travel to": val_to_set = "Canada"
+            elif fname == "2_4" or fname_lower == "to stay with": val_to_set = data.get("acc_name", "")
+            elif fname == "At the following addresses 1": val_to_set = data.get("trip_address", "")
+            elif fname == "At the following addresses 2": val_to_set = data.get("trip_phone", "")
+            elif fname == "email_2": val_to_set = data.get("trip_email", "")
+            elif fname == "yyyymmdd_2": val_to_set = data.get("sign_date", "")
+            elif fname == "1_4" or "travel date" in fname_lower or fname_lower == "date" or "from" in fname_lower or "departure" in fname_lower or "start date" in fname_lower: 
+                val_to_set = data.get("trip_date", "")
+            elif fname_lower == "to" or "return" in fname_lower or "end date" in fname_lower: 
+                val_to_set = "" 
+            else:
+                for idx, (name_key, dob_key) in enumerate(child_widgets):
+                    if idx < len(page_children):
+                        if fname == name_key: val_to_set = page_children[idx].get("name", "")
+                        elif fname == dob_key: val_to_set = page_children[idx].get("dob", "")
+            
+            if val_to_set is not None:
+                set_smart_widget_value(widget, val_to_set, default_fontsize=11)
+
+    output_pdf = io.BytesIO()
+    doc.save(output_pdf); doc.close(); output_pdf.seek(0)
+    return output_pdf
+
+# ==========================================
+# 5. CRM 스마트 압축 및 PDF 안전 병합 엔진
+# ==========================================
+def process_and_compress_file(file_bytes, mime_type, target_filename):
+    is_jpeg = target_filename.lower().endswith(('.jpg', '.jpeg'))
+    
+    if is_jpeg:
+        img = Image.open(io.BytesIO(file_bytes))
+        img = ImageOps.exif_transpose(img)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+            
+        max_dim = max(img.width, img.height)
+        if max_dim > 2000:
+            ratio = 2000.0 / float(max_dim)
+            img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.Resampling.LANCZOS)
+            
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=80, optimize=True)
+        buf.seek(0)
+        return buf.getvalue(), "image/jpeg"
+        
+    else:
+        if "pdf" in mime_type.lower():
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            total_text_len = 0
+            
+            for page_idx in range(min(len(doc), 5)):
+                page = doc.load_page(page_idx)
+                text = page.get_text("text").strip()
+                total_text_len += len(text)
+                if total_text_len > 50:
+                    break
+            
+            if total_text_len > 50:
+                doc.close()
+                return sanitize_and_unlock_pdf(file_bytes), "application/pdf"
+            
+            new_doc = fitz.open()
+            target_dpi = 150
+            quality = 65
+            
+            for page in doc:
+                rot = page.rotation % 360
+                if rot in (90, 270):
+                    eff_width = page.rect.height
+                    eff_height = page.rect.width
+                else:
+                    eff_width = page.rect.width
+                    eff_height = page.rect.height
+
+                zoom = target_dpi / 72.0
+                if max(eff_width, eff_height) > 2000:
+                    zoom = 1.0
+
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+                img_buf = io.BytesIO()
+                img.save(img_buf, format="JPEG", quality=quality, optimize=True)
+                img_buf.seek(0)
+
+                new_page_width = pix.width / zoom
+                new_page_height = pix.height / zoom
+                pdf_page = new_doc.new_page(width=new_page_width, height=new_page_height)
+                pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
+                
+            output_pdf = io.BytesIO()
+            new_doc.save(output_pdf, deflate=True, garbage=4)
+            new_doc.close()
+            doc.close()
+            
+            compressed_bytes = output_pdf.getvalue()
+            final_bytes = compressed_bytes if len(compressed_bytes) < len(file_bytes) else file_bytes
+            return sanitize_and_unlock_pdf(final_bytes), "application/pdf"
+            
         else:
-            if not os.path.exists(TEMPLATE_PATH):
-                st.error(f"템플릿 파일을 찾을 수 없습니다: {TEMPLATE_PATH}")
-                st.stop()
-            docx_bytes = generate_job_offer_docx(final_jo_dict)
+            target_dpi = 150
+            quality = 70
+            img = Image.open(io.BytesIO(file_bytes))
+            img = ImageOps.exif_transpose(img)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+                
+            max_dim = max(img.width, img.height)
+            if max_dim > 1800:
+                ratio = 1800.0 / float(max_dim)
+                img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.Resampling.LANCZOS)
+                
+            img_buf = io.BytesIO()
+            img.save(img_buf, format="JPEG", quality=quality, optimize=True)
+            img_buf.seek(0)
+            
+            new_doc = fitz.open()
+            page_width = img.width * 72.0 / target_dpi
+            page_height = img.height * 72.0 / target_dpi
+            pdf_page = new_doc.new_page(width=page_width, height=page_height)
+            
+            pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
+            
+            output_pdf = io.BytesIO()
+            new_doc.save(output_pdf)
+            new_doc.close()
+            
+            compressed_bytes = output_pdf.getvalue()
+            return sanitize_and_unlock_pdf(compressed_bytes), "application/pdf"
 
-        crm_client = "NAME"
-        if c_name:
-            parts = c_name.strip().split()
-            if parts: crm_client = parts[0].capitalize()
-        out_filename = f"[Job Offer]_{crm_client}.docx"
+# ==========================================
+# 6. Streamlit 네비게이션 및 UI 구성
+# ==========================================
+MENU_1 = "🍁 IMM5476 자동 작성"
+MENU_2 = "✈️ 한부모 동의서 자동 작성"
+MENU_3 = "📋 IMM서류 정보 정리"
+MENU_4 = "🏷️ CRM 파일명 생성 및 묶기/분할"
 
-        st.success("잡오퍼 DOCX 문서 생성이 완료되었습니다!")
-        st.download_button(label="📥 Job Offer 다운로드", data=docx_bytes, file_name=out_filename, mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", type="primary", use_container_width=True)
+st.sidebar.title("🦅 CanNest Tool")
+app_mode = st.sidebar.radio("원하시는 업무 도구를 선택하세요", [MENU_1, MENU_2, MENU_3, MENU_4])
 
-st.markdown("<br><br>", unsafe_allow_html=True)
-if st.button("🔄 새 케이스 시작 (전체 초기화)", type="secondary", use_container_width=True):
-    for key in list(st.session_state.keys()):
-        if key != "password_correct": del st.session_state[key]
-    st.rerun()
+# ------------------------------------------
+# 메뉴 1: IMM5476 자동 작성
+# ------------------------------------------
+if app_mode == MENU_1:
+    st.title(MENU_1)
+    if "extracted_5476" not in st.session_state: st.session_state.extracted_5476 = None
+
+    template_5476_bytes = get_preloaded_file_bytes(["imm5476_template.pdf", "imm5476_template.pdf.pdf"])
+    
+    if template_5476_bytes:
+        st.success("✅ 사내 표준 'IMM5476' 양식이 자동으로 로드되었습니다.")
+    else:
+        st.error("⚠️ GitHub에 'imm5476_template.pdf' 파일이 없습니다. 수동으로 업로드해 주세요.")
+        template_file = st.file_uploader("IMM5476 템플릿 PDF 선택", type=['pdf'], key="template_5476")
+        if template_file: template_5476_bytes = template_file.getvalue()
+
+    st.markdown("---")
+    client_file = st.file_uploader("1. 손님 여권 또는 퍼밋", type=['jpg', 'jpeg', 'png', 'pdf', 'heic', 'HEIC', 'docx', 'DOCX', 'doc', 'DOC'], key="client_5476")
+
+    if client_file and st.button("정보 추출하기", use_container_width=True):
+        with st.spinner("서류 분석 중입니다. 잠시만 기다려 주세요..."):
+            extracted = extract_imm5476_info(process_uploaded_file_to_image(client_file))
+            if extracted: st.session_state.extracted_5476 = extracted; st.success("정보 추출이 완료되었습니다.")
+
+    if st.session_state.extracted_5476:
+        data = st.session_state.extracted_5476
+        c1, c2 = st.columns(2)
+        with c1:
+            surname = st.text_input("성 (Surname)", data.get("surname", ""))
+            dob = st.text_input("생년월일", data.get("dob", ""))
+            email = st.text_input("이메일 주소", "")
+        with c2:
+            given = st.text_input("이름 (Given Name)", data.get("given_name", ""))
+            uci = st.text_input("UCI", data.get("uci", ""))
+            sign_date = st.date_input("서명날짜", datetime.date.today())
+
+        address_phone = st.text_input("주소 또는 전화번호 (이메일이 없는 미성년자/신청자용)", placeholder="예: 2301-6658 Dow Ave, Burnaby BC V5H 0C7")
+
+        if st.button("문서 생성 및 다운로드", type="primary"):
+            if not template_5476_bytes:
+                st.error("템플릿 파일이 없습니다.")
+            else:
+                final_data = {
+                    "surname": surname, "given_name": given, "dob": dob, "uci": uci, 
+                    "email": email, "address_phone": address_phone, 
+                    "signDate": sign_date.strftime("%Y-%m-%d")
+                }
+                pdf_out = fill_imm5476(template_5476_bytes, final_data)
+                st.download_button("📥 다운로드", pdf_out, file_name=f"IMM5476_{surname}_{given}.pdf", mime="application/pdf")
+        
+        st.markdown("---")
+        if st.button("🔄 전체 리셋", type="secondary", use_container_width=True, key="reset_btn_m1"):
+            for key in list(st.session_state.keys()):
+                if key != "password_correct":
+                    del st.session_state[key]
+            st.rerun()
+
+# ------------------------------------------
+# 메뉴 2: 한부모 동의서 자동 작성
+# ------------------------------------------
+elif app_mode == MENU_2:
+    st.title(MENU_2)
+    if "consent_non_acc" not in st.session_state: st.session_state.consent_non_acc = {}
+    if "consent_family" not in st.session_state: st.session_state.consent_family = []
+
+    consent_template_bytes = get_preloaded_file_bytes(["consent_template.pdf", "consent_template.pdf.pdf"])
+
+    if consent_template_bytes:
+        st.success("✅ 사내 표준 '한부모 동의서' 양식이 자동으로 로드되었습니다.")
+    else:
+        st.error("⚠️ GitHub에 'consent_template.pdf' 파일이 없습니다. 수동으로 업로드해 주세요.")
+        consent_template = st.file_uploader("동의서 양식 선택", type=['pdf'])
+        if consent_template: consent_template_bytes = consent_template.getvalue()
+
+    st.markdown("---")
+    c1, c2 = st.columns(2)
+    with c1: non_acc_file = st.file_uploader("비동반 부모님 여권 (1장)", type=['jpg', 'jpeg', 'png', 'pdf', 'heic', 'HEIC', 'docx', 'DOCX', 'doc', 'DOC'])
+    with c2: family_files = st.file_uploader("동반 부모/자녀 여권", type=['jpg', 'jpeg', 'png', 'pdf', 'heic', 'HEIC', 'docx', 'DOCX', 'doc', 'DOC'], accept_multiple_files=True)
+
+    if st.button("여권 정보 추출하기", type="primary", use_container_width=True):
+        images = []
+        has_non_acc = bool(non_acc_file)
+        if non_acc_file: images.append(process_uploaded_file_to_image(non_acc_file))
+        if family_files: images.extend([process_uploaded_file_to_image(f) for f in family_files])
+        
+        if images:
+            with st.spinner("여권 정보를 분석 중입니다. 잠시만 기다려 주세요..."):
+                res = extract_all_passports_batch(has_non_acc, images)
+                if res:
+                    st.session_state.consent_non_acc = res.get("non_accompanying_parent", {}) or {}
+                    st.session_state.consent_family = res.get("family_members", []) or []
+                    st.success("여권 정보 추출이 완료되었습니다.")
+
+    non_acc_data = st.session_state.consent_non_acc
+    non_acc_name = st.text_input("비동반 부모 성명", format_full_name(non_acc_data.get('surname',''), non_acc_data.get('given_name','')))
+    non_acc_address = st.text_input("주소")
+    ca, cb = st.columns(2)
+    with ca: non_acc_phone = st.text_input("전화번호")
+    with cb: non_acc_email = st.text_input("이메일")
+
+    acc_parents = [p for p in st.session_state.consent_family if not is_minor(p.get("dob", ""))]
+    children_list = [p for p in st.session_state.consent_family if is_minor(p.get("dob", ""))]
+    
+    acc_name, acc_passport, acc_rel = "", "", "Mother"
+    if acc_parents:
+        p = acc_parents[0]
+        acc_name = format_full_name(p.get('surname',''), p.get('given_name',''))
+        acc_passport = p.get("passport_number", "")
+        acc_rel = "Mother" if p.get("gender") == "F" else "Father"
+
+    cp1, cp2, cp3 = st.columns(3)
+    with cp1: acc_name = st.text_input("동반 부모 성명", acc_name)
+    with cp2: acc_rel = st.selectbox("관계", ["Mother", "Father"], index=0 if acc_rel=="Mother" else 1)
+    with cp3: acc_passport = st.text_input("여권번호", acc_passport)
+
+    final_children = []
+    for idx, c in enumerate(children_list):
+        cc1, cc2 = st.columns(2)
+        with cc1: n = st.text_input(f"자녀{idx+1} 성명", format_full_name(c.get('surname',''), c.get('given_name','')))
+        with cc2: d = st.text_input(f"자녀{idx+1} 생일", c.get("dob", "").replace("-", "/"))
+        final_children.append({"name": n, "dob": d})
+    
+    if not children_list:
+        cc1, cc2 = st.columns(2)
+        with cc1: n = st.text_input("자녀 성명")
+        with cc2: d = st.text_input("자녀 생일")
+        if n: final_children.append({"name": n, "dob": d})
+
+    trip_address = st.text_input("현지 주소")
+    ct1, ct2 = st.columns(2)
+    with ct1: trip_phone = st.text_input("현지 전화")
+    with ct2: trip_email = st.text_input("현지 이메일")
+    
+    trip_date = st.text_input("여행 기간 (Travel Date)", placeholder="예: 2026/09/01 ~ 2026/09/30 또는 August 2026")
+    
+    sign_date_str = st.date_input("서명일", datetime.date.today()).strftime("%Y/%m/%d")
+
+    if st.button("문서 생성 및 다운로드", type="primary"):
+        if not consent_template_bytes:
+            st.error("양식 파일이 없습니다.")
+        else:
+            data_consent = {
+                "non_acc_name": non_acc_name, "non_acc_address": non_acc_address, "non_acc_phone": non_acc_phone, "non_acc_email": non_acc_email,
+                "children": final_children, "acc_name": acc_name, "acc_relationship": acc_rel, "acc_passport": acc_passport,
+                "trip_address": trip_address, "trip_phone": trip_phone, "trip_email": trip_email, 
+                "trip_date": trip_date, 
+                "sign_date": sign_date_str
+            }
+            pdf_out = fill_consent_letter(consent_template_bytes, data_consent)
+            
+            crm_name = "NAME"
+            if non_acc_name:
+                if re.search(r'[가-힣]', non_acc_name):
+                    crm_name = non_acc_name.replace(" ", "")
+                else:
+                    parts = non_acc_name.strip().split()
+                    if parts: crm_name = parts[0].capitalize()
+            
+            download_file_name = f"{crm_name}_Consent Letter for Children Travelling Abroad.pdf"
+            
+            st.download_button("📥 다운로드", pdf_out, download_file_name, "application/pdf")
+            
+    st.markdown("---")
+    if st.button("🔄 전체 리셋", type="secondary", use_container_width=True, key="reset_btn_m2"):
+        for key in list(st.session_state.keys()):
+            if key != "password_correct":
+                del st.session_state[key]
+        st.rerun()
+
+# ------------------------------------------
+# 메뉴 3: 이민서류 정보 정리 (Case File Prep)
+# ------------------------------------------
+elif app_mode == MENU_3:
+    st.title(MENU_3)
+    
+    if "prep_result" not in st.session_state:
+        st.session_state.prep_result = None
+
+    st.subheader("1. 대상 서식 (IMM PDF)")
+    
+    form_map = {
+        "직접 파일 업로드 (기타 서식)": None,
+        "IMM1294 (SP-OUTSIDE)": "imm1294.pdf",
+        "IMM1295 (WP-OUTSIDE)": "imm1295.pdf",
+        "IMM5708 (VR-INSIDE)": "imm5708.pdf",
+        "IMM5709 (SP-INSIDE)": "imm5709.pdf",
+        "IMM5710 (WP-INSIDE)": "imm5710.pdf"
+    }
+    
+    selected_form = st.selectbox("📌 템플릿 서식 선택", list(form_map.keys()))
+    
+    tmpl_bytes = None
+    
+    if form_map[selected_form] is not None:
+        file_path = form_map[selected_form]
+        tmpl_bytes = load_pdf_bytes_cached(file_path)
+        if tmpl_bytes:
+            st.success(f"✅ '{selected_form}' 양식이 자동으로 로드되었습니다.")
+        else:
+            st.error(f"⚠️ {file_path} 파일이 서버에 없습니다. 파일 업로드 상태를 확인해 주세요.")
+    else:
+        tmpl_prep_file = st.file_uploader("빈 IMM 서식 (반드시 Print to PDF로 평탄화된 파일)", type=['pdf'], key="case_tmpl")
+        if tmpl_prep_file:
+            tmpl_bytes = tmpl_prep_file.getvalue()
+
+    st.markdown("---")
+    st.subheader("2. 손님 제출 서류 (복수 선택 가능)")
+    client_prep_files = st.file_uploader("질문지, 여권, 퍼밋 등 서류 선택", type=['jpg', 'jpeg', 'png', 'pdf', 'heic', 'HEIC', 'docx', 'DOCX', 'doc', 'DOC'], accept_multiple_files=True, key="case_client_docs")
+
+    if st.button("서류 정보 정리하기", type="primary", use_container_width=True):
+        if tmpl_bytes is None:
+            st.warning("1번 단계에서 서식이 정상적으로 선택되거나 업로드되지 않았습니다.")
+        elif not client_prep_files:
+            st.warning("2번 단계에서 손님 서류를 1개 이상 올려주세요.")
+        else:
+            with st.spinner("서류를 대조하여 정보 및 불일치 항목을 확인 중입니다. 잠시만 기다려 주세요..."):
+                res = extract_case_prep_info(tmpl_bytes, client_prep_files)
+                if res:
+                    st.session_state.prep_result = res
+                    st.success("서류 정보 정리가 완료되었습니다.")
+
+    if st.session_state.prep_result:
+        st.markdown("---")
+        st.subheader("3. 정리된 정보 결과")
+
+        parsed = st.session_state.prep_result
+        sections = parsed.get("sections", [])
+
+        if not sections:
+            st.error("서식에서 분석할 항목을 찾지 못했습니다. (파일이 평탄화된 PDF인지 확인해 주세요)")
+        else:
+            full_text_list = []
+            for sec in sections:
+                sec_name = sec.get("section", "기타 항목")
+                st.write(f"### 📌 {sec_name}")
+                full_text_list.append(f"[{sec_name}]")
+
+                table_data = []
+                prev_group = None
+                for f in sec.get("fields", []):
+                    field_lbl = f.get("field", "")
+                    val = f.get("value", "")
+                    src = f.get("source", "")
+
+                    group_match = re.match(r'^(.*?\bEntry\s*\d+)', field_lbl, re.IGNORECASE)
+                    curr_group = group_match.group(1).strip() if group_match else None
+
+                    if prev_group and curr_group and prev_group != curr_group:
+                        table_data.append({
+                            "항목 (Field)": "──────────",
+                            "추출값 (Value)": "──────────",
+                            "출처 (Source)": "──────────"
+                        })
+                        full_text_list.append("")
+
+                    prev_group = curr_group
+
+                    if not val:
+                        display_val = "⚠️ 확인 필요 (미발견)"
+                        full_text_list.append(f"{field_lbl}: (확인 필요)")
+                    else:
+                        display_val = val
+                        full_text_list.append(f"{field_lbl}: {val}")
+
+                    table_data.append({
+                        "항목 (Field)": field_lbl,
+                        "추출값 (Value)": display_val,
+                        "출처 (Source)": src if src else "-"
+                    })
+
+                st.table(table_data)
+                full_text_list.append("")
+
+            st.markdown("#### 📋 한눈에 복사하기")
+            st.text_area("아래 텍스트를 복사하여 서식에 옮겨 적으세요", value="\n".join(full_text_list), height=250)
+            
+            if st.button("＋ 새 케이스 정리하기"):
+                st.session_state.prep_result = None
+                st.rerun()
+
+# ------------------------------------------
+# 메뉴 4: CRM 파일명 자동 생성 및 묶기/분할
+# ------------------------------------------
+elif app_mode == MENU_4:
+    st.title(MENU_4)
+    st.caption("개별 낱장 이미지, 여러 장짜리 통짜 PDF, MS Word 서류 등을 섞어서 올려도 AI가 알아서 문서 단위로 묶거나 분할하여 CRM 파일명으로 최적화합니다.")
+
+    if "uploader_key" not in st.session_state:
+        st.session_state.uploader_key = str(uuid.uuid4())
+    if "analysis_results" not in st.session_state:
+        st.session_state.analysis_results = None
+
+    uploaded_files = st.file_uploader(
+        "서류 업로드 (복수 선택 가능)", 
+        type=['jpg', 'jpeg', 'png', 'pdf', 'heic', 'HEIC', 'docx', 'DOCX', 'doc', 'DOC'], 
+        accept_multiple_files=True,
+        key=st.session_state.uploader_key
+    )
+
+    if uploaded_files:
+        if st.button("서류 분석 및 묶기/분할 시작", type="primary", use_container_width=True):
+            results = []
+            status_text = st.empty()
+            progress_bar = st.progress(0)
+            
+            status_text.text("1. 전체 서류 페이지 스캔 및 미리보기 생성 중...")
+            
+            global_pages = []
+            page_counter = 1
+            
+            for file in uploaded_files:
+                file_bytes = file.getvalue()
+                mime_type = file.type if file.type else "application/pdf"
+                fname_lower = file.name.lower()
+                
+                if fname_lower.endswith(('.doc', '.docx')):
+                    text_content = read_word_document_text(file_bytes, file.name)
+                    img = Image.new('RGB', (800, 1000), color=(255, 255, 255))
+                    draw = ImageDraw.Draw(img)
+                    disp_text = f"[Word File: {file.name}]\n\n" + (text_content[:800] if text_content else "Word Document")
+                    draw.text((40, 40), disp_text, fill=(0, 0, 0))
+                    
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=60)
+                    
+                    global_pages.append({
+                        "global_idx": page_counter,
+                        "original_name": file.name,
+                        "mime_type": mime_type,
+                        "file_bytes": file_bytes,
+                        "pdf_page_idx": 0,
+                        "preview_bytes": buf.getvalue(),
+                        "is_word": True,
+                        "word_text": text_content
+                    })
+                    page_counter += 1
+                elif "pdf" in mime_type.lower() or fname_lower.endswith('.pdf'):
+                    doc = fitz.open(stream=file_bytes, filetype="pdf")
+                    for i in range(len(doc)):
+                        if page_counter > 40: break
+                        page = doc.load_page(i)
+                        pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2))
+                        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                        buf = io.BytesIO()
+                        img.save(buf, format="JPEG", quality=60)
+                        
+                        global_pages.append({
+                            "global_idx": page_counter,
+                            "original_name": file.name,
+                            "mime_type": mime_type,
+                            "file_bytes": file_bytes,
+                            "pdf_page_idx": i,
+                            "preview_bytes": buf.getvalue(),
+                            "is_word": False
+                        })
+                        page_counter += 1
+                    doc.close()
+                else:
+                    if page_counter > 40: continue
+                    img = Image.open(io.BytesIO(file_bytes))
+                    img = ImageOps.exif_transpose(img)
+                    if img.mode != "RGB": img = img.convert("RGB")
+                    
+                    preview = img.copy()
+                    max_dim = max(preview.width, preview.height)
+                    if max_dim > 1200:
+                        ratio = 1200.0 / float(max_dim)
+                        preview = preview.resize((int(preview.width * ratio), int(preview.height * ratio)), Image.Resampling.LANCZOS)
+                    buf = io.BytesIO()
+                    preview.save(buf, format="JPEG", quality=60)
+                    
+                    global_pages.append({
+                        "global_idx": page_counter,
+                        "original_name": file.name,
+                        "mime_type": mime_type,
+                        "file_bytes": file_bytes,
+                        "pdf_page_idx": 0,
+                        "preview_bytes": buf.getvalue(),
+                        "is_word": False
+                    })
+                    page_counter += 1
+
+            if page_counter > 40:
+                st.warning("⚠️ 업로드된 총 페이지 수가 40장을 초과하여, 앞의 40장까지만 분석 및 병합합니다.")
+
+            status_text.text("2. AI가 페이지별 문맥을 분석하여 연관 서류를 묶거나 나누는 중입니다...")
+            
+            prompt = f"""
+            You are an expert AI document classifier for a Canadian immigration firm.
+            I am providing {len(global_pages)} pages of documents uploaded by a client. 
+
+            Your task:
+            1. Read ALL pages carefully.
+            2. GROUP the pages that logically belong to the SAME document type for the SAME client. 
+               *CRITICAL MERGE RULE 1 (Passport)*: If you see multiple passports for the same person, SEPARATE them into Old Passport and New Passport by checking the expiry dates. Any stamp or visa pages MUST be merged with the correct passport based on the stamp/visa dates matching the valid period of the passport. DO NOT classify a TRV sticker inside a passport as a Visitor Record.
+               *CRITICAL MERGE RULE 2 (ID/License)*: For ID cards, Driver's Licences, and PR Cards, the page containing the primary bio-data (face photo, name, DOB) MUST be ordered as Page 1 (Front), and the backside as Page 2.
+               *CRITICAL MERGE RULE 3 (Digital Photo)*: If you see a studio receipt/timestamp page along with a face photo, merge them into ONE single Digital Photo document.
+               *CRITICAL MERGE RULE 4*: Merge ALL BANK STATEMENTS, PAYSTUBS, or UTILITY BILLS for the SAME client into a single group.
+            3. ROTATION CORRECTION (CRITICAL - TEXT UPRIGHT CHECK): 
+               - Look strictly at the MAIN English text/numbers (e.g., 'Canada', 'DRIVER'S LICENCE', 'KIM MIN') and face photo.
+               - SPECIAL RULE FOR BC DRIVER'S LICENCES: BC Licences have large text 'DRIVER'S LICENCE BRITISH COLUMBIA' running vertically along the right edge BY DESIGN. IGNORE this vertical side-text! Instead, look at the face photo and the horizontal text 'Canada', 'KIM MIN', 'DOB'. If the face photo is upright and 'KIM MIN' reads left-to-right, IT IS UPRIGHT (0 degrees)!
+               - Analyze step-by-step:
+                 1) Is the main body text (Name, DOB, Address) reading normally Left-to-Right? -> Output 0
+                 2) Is the main body text reading Bottom-to-Top (running vertically pointing left)? -> Output 90
+                 3) Is the main body text reading Top-to-Bottom (running vertically pointing right)? -> Output 270
+                 4) Is the main body text upside down? -> Output 180
+               *Write your physical observation in `rotation_reasoning` first.*
+            4. For EACH grouped document, generate an EXACT filename using our strict CRM manual rules provided below.
+
+            [STRICT CRM MANUAL FILENAME RULES]
+            Rule 1 (Name): Korean client -> Full Korean Name without spaces (e.g. 홍길동). Foreign client -> VERY FIRST WORD of English Given Name in Title Case (e.g. Richard, Pham).
+            Rule 2 (Dates): MUST be YYYY.MM.DD (e.g. 2022.01.02). Use dots '.' as delimiters.
+            Rule 3 (Delimiter): Underscore '_' between Name, Document Category, and Date/Company.
+            Rule 4 (Date Range): Use hyphen '-' for ranges (e.g. 2022.04.22-2022.05.22).
+            Rule 5 (Capitalization): Every English word MUST be Title Case (Capitalize First Letter).
+
+            [CATEGORIES & CMS SUFFIX RULES]
+            1. Passport (including stamp/visa pages): {{Name}}_PP_{{ExpiryDate YYYY.MM.DD}}
+            2. Work Permit / Study Permit / Visitor Record (IMM 1442) / Coop / PGWP / BOWP: {{Name}}_{{WP/SP/VR/Coop/PGWP/BOWP}}_{{ExpiryDate YYYY.MM.DD}}
+            3. Questionnaire: {{Name}}_QA_{{Type}}_{{ReceivedDate YYYY.MM.DD}}
+            4. Police Certificate: {{Name}}_Police Cert_{{CountryInEnglish}}
+            5. Letter of Employment / Confirmation of Employment: {{Name}}_LOE_{{CompanyInEnglish}} (CRITICAL: MUST use 'LOE', NEVER 'Employment Letter'. ONLY for documents certifying past/current employment, usually 1 signature.)
+            6. Job Offer / Employment Agreement: {{Name}}_Job Offer_{{CompanyInEnglish}} (CRITICAL: Outlines future terms, usually has BOTH employer and employee signatures.)
+            7. Paystub: {{Name}}_Paystub_{{CompanyInEnglish}}_{{StartDate-EndDate}}
+            8. Education Certificate / WES: {{Name}}_{{Diploma/Bachelor/Master/Highschool/Certificate/WES}}_{{SchoolName}}
+            9. Certificate of Income / NOA: {{Name}}_COI_{{Year YYYY}}
+            10. Official English Score: {{Name}}_{{IELTS/CELPIP}}_{{Date YYYY.MM.DD}}
+            11. Resume: {{Name}}_Resume_{{ReceivedDate YYYY.MM.DD}} (Keep original .doc/.docx format if uploaded)
+            12. Medical Exam / Emedical: {{Name}}_Emedical_{{Year YYYY}}
+            13. Marriage Certificate: {{Name}}_Marriage Cert_{{IssueDate YYYY.MM.DD}}
+            14. Transcript: {{Name}}_Transcript_{{SchoolName}}
+            15. Bank Statement: {{Name}}_Bank Statement_{{Year YYYY}}
+            16. Family Certificate: {{Name}}_Family Cert_{{IssueDate YYYY.MM.DD}}
+            17. Basic Certificate: {{Name}}_Basic Cert
+            18. Birth Certificate: {{Name}}_Birth Cert
+            19. Travel Consent: {{ChildName}}_Travel Consent
+            20. Provincial ID / ECE Licence: {{Name}}_{{ID/ECE Licence}}_{{ExpiryDate YYYY.MM.DD}}
+            21. Driver's Licence: {{Name}}_Driver's Licence_{{ExpiryDate YYYY.MM.DD}} (Use 'Licence', not 'License')
+            22. Permanent Resident Card: {{Name}}_PR Card_{{ExpiryDate YYYY.MM.DD}}
+            23. Digital Photo / Passport Photo: {{Name}}_Digital Photo (Use .pdf if multiple pages, else .jpg)
+            24. T4 (Statement of Remuneration Paid): {{Name}}_T4_{{EmployerNameInEnglish}}_{{Year YYYY}}
+            25. Letter of Acceptance / Official Admission Letter (입학허가서): {{Name}}_LOA_{{SchoolNameInEnglish}} (e.g. 공원준_LOA_Metropolitan Community College)
+
+            [CRITICAL FALLBACK RULE FOR UNKNOWN DOCUMENTS]
+            - Step 1: If a document does NOT match any categories above, extract the official document title printed at the top of the document (in English, Title Case) and format as: {{Name}}_{{DocumentTitleInEnglish}}.
+            - Step 2: If the document title/type is completely ambiguous, set suggested_filename as {{Name}}_Unclassified_확인필요.pdf and set "is_unclassified": true.
+
+            Return ONLY a raw JSON object formatted EXACTLY like this:
+            {{
+              "page_details": [
+                {{
+                  "page_index": 1,
+                  "rotation_reasoning": "Main body text 'KIM MIN' reads horizontally Left-to-Right. Ignoring BC license vertical side-text. It is upright.",
+                  "rotation_needed_clockwise": 0
+                }}
+              ],
+              "documents": [
+                {{
+                  "client_name": "...",
+                  "doc_category": "...",
+                  "suggested_filename": "...",
+                  "page_indices": [1, 2],
+                  "is_unclassified": false,
+                  "is_resume": false
+                }}
+              ]
+            }}
+            """
+            
+            contents = [prompt]
+            for p in global_pages:
+                contents.append(f"--- Page {p['global_idx']} ---")
+                contents.append({"mime_type": "image/jpeg", "data": p['preview_bytes']})
+            
+            try:
+                response = safe_generate_content(contents)
+                clean_text = response.text.strip().replace('```json', '').replace('```', '')
+                data = json.loads(clean_text)
+                
+                page_details = data.get("page_details", [])
+                rotations = {str(item.get("page_index")): item.get("rotation_needed_clockwise", 0) for item in page_details}
+                
+                raw_docs_info = data.get("documents", [])
+                
+                docs_info = []
+                for d in raw_docs_info:
+                    c_name = d.get("client_name", "").strip()
+                    c_cat = d.get("doc_category", "").strip()
+                    
+                    existing = None
+                    for item in docs_info:
+                        name1 = item.get("suggested_filename", "").replace(".pdf", "").replace(".jpg", "").replace(".docx", "").replace(".doc", "").strip()
+                        name2 = d.get("suggested_filename", "").replace(".pdf", "").replace(".jpg", "").replace(".docx", "").replace(".doc", "").strip()
+                        if name1 == name2:
+                            existing = item
+                            break
+                        if c_name and c_cat and c_name == item.get("client_name", "").strip() and c_cat == item.get("doc_category", "").strip():
+                            if "bank statement" in c_cat.lower() or "paystub" in c_cat.lower() or "statement" in c_cat.lower():
+                                existing = item
+                                break
+                                
+                    if existing:
+                        new_indices = d.get("page_indices", [])
+                        for ni in new_indices:
+                            if ni not in existing["page_indices"]:
+                                existing["page_indices"].append(ni)
+                    else:
+                        docs_info.append(d)
+                        
+            except Exception as e:
+                st.error(f"AI 분석 중 오류가 발생했습니다: {e}")
+                docs_info = []
+                rotations = {}
+
+            status_text.text("3. 분석된 정보를 바탕으로 최종 서류 결합 및 회전/압축 중입니다...")
+            progress_step = 1 / max(len(docs_info), 1)
+
+            failed_docs = []
+
+            for idx, doc_info in enumerate(docs_info):
+                indices = doc_info.get("page_indices", [])
+                if not indices: continue
+                
+                final_name = doc_info.get("suggested_filename", f"Document_{idx+1}")
+                is_unclassified = doc_info.get("is_unclassified", False) or "확인필요" in final_name
+                is_resume = doc_info.get("is_resume", False) or "resume" in final_name.lower()
+                
+                source_names = []
+                group_pages = []
+                for p_idx in indices:
+                    p_data = next((p for p in global_pages if p['global_idx'] == p_idx), None)
+                    if p_data:
+                        group_pages.append(p_data)
+                        if p_data["original_name"] not in source_names:
+                            source_names.append(p_data["original_name"])
+
+                unique_src_files = list(set([p["original_name"] for p in group_pages]))
+                is_all_from_same_pdf = (len(unique_src_files) == 1 and "pdf" in group_pages[0]["mime_type"].lower())
+                is_all_from_same_word = (len(unique_src_files) == 1 and group_pages[0]["is_word"])
+                needs_rotation = any(int(rotations.get(str(p["global_idx"]), 0)) != 0 for p in group_pages)
+                
+                if is_resume and is_all_from_same_word:
+                    base_name, _ = os.path.splitext(final_name)
+                    orig_ext = os.path.splitext(group_pages[0]["original_name"])[1]
+                    final_name = base_name + orig_ext
+                    
+                    comp_bytes = group_pages[0]["file_bytes"]
+                    out_mime = group_pages[0]["mime_type"]
+                    orig_kb = len(comp_bytes) / 1024
+                    comp_kb = orig_kb
+                    
+                    src_display = ", ".join(source_names)
+                    if len(src_display) > 30: src_display = src_display[:27] + "..."
+                    
+                    results.append({
+                        "original_name": f"분석결과 ({src_display})",
+                        "suggested_filename": final_name,
+                        "category": doc_info.get("doc_category", "기타"),
+                        "client_name": doc_info.get("client_name", ""),
+                        "mime": out_mime,
+                        "orig_kb": orig_kb,
+                        "comp_kb": comp_kb,
+                        "bytes": comp_bytes,
+                        "is_unclassified": is_unclassified
+                    })
+                    progress_bar.progress(min((idx + 1) * progress_step, 1.0))
+                    continue
+
+                if not (final_name.lower().endswith(".pdf") or final_name.lower().endswith(".jpg") or final_name.lower().endswith(".jpeg") or final_name.lower().endswith(".doc") or final_name.lower().endswith(".docx")):
+                    if "photo" in final_name.lower() and len(indices) == 1:
+                        final_name += ".jpg"
+                    else:
+                        final_name += ".pdf"
+                        
+                try:
+                    if is_all_from_same_pdf:
+                        src_doc = fitz.open(stream=group_pages[0]["file_bytes"], filetype="pdf")
+                        pdf_indices = [p["pdf_page_idx"] for p in group_pages]
+                        
+                        if len(pdf_indices) == len(src_doc) and not needs_rotation and pdf_indices == list(range(len(src_doc))):
+                            merged_pdf_bytes = group_pages[0]["file_bytes"]
+                            src_doc.close()
+                            final_processed_bytes = sanitize_and_unlock_pdf(merged_pdf_bytes)
+                        else:
+                            src_doc.select(pdf_indices)  
+                            for i, p_data in enumerate(group_pages):
+                                try:
+                                    rot = int(rotations.get(str(p_data["global_idx"]), 0))
+                                    if rot != 0:
+                                        page = src_doc[i]
+                                        page.set_rotation((page.rotation + rot) % 360)
+                                except: pass
+                            merged_pdf_bytes_io = io.BytesIO()
+                            src_doc.save(merged_pdf_bytes_io) 
+                            src_doc.close()
+                            merged_pdf_bytes = merged_pdf_bytes_io.getvalue()
+                            final_processed_bytes = sanitize_and_unlock_pdf(merged_pdf_bytes)
+                            
+                        comp_bytes, out_mime = final_processed_bytes, "application/pdf"
+                    else:
+                        new_doc = fitz.open()
+                        for p_data in group_pages:
+                            rot = 0
+                            try: rot = int(rotations.get(str(p_data["global_idx"]), 0))
+                            except: pass
+                            
+                            if p_data.get("is_word"):
+                                pdf_page = new_doc.new_page(width=595, height=842)
+                                w_text = p_data.get("word_text", "")
+                                pdf_page.insert_text((50, 50), w_text[:3000] if w_text else f"Word Document: {p_data['original_name']}", fontsize=10)
+                            elif "pdf" in p_data["mime_type"].lower():
+                                src_doc = fitz.open(stream=p_data["file_bytes"], filetype="pdf")
+                                new_doc.insert_pdf(src_doc, from_page=p_data["pdf_page_idx"], to_page=p_data["pdf_page_idx"])
+                                if rot != 0:
+                                    page = new_doc[-1]
+                                    page.set_rotation((page.rotation + rot) % 360)
+                                src_doc.close()
+                            else:
+                                img = Image.open(io.BytesIO(p_data["file_bytes"]))
+                                img = ImageOps.exif_transpose(img) 
+                                if img.mode != "RGB": img = img.convert("RGB")
+                                
+                                if rot != 0: 
+                                    img = img.rotate(-rot, expand=True) 
+                                    
+                                img_buf = io.BytesIO()
+                                img.save(img_buf, format="JPEG", quality=95)
+                                pdf_page = new_doc.new_page(width=img.width, height=img.height)
+                                pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
+                        merged_pdf_bytes_io = io.BytesIO()
+                        new_doc.save(merged_pdf_bytes_io)
+                        new_doc.close()
+                        merged_pdf_bytes = merged_pdf_bytes_io.getvalue()
+                    
+                        is_jpeg = final_name.lower().endswith(('.jpg', '.jpeg'))
+                        orig_total_bytes = sum([len(p["file_bytes"]) for p in group_pages])
+                        
+                        if is_jpeg and len(indices) == 1:
+                            p_data = group_pages[0]
+                            if "pdf" in p_data["mime_type"].lower():
+                                src_doc = fitz.open(stream=p_data["file_bytes"], filetype="pdf")
+                                page = src_doc.load_page(p_data["pdf_page_idx"])
+                                pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+                                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                                src_doc.close()
+                            else:
+                                img = Image.open(io.BytesIO(p_data["file_bytes"]))
+                                img = ImageOps.exif_transpose(img)
+                                
+                            try:
+                                rot = int(rotations.get(str(p_data["global_idx"]), 0))
+                                if rot != 0: img = img.rotate(-rot, expand=True)
+                            except: pass
+                            
+                            if img.mode != "RGB": img = img.convert("RGB")
+                            
+                            img_buf = io.BytesIO()
+                            img.save(img_buf, format="JPEG", quality=95)
+                            comp_bytes, out_mime = process_and_compress_file(img_buf.getvalue(), "image/jpeg", final_name)
+                        else:
+                            final_processed_bytes = sanitize_and_unlock_pdf(merged_pdf_bytes)
+                            comp_bytes, out_mime = process_and_compress_file(final_processed_bytes, "application/pdf", final_name)
+                        
+                    orig_kb = sum([len(p["file_bytes"]) for p in group_pages]) / 1024
+                    comp_kb = len(comp_bytes) / 1024
+                    
+                    src_display = ", ".join(source_names)
+                    if len(src_display) > 30: src_display = src_display[:27] + "..."
+                    
+                    results.append({
+                        "original_name": f"분석결과 ({src_display})",
+                        "suggested_filename": final_name,
+                        "category": doc_info.get("doc_category", "기타"),
+                        "client_name": doc_info.get("client_name", ""),
+                        "mime": out_mime,
+                        "orig_kb": orig_kb,
+                        "comp_kb": comp_kb,
+                        "bytes": comp_bytes,
+                        "is_unclassified": is_unclassified
+                    })
+                
+                except Exception as e:
+                    failed_docs.append(final_name)
+                
+                progress_bar.progress(min((idx + 1) * progress_step, 1.0))
+                
+            if failed_docs:
+                status_text.warning("일부 서류 처리에 실패했지만, 나머지 서류의 최적화는 완료되었습니다.")
+                st.warning("⚠️ **아래 서류는 파일 손상 또는 변환 중 오류가 발생하여 제외되었습니다. 원본 파일을 직접 확인해 주세요:**\n\n" + "\n".join([f"- {f}" for f in failed_docs]))
+            else:
+                status_text.success("모든 서류의 묶기/분할 및 스마트 회전 최적화가 완료되었습니다.")
+                
+            st.session_state.analysis_results = results
+
+    if st.session_state.analysis_results:
+        st.markdown("---")
+        st.subheader("변환 완료된 서류 다운로드")
+        
+        zip_buffer = io.BytesIO()
+        final_downloads = []
+        
+        for idx, item in enumerate(st.session_state.analysis_results):
+            col1, col2, col3 = st.columns([3, 3, 2])
+            
+            with col1:
+                st.write(f"**출처**: `{item['original_name']}`")
+                st.caption(f"{item['orig_kb']:.1f} KB ➡️ **{item['comp_kb']:.1f} KB**")
+                if item.get("is_unclassified"):
+                    st.warning("⚠️ 규칙 미확인 서류 (파일명 수동 확인 필요)")
+                
+            with col2:
+                user_edited_name = st.text_input(
+                    "파일명", 
+                    value=item['suggested_filename'], 
+                    key=f"edit_{idx}",
+                    label_visibility="collapsed"
+                )
+                final_downloads.append((user_edited_name, item['bytes'], item['mime']))
+                
+            with col3:
+                st.download_button("⬇️ 개별 다운로드", data=item['bytes'], file_name=user_edited_name, mime=item['mime'], key=f"dl_btn_{idx}")
+                
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            for fname, fbytes, _ in final_downloads:
+                zip_file.writestr(fname, fbytes)
+                
+        zip_buffer.seek(0)
+        today_str = datetime.date.today().strftime("%Y%m%d")
+        
+        st.markdown("---")
+        st.download_button(
+            "📦 전체 서류 ZIP 다운로드",
+            data=zip_buffer,
+            file_name=f"CRM_Documents_{today_str}.zip",
+            mime="application/zip",
+            type="primary",
+            use_container_width=True
+        )
+
+        st.markdown("---")
+        if st.button("🔄 전체 리셋", type="secondary", use_container_width=True):
+            for key in list(st.session_state.keys()):
+                if key != "password_correct":
+                    del st.session_state[key]
+            st.session_state.uploader_key = str(uuid.uuid4())
+            st.rerun()
