@@ -284,28 +284,33 @@ def embed_courier_in_doc(doc):
     pass
 
 
-# 💡 💡 [완벽 해결책] 질문지/폼 필드가 입력된 페이지를 고해상도 이미지로 화질 구워서 100% 보존
-def page_to_image_pdf_page(new_doc, src_doc, page_idx, rotation=0, dpi=200):
-  """AcroForm/XFA 서식이 포함된 PDF 페이지를 고해상도 렌더링하여 새 PDF 페이지에 삽입합니다.
+# 💡 제자리 수정(In-place)을 통해 AcroForm 구조를 100% 보존하여 내용 유실 방지
+def sanitize_and_unlock_pdf(pdf_bytes):
+  try:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    for page in doc:
+      for widget in list(page.widgets()):
+        field_type_str = getattr(widget, "field_type_string", "").lower()
+        if (
+            "sig" in field_type_str
+            or widget.field_type == fitz.PDF_WIDGET_TYPE_SIGNATURE
+        ):
+          page.delete_widget(widget)
+        else:
+          if hasattr(widget, "field_flags"):
+            widget.field_flags &= ~1  # 읽기 전용 해제하여 사후 수정 가능하도록 설정
+            widget.update()
+            
+    doc.need_appearances(True)
+    doc.set_metadata({})
 
-  내용 유실, 폰트 깨짐, 서식 삭제 현상을 100% 방지합니다.
-  """
-  page = src_doc.load_page(page_idx)
-  zoom = dpi / 72.0
-  pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
-  img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-
-  if rotation % 360 != 0:
-    img = img.rotate(-rotation, expand=True)
-
-  buf = io.BytesIO()
-  img.save(buf, format="JPEG", quality=92, optimize=True)
-  buf.seek(0)
-
-  page_w = img.width * 72.0 / dpi
-  page_h = img.height * 72.0 / dpi
-  pdf_page = new_doc.new_page(width=page_w, height=page_h)
-  pdf_page.insert_image(pdf_page.rect, stream=buf.getvalue())
+    out_buf = io.BytesIO()
+    # clean=True는 내부 구조를 재작성하므로 폼 데이터 유실을 막기 위해 생략
+    doc.save(out_buf, deflate=True)
+    doc.close()
+    return out_buf.getvalue()
+  except Exception:
+    return pdf_bytes
 
 
 def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
@@ -327,6 +332,10 @@ def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
       text = ""
       for page in doc:
         text += page.get_text("text") + "\n"
+        # 💡 [메뉴 3 AI 인식용] 텍스트 레이어뿐만 아니라 숨겨진 질문지 위젯 입력값도 명시적으로 추출
+        for widget in page.widgets():
+            if widget.field_value:
+                text += f"{widget.field_name}: {widget.field_value}\n"
 
       if len(text.strip()) > 100:
         return [f"\n--- [Document: {file_name}] ---\n{text[:20000]}\n"]
@@ -372,27 +381,6 @@ def is_minor(dob_str):
     return age < 19
   except Exception:
     return True
-
-
-def sanitize_and_unlock_pdf(pdf_bytes):
-  try:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    for page in doc:
-      for widget in list(page.widgets()):
-        field_type_str = getattr(widget, "field_type_string", "").lower()
-        if (
-            "sig" in field_type_str
-            or widget.field_type == fitz.PDF_WIDGET_TYPE_SIGNATURE
-        ):
-          page.delete_widget(widget)
-
-    doc.set_metadata({})
-    out_buf = io.BytesIO()
-    doc.save(out_buf, clean=True, deflate=True)
-    doc.close()
-    return out_buf.getvalue()
-  except Exception:
-    return pdf_bytes
 
 
 # ==========================================
@@ -757,11 +745,12 @@ def process_and_compress_file(
         page = doc.load_page(page_idx)
         text = page.get_text("text").strip()
         total_text_len += len(text)
-        if page.first_widget is not None:
+        if list(page.widgets()):  # 💡 질문지(폼 필드) 존재 여부 정확히 확인
           has_widgets = True
         if total_text_len > 50:
           break
 
+      # 💡 텍스트가 있거나 대화형 폼 필드(Widget)가 있는 PDF는 강제 이미지 압축 방지
       if total_text_len > 50 or has_widgets:
         doc.close()
         if already_sanitized:
@@ -1724,54 +1713,36 @@ elif app_mode == MENU_4:
             final_name += ".pdf"
 
         try:
+          # 💡 [해결책 2] 원본 PDF 구조를 파괴하지 않고 병합하기
           if is_all_from_same_pdf:
             src_doc = fitz.open(
                 stream=group_pages[0]["file_bytes"], filetype="pdf"
             )
             pdf_indices = [p["pdf_page_idx"] for p in group_pages]
 
-            has_widgets_in_selection = False
-            for idx_p in pdf_indices:
-              if src_doc.load_page(idx_p).first_widget is not None:
-                has_widgets_in_selection = True
-                break
-
             if (
                 len(pdf_indices) == len(src_doc)
                 and not needs_rotation
                 and pdf_indices == list(range(len(src_doc)))
-                and not has_widgets_in_selection
             ):
               merged_pdf_bytes = group_pages[0]["file_bytes"]
               src_doc.close()
               final_processed_bytes = sanitize_and_unlock_pdf(merged_pdf_bytes)
             else:
-              new_doc = fitz.open()
-              for p_data in group_pages:
-                p_idx = p_data["pdf_page_idx"]
-                rot = int(rotations.get(str(p_data["global_idx"]), 0))
-                p_has_widget = (
-                    src_doc.load_page(p_idx).first_widget is not None
-                )
-
-                if p_has_widget:
-                  page_to_image_pdf_page(
-                      new_doc, src_doc, p_idx, rotation=rot, dpi=200
-                  )
-                else:
-                  new_doc.insert_pdf(
-                      src_doc, from_page=p_idx, to_page=p_idx
-                  )
+              src_doc.select(pdf_indices)
+              for i, p_data in enumerate(group_pages):
+                try:
+                  rot = int(rotations.get(str(p_data["global_idx"]), 0))
                   if rot != 0:
-                    new_doc[-1].set_rotation(
-                        (new_doc[-1].rotation + rot) % 360
-                    )
-
+                    page = src_doc[i]
+                    page.set_rotation((page.rotation + rot) % 360)
+                except Exception:
+                  pass
               merged_pdf_bytes_io = io.BytesIO()
-              new_doc.save(merged_pdf_bytes_io, deflate=True)
-              new_doc.close()
+              src_doc.save(merged_pdf_bytes_io, deflate=True)
               src_doc.close()
-              final_processed_bytes = merged_pdf_bytes_io.getvalue()
+              merged_pdf_bytes = merged_pdf_bytes_io.getvalue()
+              final_processed_bytes = sanitize_and_unlock_pdf(merged_pdf_bytes)
 
             comp_bytes, out_mime = process_and_compress_file(
                 final_processed_bytes,
@@ -1800,22 +1771,13 @@ elif app_mode == MENU_4:
                     stream=p_data["file_bytes"], filetype="pdf"
                 )
                 p_idx = p_data["pdf_page_idx"]
-                p_has_widget = (
-                    src_doc.load_page(p_idx).first_widget is not None
+                new_doc.insert_pdf(
+                    src_doc, from_page=p_idx, to_page=p_idx
                 )
-
-                if p_has_widget:
-                  page_to_image_pdf_page(
-                      new_doc, src_doc, p_idx, rotation=rot, dpi=200
+                if rot != 0:
+                  new_doc[-1].set_rotation(
+                      (new_doc[-1].rotation + rot) % 360
                   )
-                else:
-                  new_doc.insert_pdf(
-                      src_doc, from_page=p_idx, to_page=p_idx
-                  )
-                  if rot != 0:
-                    new_doc[-1].set_rotation(
-                        (new_doc[-1].rotation + rot) % 360
-                    )
                 src_doc.close()
               else:
                 img = Image.open(io.BytesIO(p_data["file_bytes"]))
@@ -1836,7 +1798,7 @@ elif app_mode == MENU_4:
             merged_pdf_bytes_io = io.BytesIO()
             new_doc.save(merged_pdf_bytes_io, deflate=True)
             new_doc.close()
-            final_processed_bytes = merged_pdf_bytes_io.getvalue()
+            merged_pdf_bytes = merged_pdf_bytes_io.getvalue()
 
             is_jpeg = final_name.lower().endswith((".jpg", ".jpeg"))
 
