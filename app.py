@@ -173,6 +173,7 @@ def process_uploaded_file_to_image(file_obj):
     page = doc.load_page(0)
     pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    doc.close()
   else:
     img = Image.open(io.BytesIO(file_bytes))
     img = ImageOps.exif_transpose(img)
@@ -210,9 +211,8 @@ def set_smart_widget_value(
   widget.field_value = val_str
 
   if hasattr(widget, "field_flags") and widget.field_flags:
-    widget.field_flags &= ~1  # 수정 가능(Fillable) 상태 유지
+    widget.field_flags &= ~1
 
-  # IRCC 양식 표준 폰트 식별자인 "Cour"를 최우선 지정
   try:
     widget.text_font = "Cour"
   except Exception:
@@ -253,7 +253,6 @@ def set_smart_widget_value(
 
 
 def embed_courier_in_doc(doc):
-  """cour.ttf 폰트를 PDF 문서 내 AcroForm DR 리소스에 통합 주입하는 함수"""
   if not os.path.exists("cour.ttf"):
     return
 
@@ -285,6 +284,35 @@ def embed_courier_in_doc(doc):
     pass
 
 
+# 💡 제자리 수정(In-place)을 통해 AcroForm 구조를 100% 보존하여 내용 유실 방지
+def sanitize_and_unlock_pdf(pdf_bytes):
+  try:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    for page in doc:
+      for widget in list(page.widgets()):
+        field_type_str = getattr(widget, "field_type_string", "").lower()
+        if (
+            "sig" in field_type_str
+            or widget.field_type == fitz.PDF_WIDGET_TYPE_SIGNATURE
+        ):
+          page.delete_widget(widget)
+        else:
+          if hasattr(widget, "field_flags"):
+            widget.field_flags &= ~1  # 읽기 전용 해제하여 사후 수정 가능하도록 설정
+            widget.update()
+            
+    doc.need_appearances(True)
+    doc.set_metadata({})
+
+    out_buf = io.BytesIO()
+    # clean=True는 내부 구조를 재작성하므로 폼 데이터 유실을 막기 위해 생략
+    doc.save(out_buf, deflate=True)
+    doc.close()
+    return out_buf.getvalue()
+  except Exception:
+    return pdf_bytes
+
+
 def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
   ext = os.path.splitext(file_name)[1].lower() if file_name else ""
   if (
@@ -304,6 +332,10 @@ def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
       text = ""
       for page in doc:
         text += page.get_text("text") + "\n"
+        # 💡 [메뉴 3 AI 인식용] 텍스트 레이어뿐만 아니라 숨겨진 질문지 위젯 입력값도 명시적으로 추출
+        for widget in page.widgets():
+            if widget.field_value:
+                text += f"{widget.field_name}: {widget.field_value}\n"
 
       if len(text.strip()) > 100:
         return [f"\n--- [Document: {file_name}] ---\n{text[:20000]}\n"]
@@ -349,38 +381,6 @@ def is_minor(dob_str):
     return age < 19
   except Exception:
     return True
-
-
-def sanitize_and_unlock_pdf(pdf_bytes):
-  try:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    clean_doc = fitz.open()
-
-    for page in doc:
-      clean_doc.insert_pdf(doc, from_page=page.number, to_page=page.number)
-
-    for page in clean_doc:
-      for widget in list(page.widgets()):
-        field_type_str = getattr(widget, "field_type_string", "").lower()
-        if (
-            "sig" in field_type_str
-            or widget.field_type == fitz.PDF_WIDGET_TYPE_SIGNATURE
-        ):
-          page.delete_widget(widget)
-        else:
-          if hasattr(widget, "field_flags"):
-            widget.field_flags |= 1
-            widget.update()
-
-    clean_doc.set_metadata({})
-
-    out_buf = io.BytesIO()
-    clean_doc.save(out_buf, clean=True, deflate=True)
-    clean_doc.close()
-    doc.close()
-    return out_buf.getvalue()
-  except Exception:
-    return pdf_bytes
 
 
 # ==========================================
@@ -710,7 +710,9 @@ def fill_consent_letter(template_bytes, data):
 # ==========================================
 # 5. CRM 스마트 압축 및 PDF 안전 병합 엔진
 # ==========================================
-def process_and_compress_file(file_bytes, mime_type, target_filename):
+def process_and_compress_file(
+    file_bytes, mime_type, target_filename, already_sanitized: bool = False
+):
   is_jpeg = target_filename.lower().endswith((".jpg", ".jpeg"))
 
   if is_jpeg:
@@ -735,18 +737,26 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
   else:
     if "pdf" in mime_type.lower():
       doc = fitz.open(stream=file_bytes, filetype="pdf")
+
       total_text_len = 0
+      has_widgets = False
 
       for page_idx in range(min(len(doc), 5)):
         page = doc.load_page(page_idx)
         text = page.get_text("text").strip()
         total_text_len += len(text)
+        if list(page.widgets()):  # 💡 질문지(폼 필드) 존재 여부 정확히 확인
+          has_widgets = True
         if total_text_len > 50:
           break
 
-      if total_text_len > 50:
+      # 💡 텍스트가 있거나 대화형 폼 필드(Widget)가 있는 PDF는 강제 이미지 압축 방지
+      if total_text_len > 50 or has_widgets:
         doc.close()
-        return sanitize_and_unlock_pdf(file_bytes), "application/pdf"
+        if already_sanitized:
+          return file_bytes, "application/pdf"
+        else:
+          return sanitize_and_unlock_pdf(file_bytes), "application/pdf"
 
       new_doc = fitz.open()
       target_dpi = 150
@@ -790,7 +800,10 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
           if len(compressed_bytes) < len(file_bytes)
           else file_bytes
       )
-      return sanitize_and_unlock_pdf(final_bytes), "application/pdf"
+      if already_sanitized:
+        return final_bytes, "application/pdf"
+      else:
+        return sanitize_and_unlock_pdf(final_bytes), "application/pdf"
 
     else:
       target_dpi = 150
@@ -824,7 +837,10 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
       new_doc.close()
 
       compressed_bytes = output_pdf.getvalue()
-      return sanitize_and_unlock_pdf(compressed_bytes), "application/pdf"
+      if already_sanitized:
+        return compressed_bytes, "application/pdf"
+      else:
+        return sanitize_and_unlock_pdf(compressed_bytes), "application/pdf"
 
 
 # ==========================================
@@ -1389,6 +1405,7 @@ elif app_mode == MENU_4:
           page_counter += 1
         elif "pdf" in mime_type.lower() or fname_lower.endswith(".pdf"):
           doc = fitz.open(stream=file_bytes, filetype="pdf")
+
           for i in range(len(doc)):
             if page_counter > 40:
               break
@@ -1696,6 +1713,7 @@ elif app_mode == MENU_4:
             final_name += ".pdf"
 
         try:
+          # 💡 [해결책 2] 원본 PDF 구조를 파괴하지 않고 병합하기
           if is_all_from_same_pdf:
             src_doc = fitz.open(
                 stream=group_pages[0]["file_bytes"], filetype="pdf"
@@ -1721,23 +1739,22 @@ elif app_mode == MENU_4:
                 except Exception:
                   pass
               merged_pdf_bytes_io = io.BytesIO()
-              src_doc.save(merged_pdf_bytes_io)
+              src_doc.save(merged_pdf_bytes_io, deflate=True)
               src_doc.close()
               merged_pdf_bytes = merged_pdf_bytes_io.getvalue()
               final_processed_bytes = sanitize_and_unlock_pdf(merged_pdf_bytes)
 
-            comp_bytes, out_mime = (
+            comp_bytes, out_mime = process_and_compress_file(
                 final_processed_bytes,
                 "application/pdf",
+                final_name,
+                already_sanitized=True,
             )
+
           else:
             new_doc = fitz.open()
             for p_data in group_pages:
-              rot = 0
-              try:
-                rot = int(rotations.get(str(p_data["global_idx"]), 0))
-              except Exception:
-                pass
+              rot = int(rotations.get(str(p_data["global_idx"]), 0))
 
               if p_data.get("is_word"):
                 pdf_page = new_doc.new_page(width=595, height=842)
@@ -1753,14 +1770,14 @@ elif app_mode == MENU_4:
                 src_doc = fitz.open(
                     stream=p_data["file_bytes"], filetype="pdf"
                 )
+                p_idx = p_data["pdf_page_idx"]
                 new_doc.insert_pdf(
-                    src_doc,
-                    from_page=p_data["pdf_page_idx"],
-                    to_page=p_data["pdf_page_idx"],
+                    src_doc, from_page=p_idx, to_page=p_idx
                 )
                 if rot != 0:
-                  page = new_doc[-1]
-                  page.set_rotation((page.rotation + rot) % 360)
+                  new_doc[-1].set_rotation(
+                      (new_doc[-1].rotation + rot) % 360
+                  )
                 src_doc.close()
               else:
                 img = Image.open(io.BytesIO(p_data["file_bytes"]))
@@ -1772,18 +1789,18 @@ elif app_mode == MENU_4:
                   img = img.rotate(-rot, expand=True)
 
                 img_buf = io.BytesIO()
-                img.save(img_buf, format="JPEG", quality=95)
+                img.save(img_buf, format="JPEG", quality=92)
                 pdf_page = new_doc.new_page(
                     width=img.width, height=img.height
                 )
                 pdf_page.insert_image(pdf_page.rect, stream=img_buf.getvalue())
+
             merged_pdf_bytes_io = io.BytesIO()
-            new_doc.save(merged_pdf_bytes_io)
+            new_doc.save(merged_pdf_bytes_io, deflate=True)
             new_doc.close()
             merged_pdf_bytes = merged_pdf_bytes_io.getvalue()
 
             is_jpeg = final_name.lower().endswith((".jpg", ".jpeg"))
-            orig_total_bytes = sum([len(p["file_bytes"]) for p in group_pages])
 
             if is_jpeg and len(indices) == 1:
               p_data = group_pages[0]
@@ -1814,12 +1831,18 @@ elif app_mode == MENU_4:
               img_buf = io.BytesIO()
               img.save(img_buf, format="JPEG", quality=95)
               comp_bytes, out_mime = process_and_compress_file(
-                  img_buf.getvalue(), "image/jpeg", final_name
+                  img_buf.getvalue(),
+                  "image/jpeg",
+                  final_name,
+                  already_sanitized=True,
               )
             else:
               final_processed_bytes = sanitize_and_unlock_pdf(merged_pdf_bytes)
               comp_bytes, out_mime = process_and_compress_file(
-                  final_processed_bytes, "application/pdf", final_name
+                  final_processed_bytes,
+                  "application/pdf",
+                  final_name,
+                  already_sanitized=True,
               )
 
           orig_kb = sum([len(p["file_bytes"]) for p in group_pages]) / 1024
