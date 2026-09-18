@@ -566,7 +566,6 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
             target_dpi = 150
             quality = 65
             
-            # 💡 패치 지점: 회전된 pixmap 비율과 new_page 프레임 크기 동기화
             for page in doc:
                 rot = page.rotation % 360
                 if rot in (90, 270):
@@ -1084,6 +1083,7 @@ elif app_mode == MENU_4:
             22. Permanent Resident Card: {{Name}}_PR Card_{{ExpiryDate YYYY.MM.DD}}
             23. Digital Photo / Passport Photo: {{Name}}_Digital Photo (Use .pdf if multiple pages, else .jpg)
             24. T4 (Statement of Remuneration Paid): {{Name}}_T4_{{EmployerNameInEnglish}}_{{Year YYYY}}
+            25. Letter of Acceptance / Official Admission Letter (입학허가서): {{Name}}_LOA_{{SchoolNameInEnglish}} (e.g. 공원준_LOA_Metropolitan Community College)
 
             [CRITICAL FALLBACK RULE FOR UNKNOWN DOCUMENTS]
             - Step 1: If a document does NOT match any categories above, extract the official document title printed at the top of the document (in English, Title Case) and format as: {{Name}}_{{DocumentTitleInEnglish}}.
