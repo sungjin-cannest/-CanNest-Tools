@@ -210,9 +210,8 @@ def set_smart_widget_value(
   widget.field_value = val_str
 
   if hasattr(widget, "field_flags") and widget.field_flags:
-    widget.field_flags &= ~1  # 수정 가능(Fillable) 상태 유지
+    widget.field_flags &= ~1
 
-  # IRCC 양식 표준 폰트 식별자인 "Cour"를 최우선 지정
   try:
     widget.text_font = "Cour"
   except Exception:
@@ -253,7 +252,7 @@ def set_smart_widget_value(
 
 
 def embed_courier_in_doc(doc):
-  """cour.ttf 폰트를 PDF 문서 내 AcroForm DR 리소스에 통합 주입하는 함수"""
+  """cour.ttf 폰트를 PDF 문서 내 AcroForm DR 리소스에 주입하는 함수"""
   if not os.path.exists("cour.ttf"):
     return
 
@@ -351,15 +350,12 @@ def is_minor(dob_str):
     return True
 
 
+# 💡 폼 필드 입력값이 날아가지 않도록 원본 AcroForm 데이터 100% 보존
 def sanitize_and_unlock_pdf(pdf_bytes):
   try:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    clean_doc = fitz.open()
 
     for page in doc:
-      clean_doc.insert_pdf(doc, from_page=page.number, to_page=page.number)
-
-    for page in clean_doc:
       for widget in list(page.widgets()):
         field_type_str = getattr(widget, "field_type_string", "").lower()
         if (
@@ -372,11 +368,11 @@ def sanitize_and_unlock_pdf(pdf_bytes):
             widget.field_flags |= 1
             widget.update()
 
-    clean_doc.set_metadata({})
+    doc.need_appearances(True)
+    doc.set_metadata({})
 
     out_buf = io.BytesIO()
-    clean_doc.save(out_buf, clean=True, deflate=True)
-    clean_doc.close()
+    doc.save(out_buf, clean=True, deflate=True)
     doc.close()
     return out_buf.getvalue()
   except Exception:
@@ -736,15 +732,19 @@ def process_and_compress_file(file_bytes, mime_type, target_filename):
     if "pdf" in mime_type.lower():
       doc = fitz.open(stream=file_bytes, filetype="pdf")
       total_text_len = 0
+      has_widgets = False
 
       for page_idx in range(min(len(doc), 5)):
         page = doc.load_page(page_idx)
         text = page.get_text("text").strip()
         total_text_len += len(text)
+        if page.first_widget is not None:
+          has_widgets = True
         if total_text_len > 50:
           break
 
-      if total_text_len > 50:
+      # 💡 텍스트가 있거나 대화형 서식(Widget)이 있는 PDF는 원본 폼 데이터 보존
+      if total_text_len > 50 or has_widgets:
         doc.close()
         return sanitize_and_unlock_pdf(file_bytes), "application/pdf"
 
