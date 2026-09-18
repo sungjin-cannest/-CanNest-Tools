@@ -173,6 +173,7 @@ def format_full_name(surname, given_name):
     if not g: return s
     return f"{g} {s}"
 
+# 💡 이민국 표준 'Courier New' 폰트 일치 적용 함수
 def set_smart_widget_value(widget, value, default_fontsize=11, min_fontsize=5.5):
     val_str = str(value) if value is not None else ""
     widget.field_value = val_str
@@ -181,6 +182,7 @@ def set_smart_widget_value(widget, value, default_fontsize=11, min_fontsize=5.5)
         widget.field_flags &= ~1 
         
     try:
+        # 이민국 IMM 표준 폼 폰트 Courier New (PDF 엔진 내 Cour 키워드) 적용
         widget.text_font = "Cour"
     except:
         pass
@@ -189,6 +191,7 @@ def set_smart_widget_value(widget, value, default_fontsize=11, min_fontsize=5.5)
         box_width = widget.rect.width - 4 
         if box_width > 0:
             try:
+                # Courier New 정밀 폭 계산
                 font = fitz.Font("courier") 
                 len_at_default = font.text_length(val_str, fontsize=default_fontsize)
                 if len_at_default > box_width:
