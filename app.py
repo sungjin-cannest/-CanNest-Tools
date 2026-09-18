@@ -136,7 +136,7 @@ def read_word_document_text(file_bytes, file_name=""):
 
 
 # ==========================================
-# 3. 공통 캐싱 및 스마트 이미지 처리
+# 3. 공통 캐싱 및 스마트 글자 크기 조절 함수
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_pdf_bytes_cached(file_path):
@@ -201,6 +201,55 @@ def format_full_name(surname, given_name):
   if not g:
     return s
   return f"{g} {s}"
+
+
+# 💡 수정 가능한 서식 필드(Widget)를 유지하면서 Courier 폰트 및 위치 조정
+def set_smart_widget_value(
+    widget, value, default_fontsize=11, min_fontsize=5.5
+):
+  val_str = str(value) if value is not None else ""
+  widget.field_value = val_str
+
+  if hasattr(widget, "field_flags") and widget.field_flags:
+    widget.field_flags &= ~1  # Read-Only 해제하여 수정 가능한 상태로 유지
+
+  try:
+    widget.text_font = "Courier"
+  except Exception:
+    try:
+      widget.text_font = "Cour"
+    except Exception:
+      pass
+
+  if val_str and hasattr(widget, "rect"):
+    box_width = widget.rect.width - 4
+    if box_width > 0:
+      try:
+        if os.path.exists("cour.ttf"):
+          font = fitz.Font(fontfile="cour.ttf")
+        else:
+          font = fitz.Font("courier")
+
+        len_at_default = font.text_length(val_str, fontsize=default_fontsize)
+        if len_at_default > box_width:
+          len_at_1 = font.text_length(val_str, fontsize=1)
+          if len_at_1 > 0:
+            scaled_size = box_width / len_at_1
+            widget.text_fontsize = max(
+                min_fontsize, min(default_fontsize, scaled_size)
+            )
+          else:
+            widget.text_fontsize = default_fontsize
+        else:
+          widget.text_fontsize = default_fontsize
+      except Exception:
+        widget.text_fontsize = default_fontsize
+    else:
+      widget.text_fontsize = default_fontsize
+  else:
+    widget.text_fontsize = default_fontsize
+
+  widget.update()
 
 
 def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
@@ -302,7 +351,7 @@ def sanitize_and_unlock_pdf(pdf_bytes):
 
 
 # ==========================================
-# 4. Courier New 폰트 직접 삽입 PDF 생성 엔진
+# 4. PDF 서식 채우기 로직 (대화형 폼 필드 채우기)
 # ==========================================
 def extract_imm5476_info(image):
   prompt = """
@@ -467,13 +516,10 @@ def fill_imm5476(template_bytes, data):
   }
 
   page_date_counters = {}
-  fontfile = "cour.ttf" if os.path.exists("cour.ttf") else None
 
   for page_idx, page in enumerate(doc):
     page_date_counters[page_idx] = 0
-    widgets_to_process = list(page.widgets())
-
-    for widget in widgets_to_process:
+    for widget in page.widgets():
       field_name = widget.field_name
       if not field_name:
         continue
@@ -511,32 +557,11 @@ def fill_imm5476(template_bytes, data):
         elif page_idx == 3 and page_date_counters[page_idx] == 1:
           val_to_set = target_data["signDate"]
 
-      if val_to_set:
-        rect = widget.rect
-        page.delete_widget(widget)
+      if val_to_set is not None:
+        set_smart_widget_value(widget, val_to_set, default_fontsize=9)
 
-        fontsize = 9.0
-        if fontfile:
-          try:
-            f = fitz.Font(fontfile=fontfile)
-            box_w = rect.width - 4
-            t_len = f.text_length(str(val_to_set), fontsize=fontsize)
-            if t_len > box_w and box_w > 0:
-              len1 = f.text_length(str(val_to_set), fontsize=1)
-              if len1 > 0:
-                fontsize = max(5.5, min(9.0, box_w / len1))
-          except Exception:
-            pass
-
-        page.insert_textbox(
-            rect,
-            str(val_to_set),
-            fontsize=fontsize,
-            fontfile=fontfile,
-            fontname="CourNew" if fontfile else "courier",
-            color=(0, 0, 0),
-            align=0,
-        )
+  # PDF 열람 시 Courier 폰트 강제 표시
+  doc.need_appearances(True)
 
   output_pdf = io.BytesIO()
   doc.save(output_pdf, deflate=True)
@@ -552,8 +577,6 @@ def fill_consent_letter(template_bytes, data):
   for _ in range(num_pages_needed - 1):
     doc.insert_pdf(doc, from_page=0, to_page=0)
 
-  fontfile = "cour.ttf" if os.path.exists("cour.ttf") else None
-
   for page_num in range(num_pages_needed):
     page = doc[page_num]
     page_children = children[page_num * 3 : (page_num + 1) * 3]
@@ -563,9 +586,7 @@ def fill_consent_letter(template_bytes, data):
         ("1_3", "2_3"),
     ]
 
-    widgets_to_process = list(page.widgets())
-
-    for widget in widgets_to_process:
+    for widget in page.widgets():
       fname = widget.field_name.strip() if widget.field_name else ""
       if not fname:
         continue
@@ -597,8 +618,8 @@ def fill_consent_letter(template_bytes, data):
         val_to_set = data.get("non_acc_email", "")
       elif (
           fname
-          == "This child or these children hashave my or our consent to travel"
-          " with"
+          == "This child or these children hashave my or our consent to"
+          " travel with"
       ):
         val_to_set = data.get("acc_name", "")
       elif fname == "Relationship with Children 1":
@@ -640,33 +661,11 @@ def fill_consent_letter(template_bytes, data):
             elif fname == dob_key:
               val_to_set = page_children[idx].get("dob", "")
 
-      if val_to_set:
-        rect = widget.rect
-        page.delete_widget(widget)
+      if val_to_set is not None:
+        set_smart_widget_value(widget, val_to_set, default_fontsize=11)
 
-        default_fontsize = 11.0
-        fontsize = default_fontsize
-        if fontfile:
-          try:
-            f = fitz.Font(fontfile=fontfile)
-            box_w = rect.width - 4
-            t_len = f.text_length(str(val_to_set), fontsize=default_fontsize)
-            if t_len > box_w and box_w > 0:
-              len1 = f.text_length(str(val_to_set), fontsize=1)
-              if len1 > 0:
-                fontsize = max(5.5, min(default_fontsize, box_w / len1))
-          except Exception:
-            pass
-
-        page.insert_textbox(
-            rect,
-            str(val_to_set),
-            fontsize=fontsize,
-            fontfile=fontfile,
-            fontname="CourNew" if fontfile else "courier",
-            color=(0, 0, 0),
-            align=0,
-        )
+  # PDF 열람 시 Courier 폰트 강제 표시
+  doc.need_appearances(True)
 
   output_pdf = io.BytesIO()
   doc.save(output_pdf, deflate=True)
