@@ -203,7 +203,6 @@ def format_full_name(surname, given_name):
   return f"{g} {s}"
 
 
-# 💡 수정 가능한 서식 필드(Widget)를 유지하면서 Courier 폰트 및 위치 조정
 def set_smart_widget_value(
     widget, value, default_fontsize=11, min_fontsize=5.5
 ):
@@ -211,13 +210,14 @@ def set_smart_widget_value(
   widget.field_value = val_str
 
   if hasattr(widget, "field_flags") and widget.field_flags:
-    widget.field_flags &= ~1  # Read-Only 해제하여 수정 가능한 상태로 유지
+    widget.field_flags &= ~1  # 수정 가능(Fillable) 상태 유지
 
+  # IRCC 양식 표준 폰트 식별자인 "Cour"를 최우선 지정
   try:
-    widget.text_font = "Courier"
+    widget.text_font = "Cour"
   except Exception:
     try:
-      widget.text_font = "Cour"
+      widget.text_font = "Courier"
     except Exception:
       pass
 
@@ -250,6 +250,39 @@ def set_smart_widget_value(
     widget.text_fontsize = default_fontsize
 
   widget.update()
+
+
+def embed_courier_in_doc(doc):
+  """cour.ttf 폰트를 PDF 문서 내 AcroForm DR 리소스에 통합 주입하는 함수"""
+  if not os.path.exists("cour.ttf"):
+    return
+
+  try:
+    page = doc[0]
+    font_xrefs = {}
+    for alias in ["Cour", "Courier", "CoNi", "CourierNew", "CourierNewPSMT"]:
+      try:
+        xref = page.insert_font(fontfile="cour.ttf", fontname=alias)
+        font_xrefs[alias] = xref
+      except Exception:
+        pass
+
+    catalog_xref = doc.pdf_catalog()
+    acroform_res = doc.xref_get_key(catalog_xref, "AcroForm")
+
+    acroform_xref = None
+    if acroform_res[0] == "xr":
+      acroform_xref = int(acroform_res[1].split()[0])
+    elif acroform_res[0] == "dict":
+      acroform_xref = catalog_xref
+
+    if acroform_xref and font_xrefs:
+      font_dict_entries = " ".join(
+          [f"/{alias} {xref} 0 R" for alias, xref in font_xrefs.items()]
+      )
+      doc.xref_set_key(acroform_xref, "DR/Font", f"<< {font_dict_entries} >>")
+  except Exception:
+    pass
 
 
 def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
@@ -351,7 +384,7 @@ def sanitize_and_unlock_pdf(pdf_bytes):
 
 
 # ==========================================
-# 4. PDF 서식 채우기 로직 (대화형 폼 필드 채우기)
+# 4. PDF 서식 채우기 로직
 # ==========================================
 def extract_imm5476_info(image):
   prompt = """
@@ -560,7 +593,7 @@ def fill_imm5476(template_bytes, data):
       if val_to_set is not None:
         set_smart_widget_value(widget, val_to_set, default_fontsize=9)
 
-  # PDF 열람 시 Courier 폰트 강제 표시
+  embed_courier_in_doc(doc)
   doc.need_appearances(True)
 
   output_pdf = io.BytesIO()
@@ -664,7 +697,7 @@ def fill_consent_letter(template_bytes, data):
       if val_to_set is not None:
         set_smart_widget_value(widget, val_to_set, default_fontsize=11)
 
-  # PDF 열람 시 Courier 폰트 강제 표시
+  embed_courier_in_doc(doc)
   doc.need_appearances(True)
 
   output_pdf = io.BytesIO()
