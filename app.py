@@ -284,7 +284,25 @@ def embed_courier_in_doc(doc):
     pass
 
 
-# 💡 제자리 수정(In-place)을 통해 AcroForm 구조를 100% 보존하여 내용 유실 방지
+def page_to_image_pdf_page(new_doc, src_doc, page_idx, rotation=0, dpi=200):
+  page = src_doc.load_page(page_idx)
+  zoom = dpi / 72.0
+  pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+  img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+  if rotation % 360 != 0:
+    img = img.rotate(-rotation, expand=True)
+
+  buf = io.BytesIO()
+  img.save(buf, format="JPEG", quality=92, optimize=True)
+  buf.seek(0)
+
+  page_w = img.width * 72.0 / dpi
+  page_h = img.height * 72.0 / dpi
+  pdf_page = new_doc.new_page(width=page_w, height=page_h)
+  pdf_page.insert_image(pdf_page.rect, stream=buf.getvalue())
+
+
 def sanitize_and_unlock_pdf(pdf_bytes):
   try:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -298,14 +316,13 @@ def sanitize_and_unlock_pdf(pdf_bytes):
           page.delete_widget(widget)
         else:
           if hasattr(widget, "field_flags"):
-            widget.field_flags &= ~1  # 읽기 전용 해제하여 사후 수정 가능하도록 설정
+            widget.field_flags &= ~1
             widget.update()
             
     doc.need_appearances(True)
     doc.set_metadata({})
 
     out_buf = io.BytesIO()
-    # clean=True는 내부 구조를 재작성하므로 폼 데이터 유실을 막기 위해 생략
     doc.save(out_buf, deflate=True)
     doc.close()
     return out_buf.getvalue()
@@ -332,7 +349,6 @@ def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
       text = ""
       for page in doc:
         text += page.get_text("text") + "\n"
-        # 💡 [메뉴 3 AI 인식용] 텍스트 레이어뿐만 아니라 숨겨진 질문지 위젯 입력값도 명시적으로 추출
         for widget in page.widgets():
             if widget.field_value:
                 text += f"{widget.field_name}: {widget.field_value}\n"
@@ -387,13 +403,16 @@ def is_minor(dob_str):
 # 4. PDF 서식 채우기 로직
 # ==========================================
 def extract_imm5476_info(image):
+  # 💡 AI 프롬프트 업데이트: 이메일과 주소/전화번호 추출 지시 추가
   prompt = """
-    Analyze this identity document (passport/permit/visa) carefully.
+    Analyze this document (which may be an identity document or an existing application form like IMM 5476) carefully.
     Extract the following details into exact JSON structure:
     - surname: Family name converted to Title Case (First letter capitalized, e.g., 'KIM' -> 'Kim')
     - given_name: Given names converted to Title Case (e.g., 'EUN SUN' -> 'Eun Sun')
-    - dob: Date of birth in YYYY-MM-DD format
+    - dob: Date of birth in YYYY-MM-DD format (if available, else "")
     - uci: UCI numbers only if present (10 digits or 8 digits), else empty string
+    - email: Email address if present, else empty string
+    - address_phone: Residential/Mailing address or telephone number if present, else empty string
     Return ONLY raw valid JSON object without markdown or code formatting.
     """
   try:
@@ -745,12 +764,11 @@ def process_and_compress_file(
         page = doc.load_page(page_idx)
         text = page.get_text("text").strip()
         total_text_len += len(text)
-        if list(page.widgets()):  # 💡 질문지(폼 필드) 존재 여부 정확히 확인
+        if list(page.widgets()):
           has_widgets = True
         if total_text_len > 50:
           break
 
-      # 💡 텍스트가 있거나 대화형 폼 필드(Widget)가 있는 PDF는 강제 이미지 압축 방지
       if total_text_len > 50 or has_widgets:
         doc.close()
         if already_sanitized:
@@ -914,14 +932,17 @@ if app_mode == MENU_1:
     with c1:
       surname = st.text_input("성 (Surname)", data.get("surname", ""))
       dob = st.text_input("생년월일", data.get("dob", ""))
-      email = st.text_input("이메일 주소", "")
+      # 💡 UI 렌더링 시 AI 추출 이메일 값 연동
+      email = st.text_input("이메일 주소", data.get("email", ""))
     with c2:
       given = st.text_input("이름 (Given Name)", data.get("given_name", ""))
       uci = st.text_input("UCI", data.get("uci", ""))
       sign_date = st.date_input("서명날짜", datetime.date.today())
 
+    # 💡 UI 렌더링 시 AI 추출 주소/번호 값 연동
     address_phone = st.text_input(
         "주소 또는 전화번호 (이메일이 없는 미성년자/신청자용)",
+        value=data.get("address_phone", ""),
         placeholder="예: 2301-6658 Dow Ave, Burnaby BC V5H 0C7",
     )
 
@@ -1409,6 +1430,7 @@ elif app_mode == MENU_4:
           for i in range(len(doc)):
             if page_counter > 40:
               break
+
             page = doc.load_page(i)
             pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2))
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
@@ -1713,7 +1735,6 @@ elif app_mode == MENU_4:
             final_name += ".pdf"
 
         try:
-          # 💡 [해결책 2] 원본 PDF 구조를 파괴하지 않고 병합하기
           if is_all_from_same_pdf:
             src_doc = fitz.open(
                 stream=group_pages[0]["file_bytes"], filetype="pdf"
@@ -1729,17 +1750,18 @@ elif app_mode == MENU_4:
               src_doc.close()
               final_processed_bytes = sanitize_and_unlock_pdf(merged_pdf_bytes)
             else:
-              src_doc.select(pdf_indices)
-              for i, p_data in enumerate(group_pages):
-                try:
-                  rot = int(rotations.get(str(p_data["global_idx"]), 0))
-                  if rot != 0:
-                    page = src_doc[i]
-                    page.set_rotation((page.rotation + rot) % 360)
-                except Exception:
-                  pass
+              new_doc = fitz.open()
+              for p_data in group_pages:
+                p_idx = p_data["pdf_page_idx"]
+                rot = int(rotations.get(str(p_data["global_idx"]), 0))
+                
+                new_doc.insert_pdf(src_doc, from_page=p_idx, to_page=p_idx)
+                if rot != 0:
+                  new_doc[-1].set_rotation((new_doc[-1].rotation + rot) % 360)
+
               merged_pdf_bytes_io = io.BytesIO()
-              src_doc.save(merged_pdf_bytes_io, deflate=True)
+              new_doc.save(merged_pdf_bytes_io, deflate=True)
+              new_doc.close()
               src_doc.close()
               merged_pdf_bytes = merged_pdf_bytes_io.getvalue()
               final_processed_bytes = sanitize_and_unlock_pdf(merged_pdf_bytes)
@@ -1771,13 +1793,9 @@ elif app_mode == MENU_4:
                     stream=p_data["file_bytes"], filetype="pdf"
                 )
                 p_idx = p_data["pdf_page_idx"]
-                new_doc.insert_pdf(
-                    src_doc, from_page=p_idx, to_page=p_idx
-                )
+                new_doc.insert_pdf(src_doc, from_page=p_idx, to_page=p_idx)
                 if rot != 0:
-                  new_doc[-1].set_rotation(
-                      (new_doc[-1].rotation + rot) % 360
-                  )
+                  new_doc[-1].set_rotation((new_doc[-1].rotation + rot) % 360)
                 src_doc.close()
               else:
                 img = Image.open(io.BytesIO(p_data["file_bytes"]))
