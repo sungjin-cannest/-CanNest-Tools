@@ -4,26 +4,37 @@ import streamlit as st
 st.set_page_config(page_title="CanNest 통합 업무 시스템", layout="wide")
 
 import google.generativeai as genai
-import fitz  # PyMuPDF
+try:
+    import pymupdf as fitz  # PyMuPDF 최신 버전
+except ImportError:
+    import fitz  # 구버전 호환
 from PIL import Image, ImageOps, ImageDraw
 import pillow_heif
 import io
 import json
 import os
 import re
+import time
 import datetime
+import hashlib
 import uuid
 import zipfile
+from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor
 
 try:
     import docx
     from docx.shared import RGBColor
+    DOCX_AVAILABLE = True
 except ImportError:
-    pass
+    DOCX_AVAILABLE = False
 
 pillow_heif.register_heif_opener()
 Image.MAX_IMAGE_PIXELS = None
+
+LOCAL_TZ = ZoneInfo("America/Vancouver")
+HANGUL_RE = re.compile(r"[ㄱ-ㆎ가-힣]")
+IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.heic', '.heif', '.webp')
 
 # ==========================================
 # 0. API 키 설정 및 보안
@@ -57,32 +68,66 @@ if not check_password():
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 genai.configure(api_key=GEMINI_API_KEY)
 
-def safe_generate_content(contents):
-    candidate_models = ['gemini-3.6-flash', 'gemini-1.5-flash']
+# [수정] gemini-1.5-flash는 서비스 종료됨 → 현재 운영 중인 모델로 폴백 체인 교체
+CANDIDATE_MODELS = ['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-2.5-flash']
+
+def safe_generate_content(contents, json_mode=False):
+    """모델 폴백 + 일시적 오류(429/500/503) 재시도."""
+    gen_config = {"temperature": 0}
+    if json_mode:
+        gen_config["response_mime_type"] = "application/json"
+
     last_error = None
-    for model_name in candidate_models:
-        try:
-            mod = genai.GenerativeModel(model_name)
-            return mod.generate_content(contents)
-        except Exception as e:
-            last_error = e
-            if "404" in str(e) or "not found" in str(e).lower():
-                continue
-            raise e
+    for model_name in CANDIDATE_MODELS:
+        mod = genai.GenerativeModel(model_name, generation_config=gen_config)
+        for attempt in range(3):
+            try:
+                return mod.generate_content(contents)
+            except Exception as e:
+                last_error = e
+                msg = str(e).lower()
+                if "404" in msg or "not found" in msg:
+                    break  # 다음 모델로
+                if any(k in msg for k in ["429", "500", "503", "unavailable", "overloaded", "deadline", "resource exhausted"]):
+                    time.sleep(2 * (attempt + 1))
+                    continue  # 같은 모델 재시도
+                raise
+        # 재시도 소진 또는 404 → 다음 모델
     raise last_error
+
+def parse_json_response(text):
+    """```json 펜스, 앞뒤 설명문이 붙어도 JSON만 추출."""
+    t = (text or "").strip()
+    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t, flags=re.IGNORECASE)
+    try:
+        return json.loads(t)
+    except json.JSONDecodeError:
+        start, end = t.find("{"), t.rfind("}")
+        if start != -1 and end > start:
+            return json.loads(t[start:end + 1])
+        raise
 
 # ==========================================
 # 1. 문서 파싱 엔진
 # ==========================================
 def read_word_document_text(file_bytes, file_name=""):
+    if not DOCX_AVAILABLE:
+        return ""
     try:
         doc_obj = docx.Document(io.BytesIO(file_bytes))
         text_list = [p.text for p in doc_obj.paragraphs if p.text.strip()]
         for table in doc_obj.tables:
             for row in table.rows:
-                row_txt = " | ".join([cell.text.strip() for cell in row.cells if cell.text.strip()])
-                if row_txt:
-                    text_list.append(row_txt)
+                seen = set()
+                cells = []
+                for cell in row.cells:  # 병합 셀 중복 제거
+                    if cell._tc in seen:
+                        continue
+                    seen.add(cell._tc)
+                    if cell.text.strip():
+                        cells.append(cell.text.strip())
+                if cells:
+                    text_list.append(" | ".join(cells))
         return "\n".join(text_list)
     except Exception:
         return ""
@@ -104,7 +149,7 @@ def get_preloaded_file_bytes(file_names):
 def process_uploaded_file_to_image(file_obj):
     file_bytes = file_obj.getvalue()
     fname = file_obj.name.lower()
-    
+
     if fname.endswith(('.doc', '.docx')):
         text = read_word_document_text(file_bytes, file_obj.name)
         img = Image.new('RGB', (800, 1000), color=(255, 255, 255))
@@ -123,16 +168,29 @@ def process_uploaded_file_to_image(file_obj):
         img = ImageOps.exif_transpose(img)
         if img.mode != "RGB":
             img = img.convert("RGB")
-            
+
     max_dim = max(img.width, img.height)
     if max_dim > 1800:
         ratio = 1800.0 / float(max_dim)
         img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.Resampling.LANCZOS)
-        
+
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=75)
     buf.seek(0)
     return Image.open(buf)
+
+def image_bytes_to_jpeg_part(file_bytes, max_dim=2000):
+    """[수정] HEIC/PNG 등 이미지를 Gemini가 확실히 읽는 JPEG로 변환 (EXIF 회전 보정)."""
+    img = Image.open(io.BytesIO(file_bytes))
+    img = ImageOps.exif_transpose(img)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    if max(img.size) > max_dim:
+        ratio = max_dim / float(max(img.size))
+        img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return {"mime_type": "image/jpeg", "data": buf.getvalue()}
 
 def format_full_name(surname, given_name):
     s = surname.strip()
@@ -146,7 +204,7 @@ def set_smart_widget_value(widget, value, default_fontsize=11, min_fontsize=5.5)
     val_str = str(value) if value is not None else ""
     widget.field_value = val_str
     if hasattr(widget, "field_flags") and widget.field_flags:
-        widget.field_flags &= ~1 
+        widget.field_flags &= ~1
     try: widget.text_font = "Cour"
     except Exception:
         try: widget.text_font = "Courier"
@@ -165,7 +223,7 @@ def embed_courier_in_doc(doc):
             except Exception: pass
         catalog_xref = doc.pdf_catalog()
         acroform_res = doc.xref_get_key(catalog_xref, "AcroForm")
-        acroform_xref = int(acroform_res[1].split()[0]) if acroform_res[0] == "xr" else catalog_xref
+        acroform_xref = int(acroform_res[1].split()[0]) if acroform_res[0] == "xref" else catalog_xref
         if acroform_xref and font_xrefs:
             font_dict_entries = " ".join([f"/{alias} {xref} 0 R" for alias, xref in font_xrefs.items()])
             doc.xref_set_key(acroform_xref, "DR/Font", f"<< {font_dict_entries} >>")
@@ -193,185 +251,472 @@ def sanitize_and_unlock_pdf(pdf_bytes):
     except Exception:
         return pdf_bytes
 
-def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
+# ------------------------------------------
+# 1-1. 대상 PDF 폼 필드 목록 추출 (고유 키 부여)
+# ------------------------------------------
+BUTTON_TYPES = (fitz.PDF_WIDGET_TYPE_CHECKBOX, fitz.PDF_WIDGET_TYPE_RADIOBUTTON)
+CHOICE_TYPES = (fitz.PDF_WIDGET_TYPE_COMBOBOX, fitz.PDF_WIDGET_TYPE_LISTBOX)
+
+def _safe_on_state(w):
+    try:
+        s = w.on_state()
+        if s and str(s).lower() != "off":
+            return str(s)
+    except Exception:
+        pass
+    return None
+
+def extract_pdf_form_fields(pdf_bytes):
+    """
+    [핵심 수정] 같은 이름을 공유하는 라디오/체크박스(예: Yes·No 한 그룹)는
+    이름만으로는 어느 버튼인지 구분할 수 없어, 기존 코드는 그룹의 '모든' 버튼을 켰고
+    결국 마지막 버튼(주로 'No')이 선택되는 반대 결과가 나왔습니다.
+    → 버튼마다 '이름 [상태값]' 형태의 고유 키를 부여해 AI가 정확히 하나만 고르게 합니다.
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    raw = []
+    name_counts = {}
+    for p_idx, page in enumerate(doc):
+        for w in page.widgets():
+            if w.field_type == fitz.PDF_WIDGET_TYPE_SIGNATURE:
+                continue
+            r = w.rect
+            clip = fitz.Rect(max(0, r.x0 - 120), max(0, r.y0 - 20),
+                             min(page.rect.width, r.x1 + 60), min(page.rect.height, r.y1 + 20))
+            nearby = " ".join(page.get_text("text", clip=clip).split())[:160]
+            if w.field_type in BUTTON_TYPES:
+                # 버튼 바로 오른쪽/왼쪽 글자 = 해당 선택지 이름 (Yes/No 구분용)
+                right = " ".join(page.get_text("text", clip=fitz.Rect(r.x1, r.y0 - 2, r.x1 + 45, r.y1 + 2)).split())
+                left = " ".join(page.get_text("text", clip=fitz.Rect(max(0, r.x0 - 30), r.y0 - 2, r.x0, r.y1 + 2)).split())
+                nearby = f"{nearby} || OPTION LABEL (left): {left[-20:]} | (right): {right[:20]}"
+            info = {
+                "name": w.field_name or "",
+                "label": (w.field_label or "").strip(),
+                "type": w.field_type,
+                "type_str": w.field_type_string,
+                "on_state": _safe_on_state(w) if w.field_type in BUTTON_TYPES else None,
+                "choices": [c if isinstance(c, str) else c[-1] for c in (w.choice_values or [])] if w.field_type in CHOICE_TYPES else [],
+                "nearby": nearby,
+                "page": p_idx,
+                "xref": w.xref,
+                "current": w.field_value,
+            }
+            raw.append(info)
+            if w.field_type in BUTTON_TYPES:
+                name_counts[info["name"]] = name_counts.get(info["name"], 0) + 1
+
+    # 고유 키 부여
+    fields, used = [], set()
+    btn_index = {}
+    for f in raw:
+        key = f["name"]
+        if f["type"] in BUTTON_TYPES and name_counts.get(f["name"], 0) > 1:
+            btn_index[f["name"]] = btn_index.get(f["name"], 0) + 1
+            suffix = f["on_state"] or f"#{btn_index[f['name']]}"
+            key = f"{f['name']} [{suffix}]"
+        if f["type"] not in BUTTON_TYPES and key in used:
+            # 같은 이름의 텍스트 필드는 값이 공유되므로 한 번만 노출
+            f["key"] = key
+            f["duplicate"] = True
+            fields.append(f)
+            continue
+        base, n = key, 2
+        while key in used:
+            key = f"{base} ({n})"
+            n += 1
+        used.add(key)
+        f["key"] = key
+        f["duplicate"] = False
+        fields.append(f)
+
+    xfa = False
+    try:
+        cat = doc.pdf_catalog()
+        af = doc.xref_get_key(cat, "AcroForm")
+        if af[0] == "xref":
+            af_xref = int(af[1].split()[0])
+            xfa = doc.xref_get_key(af_xref, "XFA")[0] != "null"
+        elif af[0] == "dict":
+            xfa = "/XFA" in af[1]
+    except Exception:
+        pass
+    doc.close()
+    return fields, xfa
+
+def format_field_catalog(fields):
+    lines = []
+    for f in fields:
+        if f["duplicate"]:
+            continue
+        kind = {fitz.PDF_WIDGET_TYPE_CHECKBOX: "CHECKBOX",
+                fitz.PDF_WIDGET_TYPE_RADIOBUTTON: "RADIO"}.get(f["type"], f["type_str"].upper())
+        line = f"KEY: {json.dumps(f['key'], ensure_ascii=False)} | TYPE: {kind} | PAGE: {f['page'] + 1}"
+        if f["label"]:
+            line += f" | TOOLTIP: {f['label'][:120]}"
+        line += f" | NEARBY TEXT: {f['nearby']}"
+        if f["choices"]:
+            line += f" | ALLOWED VALUES: {f['choices']}"
+        lines.append(line)
+    return "\n".join(lines)
+
+# ------------------------------------------
+# 1-2. 손님 자료 → Gemini 입력 변환
+# ------------------------------------------
+def prepare_document_for_gemini(file_bytes, mime_type, file_name="", max_chars=35000):
     ext = os.path.splitext(file_name)[1].lower() if file_name else ""
-    if "word" in mime_type.lower() or ext in ['.doc', '.docx']:
+    mime_type = (mime_type or "").lower()
+    header = f"\n--- [Document: {file_name}] ---\n"
+
+    if ext == ".doc" or mime_type == "application/msword":
+        # [수정] 구형 .doc는 python-docx로 못 읽고, Gemini도 받지 못해 전체 분석이 실패했음
+        return [], f"{file_name}: 구형 .doc 형식은 읽을 수 없습니다. Word에서 .docx 또는 PDF로 저장 후 올려주세요."
+
+    if "word" in mime_type or ext == ".docx":
         word_text = read_word_document_text(file_bytes, file_name)
         if word_text:
-            return [f"\n--- [Word Document: {file_name}] ---\n{word_text[:35000]}\n"]
-            
-    if "pdf" in mime_type.lower() or ext == '.pdf':
+            return [header + word_text[:max_chars] + "\n"], None
+        return [], f"{file_name}: Word 파일에서 텍스트를 읽지 못했습니다."
+
+    if ext in IMAGE_EXTS or mime_type.startswith("image/"):
+        try:
+            return [header + "(image below)", image_bytes_to_jpeg_part(file_bytes)], None
+        except Exception as e:
+            return [], f"{file_name}: 이미지를 열 수 없습니다 ({e})."
+
+    if "pdf" in mime_type or ext == ".pdf":
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
             text = ""
-            field_list = []
-            
             for page in doc:
                 text += page.get_text("text") + "\n"
-                
-                # 대화형 서식(Widget) 필드 리스트를 AI에게 제공
                 for w in page.widgets():
-                    if w.field_value:
-                        text += f"[{w.field_name}]: {w.field_value}\n"
-                    
-                    r = w.rect
-                    clip = fitz.Rect(max(0, r.x0 - 100), max(0, r.y0 - 25), min(page.rect.width, r.x1 + 50), min(page.rect.height, r.y1 + 25))
-                    nearby = page.get_text("text", clip=clip).replace('\n', ' ').strip()
-                    field_list.append(f"Field Name: '{w.field_name}' | Nearby Text: '{nearby}' | Type: {w.field_type_string}")
-            
-            if field_list:
-                text += "\n\n--- [FILLABLE PDF FIELDS AVAILABLE] ---\n"
-                text += "Map client data exactly to the 'Field Name' keys listed below:\n"
-                text += "\n".join(field_list) + "\n"
+                    v = w.field_value
+                    if v and str(v).lower() != "off":
+                        label = w.field_label or w.field_name
+                        text += f"[Filled field: {label}] {v}\n"
 
-            if len(text.strip()) > 100:
-                doc.close()
-                return [f"\n--- [Document: {file_name}] ---\n{text[:35000]}\n"]
-            else:
-                images = []
-                for p_idx in range(min(len(doc), 10)):
-                    page = doc.load_page(p_idx)
-                    pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+            # [수정] 텍스트가 조금만 있는 스캔본(예: 여권 스캔 + 워터마크 문구)도 이미지로 함께 보냄
+            page_count = len(doc)
+            avg_chars = len(text.strip()) / max(page_count, 1)
+            parts = []
+            if text.strip():
+                parts.append(header + text[:max_chars] + "\n")
+            if avg_chars < 200:
+                if not parts:
+                    parts.append(header + "(scanned pages below)")
+                for p_idx in range(min(page_count, 10)):
+                    pix = doc.load_page(p_idx).get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                     buf = io.BytesIO()
-                    img.save(buf, format="JPEG", quality=75)
-                    images.append({"mime_type": "image/jpeg", "data": buf.getvalue()})
-                doc.close()
-                return images
-        except Exception:
-            pass
-    return [{"mime_type": mime_type, "data": file_bytes}]
+                    img.save(buf, format="JPEG", quality=80)
+                    parts.append({"mime_type": "image/jpeg", "data": buf.getvalue()})
+            doc.close()
+            return parts, None
+        except Exception as e:
+            return [], f"{file_name}: PDF를 열 수 없습니다 ({e})."
+
+    return [], f"{file_name}: 지원하지 않는 형식입니다."
 
 def batch_process_client_files(files):
     def worker(f):
-        mime = f.type if f.type else "application/pdf"
-        return prepare_document_for_gemini(f.getvalue(), mime, f.name)
+        return prepare_document_for_gemini(f.getvalue(), f.type, f.name)
     with ThreadPoolExecutor(max_workers=4) as executor:
         results = list(executor.map(worker, files))
-    flat = []
-    for r in results:
-        flat.extend(r)
-    return flat
+    flat, warnings = [], []
+    for parts, warn in results:
+        flat.extend(parts)
+        if warn:
+            warnings.append(warn)
+    return flat, warnings
 
 # ==========================================
-# 2. AI 질문지 분석 및 완벽 매핑
+# 2. AI 질문지 분석 및 매핑
 # ==========================================
+QA_RULES = """
+[CRITICAL RULES - MUST OBEY]
+1. UNKNOWN INFO = OMIT: If the client documents do NOT explicitly answer Tuberculosis, Medical issues, Crime, Visa Refusals, or Biometrics, OMIT those fields entirely. NEVER guess "No".
+2. ENGLISH TESTS: Only if the client explicitly has an IELTS, CELPIP, or Duolingo score, select the English-test YES option and fill in the scores. Otherwise leave it blank.
+3. CANADA VISA HISTORY: If the client currently holds a Canadian permit (Visitor Record, Work Permit, Study Permit), record it in the Canada visa application history field (e.g., "Work Permit (Valid until YYYY-MM-DD)").
+4. CURRENT JOB LOGIC: Today is {today}. A job whose end date is before this month is NOT current. In the work history table, the FIRST ROW is reserved for the current job. If the client has NO current job, leave the entire first row blank and start past jobs from the SECOND row, most recent first.
+5. TABLE SEQUENTIAL MAPPING: Map Education and Travel history sequentially from Row 1 with no empty rows in between, most recent first.
+6. OVERSEAS RESIDENCE: If overseas residence is inferred only from overseas work, fill City/Country but leave From/To dates blank.
+7. FAMILY INFO: Fill spouse and children information if available.
+8. SIGNATURE / DATE OF SIGNING: Leave blank.
+9. LANGUAGE: All values MUST be in English (Latin letters, numbers). Romanize Korean names exactly as they appear in the passport. NO KOREAN characters in values.
+10. DATES: Use YYYY-MM-DD unless the field's nearby text shows another format (e.g., DD/MM/YYYY, or separate Year/Month boxes).
+11. CONFLICTS: If documents disagree, prefer passport > permit/official letters > previous questionnaire > resume.
+"""
+
 def analyze_qa_for_fill(client_files, target_file):
-    prompt = """
-    You are an expert Canadian immigration assistant filling out a blank questionnaire based on client documents.
-    The FIRST document is the NEW BLANK QUESTIONNAIRE. The rest are CLIENT SOURCE MATERIALS.
+    """반환: (result_dict | None, warnings, context)"""
+    today = datetime.datetime.now(LOCAL_TZ).strftime("%B %d, %Y")
+    target_bytes = target_file.getvalue()
+    is_docx = target_file.name.lower().endswith(".docx")
 
-    [CRITICAL RULES - MUST OBEY OR FAIL]
-    1. UNKNOWN INFO = OMIT: If the client documents do NOT explicitly mention an answer for Tuberculosis, Medical issues, Crime, Visa Refusals, or Biometrics, YOU MUST OMIT those fields from the JSON entirely. ABSOLUTELY DO NOT GUESS "NO", "Off", or "False". Leave them unmapped and blank.
-    2. ENGLISH TESTS: If AND ONLY IF the client explicitly has an IELTS, CELPIP, or Duolingo score in the materials, map "Yes" to the English test YES checkbox. Otherwise, LEAVE IT COMPLETELY BLANK.
-    3. CANADA VISA HISTORY: If the client currently holds a Canadian permit (e.g., Visitor Record, Work Permit, Study Permit), they obviously applied for it. You MUST map this fact to the "Canada Visa Application History" text field (e.g., "Visitor Record (Valid until YYYY-MM-DD)").
-    4. CURRENT JOB LOGIC: Today is October 2026. A job ending in "2026-09" or earlier is NOT current. In the work history table, the FIRST ROW is reserved for the "Current" job. IF THE CLIENT DOES NOT HAVE A CURRENT JOB, YOU MUST LEAVE THE ENTIRE FIRST ROW BLANK. Start mapping their past jobs from the SECOND ROW downwards.
-    5. TABLE SEQUENTIAL MAPPING: Map Education and Travel history sequentially starting from Row 1. NO empty gaps between rows. Map Work history from Row 2 if there is no current job, otherwise Row 1.
-    6. OVERSEAS RESIDENCE: If you infer overseas residence from overseas work experience, DO NOT fill in the "From/To" dates for that residence (leave dates blank), but DO fill in the City/Country.
-    7. FAMILY INFO: Extract Spouse and Children information if available and map them.
-    8. SIGNATURE DATE = BLANK: DO NOT fill in the signature Date. Leave it blank.
-    9. LANGUAGE: All output values MUST be in ENGLISH (Latin alphabet, numbers). NO KOREAN inside values.
+    source_parts, warnings = batch_process_client_files(client_files)
+    if not source_parts:
+        st.error("읽을 수 있는 손님 자료가 없습니다.")
+        return None, warnings, None
 
-    Return ONLY a raw JSON object formatted strictly as:
-    {
-      "pdf_fields": {
-         "Exact_Field_Name_1": "Extracted Value",
-         "Exact_Checkbox_Name_For_Yes": "Yes"
-      },
-      "docx_fields": {
-         "출생 도시": "Value if the target was DOCX"
-      }
-    }
-    """
-    contents = [prompt]
-    mime_target = target_file.type if target_file.type else "application/pdf"
-    contents.extend(prepare_document_for_gemini(target_file.getvalue(), mime_target, f"[NEW_FORM] {target_file.name}"))
-    contents.extend(batch_process_client_files(client_files))
+    if is_docx:
+        form_text = read_word_document_text(target_bytes, target_file.name)
+        prompt = f"""
+You are an expert Canadian immigration assistant filling out a blank questionnaire (Word document) using the client's existing documents.
+{QA_RULES.format(today=today)}
+OUTPUT: Return ONLY a JSON object: {{"docx_fields": {{"<exact question/label text copied from the form>": "<answer>"}}}}
+- Keys MUST be copied exactly (character for character) from the form text below, e.g. the Korean label "출생 도시" or "Date of Birth".
+- Use the most specific label (e.g. "Father's Name", not just "Name").
+- Only include fields you can answer from the client materials.
+
+===== BLANK QUESTIONNAIRE (TARGET) =====
+{form_text[:60000]}
+===== END OF TARGET =====
+
+===== CLIENT SOURCE MATERIALS =====
+"""
+        context = {"kind": "docx"}
+    else:
+        fields, has_xfa = extract_pdf_form_fields(target_bytes)
+        if not fields:
+            st.error("이 PDF에는 입력 가능한 칸(대화형 폼 필드)이 없습니다. 칸이 있는 PDF 또는 .docx 질문지를 올려주세요.")
+            return None, warnings, None
+        if has_xfa:
+            warnings.append("이 PDF는 XFA(동적) 양식입니다. Adobe Acrobat에서는 채운 값이 보이지 않을 수 있으니 결과를 꼭 열어서 확인하세요.")
+        page_text = ""
+        try:
+            d = fitz.open(stream=target_bytes, filetype="pdf")
+            page_text = "\n".join(f"[Page {i + 1}]\n{p.get_text('text')}" for i, p in enumerate(d))
+            d.close()
+        except Exception:
+            pass
+        prompt = f"""
+You are an expert Canadian immigration assistant filling out a blank fillable PDF questionnaire using the client's existing documents.
+{QA_RULES.format(today=today)}
+HOW TO FILL:
+- Each fillable field has a unique KEY listed below. Use KEYS EXACTLY as written (including any " [..]" suffix).
+- TEXT / COMBOBOX: value is the answer text. For a COMBOBOX use one of its ALLOWED VALUES.
+- CHECKBOX / RADIO: to select an option, set that option's KEY to "Yes". For a Yes/No question, select ONLY the one correct option key (e.g. "Q3 [Yes]": "Yes"). Never set "No" or "Off" — simply omit options that should not be selected.
+- Use PAGE and NEARBY TEXT to understand which question and which table row each field belongs to.
+OUTPUT: Return ONLY a JSON object: {{"pdf_fields": {{"<KEY>": "<value>"}}}}
+
+===== FILLABLE FIELDS OF THE TARGET FORM =====
+{format_field_catalog(fields)}
+===== FORM PAGE TEXT (for context) =====
+{page_text[:40000]}
+===== END OF TARGET =====
+
+===== CLIENT SOURCE MATERIALS =====
+"""
+        context = {"kind": "pdf", "fields": fields}
 
     try:
-        response = safe_generate_content(contents)
-        clean_text = response.text.strip().replace('```json', '').replace('```', '')
-        return json.loads(clean_text)
+        response = safe_generate_content([prompt] + source_parts, json_mode=True)
+        data = parse_json_response(response.text)
+        if not isinstance(data, dict):
+            raise ValueError("AI 응답 형식이 올바르지 않습니다.")
+        return data, warnings, context
     except Exception as e:
         st.error(f"서류 분석 중 오류가 발생했습니다: {e}")
-        return None
+        return None, warnings, None
+
+def build_review_rows(data, context):
+    """AI 결과를 검토용 표로 변환 (없는 키·한글 값 표시)."""
+    rows = []
+    if context["kind"] == "pdf":
+        by_key = {f["key"]: f for f in context["fields"] if not f["duplicate"]}
+        for k, v in (data.get("pdf_fields") or {}).items():
+            if v is None or str(v).strip() == "":
+                continue
+            f = by_key.get(k)
+            if isinstance(v, bool):
+                v = "Yes" if v else ""
+                if not v:
+                    continue
+            v = str(v).strip()
+            if f is not None and f["type"] in BUTTON_TYPES and v.lower() not in TRUE_WORDS:
+                continue  # "No"/"Off" 지정은 체크하지 않으므로 표에서도 제외
+            note = ""
+            if f is None:
+                note = "⚠️ 서식에 없는 칸 (기입 안 됨)"
+            elif HANGUL_RE.search(v):
+                note = "⚠️ 한글 포함"
+            elif f["choices"] and v.lower() not in [c.lower() for c in f["choices"]]:
+                note = "⚠️ 선택지에 없는 값"
+            rows.append({"기입": f is not None, "칸 (Key)": k,
+                         "주변 문구": (f["nearby"] if f else "")[:80],
+                         "값": v, "확인 필요": note})
+    else:
+        for k, v in (data.get("docx_fields") or {}).items():
+            if v is None or str(v).strip() == "":
+                continue
+            v = str(v).strip()
+            rows.append({"기입": True, "칸 (Key)": k, "주변 문구": "", "값": v,
+                         "확인 필요": "⚠️ 한글 포함" if HANGUL_RE.search(v) else ""})
+    return rows
 
 # ==========================================
-# 3. PDF 대화형 폼(Widget) 직접 채우기 엔진
+# 3. PDF 대화형 폼(Widget) 채우기 엔진
 # ==========================================
-def fill_qa_pdf_interactive(target_bytes, qa_data):
+TRUE_WORDS = {'yes', 'true', 'v', 'x', 'on', '1', 'checked', 'y'}
+
+def _fit_fontsize(text, rect_width, base=10.0, min_size=6.0):
+    size = base
+    while size > min_size and fitz.get_text_length(text, fontname="cour", fontsize=size) > rect_width - 4:
+        size -= 0.5
+    return size
+
+def fill_qa_pdf_interactive(target_bytes, values_by_key, fields):
+    """values_by_key: {key: value}. 필드 키 → xref로 정확히 해당 위젯만 채움."""
     doc = fitz.open(stream=target_bytes, filetype="pdf")
-    pdf_fields = qa_data.get("pdf_fields", {})
-    fontfile = "cour.ttf" if os.path.exists("cour.ttf") else None
-    
-    for page in doc:
-        for w in page.widgets():
-            fn = w.field_name
-            if fn in pdf_fields:
-                val = pdf_fields[fn]
-                if val:
-                    ftype = getattr(w, "field_type_string", "").lower()
-                    
-                    if "check" in ftype or "radio" in ftype:
-                        if str(val).lower() in ['yes', 'true', 'v', 'on', '1', 'checked']:
-                            try:
-                                on_states = [s for s in w.on_state() if s.lower() != 'off']
-                                if on_states:
-                                    w.field_value = on_states[0]
-                                else:
-                                    w.field_value = True
-                                w.update()
-                            except Exception:
-                                pass
-                    else:
-                        if hasattr(w, "field_flags"):
-                            w.field_flags &= ~1 
-                        w.field_value = str(val)
-                        try:
-                            w.text_font = "Cour" if fontfile else "Courier"
-                        except Exception:
-                            pass
-                        w.update()
-            
+    # 같은 이름 텍스트 필드(중복)도 함께 채우기 위해 이름 → 대표 키 매핑
+    key_by_name = {f["name"]: f["key"] for f in fields if not f["duplicate"] and f["type"] not in BUTTON_TYPES}
+    filled, skipped = 0, []
+
+    for f in fields:
+        key = key_by_name.get(f["name"], f["key"]) if f["duplicate"] else f["key"]
+        if key not in values_by_key:
+            continue
+        val = str(values_by_key[key]).strip()
+        if not val:
+            continue
+        page = doc[f["page"]]
+        w = page.load_widget(f["xref"])
+        if w is None:
+            skipped.append(key)
+            continue
+        try:
+            if f["type"] in BUTTON_TYPES:
+                if val.lower() not in TRUE_WORDS:
+                    continue  # "No"/"Off"는 아무것도 체크하지 않음
+                w.field_value = f["on_state"] or True
+                w.update()
+            elif f["type"] in CHOICE_TYPES:
+                match = next((c for c in f["choices"] if c.lower() == val.lower()), None)
+                if match is None and not (w.field_flags & (1 << 18)):  # 편집 불가 콤보박스
+                    skipped.append(key)
+                    continue
+                w.field_value = match or val
+                w.update()
+            else:
+                w.field_flags &= ~1  # ReadOnly 해제
+                if w.text_maxlen and len(val) > w.text_maxlen:
+                    val = val[:w.text_maxlen]
+                w.field_value = val
+                w.text_font = "Cour"
+                multiline = bool(w.field_flags & (1 << 12))
+                if not multiline and not (w.field_flags & (1 << 24)):  # 콤(Comb) 칸 제외
+                    base = w.text_fontsize if w.text_fontsize and w.text_fontsize > 0 else 10
+                    w.text_fontsize = _fit_fontsize(val, w.rect.width, base=min(base, 11))
+                w.update()
+            filled += 1
+        except Exception:
+            skipped.append(key)
+
     doc.need_appearances(True)
     out_buf = io.BytesIO()
-    doc.save(out_buf, deflate=True)
+    doc.save(out_buf, garbage=1, deflate=True)
     doc.close()
-    return out_buf.getvalue()
+    return out_buf.getvalue(), filled, skipped
 
-def fill_qa_docx(target_bytes, qa_data):
+# ==========================================
+# 4. Word(.docx) 질문지 채우기 엔진
+# ==========================================
+def _norm_label(s):
+    return re.sub(r"[\s:：_\-\.\*]+", " ", (s or "")).strip().lower()
+
+def fill_qa_docx(target_bytes, values_by_key):
     doc = docx.Document(io.BytesIO(target_bytes))
     BLUE_RGB = RGBColor(0x1F, 0x4E, 0x8C)
-    fill_map = {k.strip().lower(): str(v).strip() for k, v in qa_data.get("docx_fields", {}).items() if v}
+    # lxml 요소 자체를 set에 보관 (id()는 재사용될 수 있어 오작동)
+    # [수정] 긴 라벨부터 매칭 → "Name"이 "Father's Name" 칸을 가로채지 않도록
+    items = sorted(
+        [(_norm_label(k), str(v).strip()) for k, v in values_by_key.items() if str(v).strip() and _norm_label(k)],
+        key=lambda x: -len(x[0]),
+    )
+    used_labels, used_cells, used_paras = set(), set(), set()
 
     def insert_run(p, text):
         run = p.add_run(f" {text}")
         run.font.color.rgb = BLUE_RGB
         run.bold = True
 
-    for table in doc.tables:
+    def iter_tables(container):
+        for t in container.tables:
+            yield t
+            for row in t.rows:
+                for cell in row.cells:
+                    yield from iter_tables(cell)  # 중첩 표 지원
+
+    for table in iter_tables(doc):
         for row in table.rows:
-            for c_idx, cell in enumerate(row.cells):
-                c_text = cell.text.strip().lower()
-                for q_label, ans in fill_map.items():
-                    if q_label in c_text and len(c_text) < len(q_label) + 20:
-                        if c_idx + 1 < len(row.cells) and not row.cells[c_idx + 1].text.strip():
-                            p = row.cells[c_idx + 1].paragraphs[0] if row.cells[c_idx + 1].paragraphs else row.cells[c_idx + 1].add_paragraph()
+            # 병합 셀 중복 제거
+            cells, seen = [], set()
+            for c in row.cells:
+                if c._tc not in seen:
+                    seen.add(c._tc)
+                    cells.append(c)
+            for c_idx, cell in enumerate(cells):
+                if cell._tc in used_cells:
+                    continue
+                c_norm = _norm_label(cell.text)
+                if not c_norm:
+                    continue
+                for label, ans in items:
+                    if label in used_labels:
+                        continue
+                    if c_norm == label or (label in c_norm and len(c_norm) <= len(label) + 25):
+                        nxt = cells[c_idx + 1] if c_idx + 1 < len(cells) else None
+                        if nxt is not None and not nxt.text.strip() and nxt._tc not in used_cells:
+                            p = nxt.paragraphs[0] if nxt.paragraphs else nxt.add_paragraph()
                             insert_run(p, ans)
-                        elif "___" in cell.text or cell.text.endswith(":"):
-                            p = cell.paragraphs[0] if cell.paragraphs else cell.add_paragraph()
+                            used_cells.add(nxt._tc)
+                        elif "___" in cell.text or cell.text.strip().endswith((":", "：")):
+                            p = cell.paragraphs[-1]
                             insert_run(p, ans)
+                        else:
+                            continue
+                        used_cells.add(cell._tc)
+                        used_labels.add(label)
+                        break
 
     for p in doc.paragraphs:
-        p_text = p.text.strip().lower()
-        for q_label, ans in fill_map.items():
-            if q_label in p_text and ("___" in p.text or p.text.strip().endswith(":")):
+        if p._p in used_paras:
+            continue
+        raw = p.text
+        p_norm = _norm_label(raw)
+        if not p_norm:
+            continue
+        for label, ans in items:
+            if label in used_labels:
+                continue
+            if label in p_norm and ("___" in raw or raw.strip().endswith((":", "："))):
                 insert_run(p, ans)
+                used_paras.add(p._p)
+                used_labels.add(label)
+                break
 
+    not_placed = [k for k, v in values_by_key.items()
+                  if str(v).strip() and _norm_label(k) and _norm_label(k) not in used_labels]
     out_buf = io.BytesIO()
     doc.save(out_buf)
-    out_buf.seek(0)
-    return out_buf.getvalue()
+    return out_buf.getvalue(), len(used_labels), not_placed
+
+def build_output_file(rows, ctx, target_bytes, base_name):
+    values = {r["칸 (Key)"]: r["값"] for r in rows if r.get("기입") and str(r.get("값", "")).strip()}
+    if ctx["kind"] == "docx":
+        out, filled, skipped = fill_qa_docx(target_bytes, values)
+        return out, f"{base_name}_Info_Filled.docx", \
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document", filled, skipped
+    out, filled, skipped = fill_qa_pdf_interactive(target_bytes, values, ctx["fields"])
+    return out, f"{base_name}_Info_Filled.pdf", "application/pdf", filled, skipped
+
+def files_signature(files):
+    h = hashlib.md5()
+    for f in files:
+        if f is not None:
+            h.update(f.name.encode())
+            h.update(str(f.size).encode())
+    return h.hexdigest()
 
 
 # ==========================================
@@ -395,34 +740,41 @@ if app_mode in [MENU_1, MENU_2, MENU_3, MENU_4]:
 # ------------------------------------------
 elif app_mode == MENU_5:
     st.title(MENU_5)
-    st.caption("기존 손님 서류들과 새 빈 질문지를 올리시면, 알고 있는 정보를 서식 칸에 맞춰 기입해 드립니다.")
+    st.caption("기존 손님 서류들과 새 빈 질문지를 올리시면, 알고 있는 정보를 서식 칸에 맞춰 기입해 드립니다. "
+               "결과는 다운로드 전에 표에서 확인·수정할 수 있습니다.")
 
-    # 파일 업로더 초기화를 위한 동적 Key 생성
     if "menu5_uploader_key" not in st.session_state:
         st.session_state.menu5_uploader_key = str(uuid.uuid4())
-
-    if "qa_result_files" not in st.session_state:
-        st.session_state.qa_result_files = None
+    for k in ("qa_rows", "qa_ctx", "qa_sig", "qa_warnings", "qa_base"):
+        st.session_state.setdefault(k, None)
 
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("1. 손님의 기존 자료들")
         source_files = st.file_uploader(
             "이전 질문지, 여권, 퍼밋, 이력서 등 (복수 선택)",
-            type=['pdf', 'docx', 'doc', 'jpg', 'jpeg', 'png', 'heic'],
+            type=['pdf', 'docx', 'jpg', 'jpeg', 'png', 'heic', 'heif', 'webp'],
             accept_multiple_files=True,
             key=f"qa_sources_{st.session_state.menu5_uploader_key}"
         )
+        st.caption("※ 구형 .doc 파일은 Word에서 .docx 또는 PDF로 저장 후 올려주세요.")
     with c2:
         st.subheader("2. 새로 채울 빈 질문지")
         new_q_file = st.file_uploader(
-            "채워 넣을 대상 질문지 1부 (.pdf 또는 .docx)",
+            "채워 넣을 대상 질문지 1부 (입력 칸이 있는 .pdf 또는 .docx)",
             type=['pdf', 'docx'],
             key=f"qa_target_{st.session_state.menu5_uploader_key}"
         )
 
-    st.markdown("---")
+    # [수정] 파일을 바꾸면 이전 손님의 결과가 남아 잘못 다운로드되는 문제 방지
+    current_sig = files_signature(list(source_files or []) + [new_q_file])
+    if st.session_state.qa_sig and st.session_state.qa_sig != current_sig:
+        st.session_state.qa_rows = None
+        st.session_state.qa_ctx = None
+        st.session_state.qa_warnings = None
+        st.session_state.qa_sig = None
 
+    st.markdown("---")
     col_action, col_reset = st.columns([8, 2])
 
     with col_action:
@@ -431,45 +783,66 @@ elif app_mode == MENU_5:
                 st.warning("1단계: 손님의 기존 서류를 최소 1개 이상 업로드해 주세요.")
             elif not new_q_file:
                 st.warning("2단계: 새로 채워야 할 질문지 파일을 업로드해 주세요.")
+            elif new_q_file.name.lower().endswith(".docx") and not DOCX_AVAILABLE:
+                st.error("서버에 python-docx가 설치되어 있지 않습니다. requirements.txt에 python-docx를 추가해 주세요.")
             else:
-                with st.spinner("원본 폼 필드를 분석하여 빈틈없이 작성 중입니다. 잠시만 기다려 주세요..."):
-                    qa_data = analyze_qa_for_fill(source_files, new_q_file)
-                    
-                    if qa_data:
-                        base_name = os.path.splitext(new_q_file.name)[0]
-                        is_docx = new_q_file.name.lower().endswith(".docx")
-                        
-                        if is_docx:
-                            filled_bytes = fill_qa_docx(new_q_file.getvalue(), qa_data)
-                            q_filename = f"{base_name}_Info_Filled.docx"
-                            q_mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                        else:
-                            filled_bytes = fill_qa_pdf_interactive(new_q_file.getvalue(), qa_data)
-                            q_filename = f"{base_name}_Info_Filled.pdf"
-                            q_mime = "application/pdf"
-
-                        # 결과를 Session State에 저장하여 버튼 증발 방지
-                        st.session_state.qa_result_files = {
-                            "q_filename": q_filename,
-                            "q_bytes": filled_bytes,
-                            "q_mime": q_mime
-                        }
+                with st.spinner("원본 폼 필드를 분석하여 작성 중입니다. 잠시만 기다려 주세요..."):
+                    data, warns, ctx = analyze_qa_for_fill(source_files, new_q_file)
+                    st.session_state.qa_warnings = warns
+                    if data and ctx:
+                        st.session_state.qa_rows = build_review_rows(data, ctx)
+                        st.session_state.qa_ctx = ctx
+                        st.session_state.qa_sig = current_sig
+                        st.session_state.qa_base = os.path.splitext(new_q_file.name)[0]
 
     with col_reset:
         if st.button("🔄 전체 리셋", use_container_width=True):
-            st.session_state.qa_result_files = None
-            st.session_state.menu5_uploader_key = str(uuid.uuid4()) # 새로운 키를 생성하여 업로더 완전 초기화
+            for k in ("qa_rows", "qa_ctx", "qa_sig", "qa_warnings", "qa_base"):
+                st.session_state[k] = None
+            st.session_state.menu5_uploader_key = str(uuid.uuid4())
             st.rerun()
 
-    # 💡 결과 렌더링
-    if st.session_state.qa_result_files:
-        res = st.session_state.qa_result_files
-        st.success("✅ 기존 정보 기입이 완료되었습니다! 확인하지 못한 항목은 비워두었으니 손님께 마저 작성해 달라고 요청하세요.")
-        
-        st.download_button(
-            label=f"📥 Info Filled 질문지 내려받기",
-            data=res["q_bytes"],
-            file_name=res["q_filename"],
-            mime=res["q_mime"],
-            type="primary"
-        )
+    for w in (st.session_state.qa_warnings or []):
+        st.warning(w)
+
+    # 💡 결과 검토 및 다운로드
+    if st.session_state.qa_rows is not None and new_q_file is not None:
+        rows = st.session_state.qa_rows
+        if not rows:
+            st.info("자료에서 질문지에 기입할 수 있는 정보를 찾지 못했습니다.")
+        else:
+            st.subheader("3. 기입 내용 확인 및 수정")
+            st.caption("값을 직접 고치거나, '기입' 체크를 해제하면 그 칸은 비워둡니다. 수정 내용은 다운로드 파일에 바로 반영됩니다.")
+            need_check = sum(1 for r in rows if r["확인 필요"])
+            if need_check:
+                st.warning(f"⚠️ 확인이 필요한 항목이 {need_check}개 있습니다. '확인 필요' 열을 살펴봐 주세요.")
+
+            edited = st.data_editor(
+                rows,
+                key=f"qa_editor_{st.session_state.qa_sig}",
+                use_container_width=True,
+                hide_index=True,
+                disabled=["칸 (Key)", "주변 문구", "확인 필요"],
+                column_config={
+                    "기입": st.column_config.CheckboxColumn(width="small"),
+                    "값": st.column_config.TextColumn(width="large"),
+                },
+            )
+            edited_rows = edited.to_dict("records") if hasattr(edited, "to_dict") else edited
+
+            try:
+                out_bytes, out_name, out_mime, filled, skipped = build_output_file(
+                    edited_rows, st.session_state.qa_ctx, new_q_file.getvalue(), st.session_state.qa_base)
+                st.success(f"✅ {filled}개 칸에 기입했습니다. 확인하지 못한 항목은 비워두었으니 손님께 마저 작성해 달라고 요청하세요.")
+                if skipped:
+                    with st.expander(f"서식에서 위치를 찾지 못해 기입되지 않은 항목 {len(skipped)}개"):
+                        st.write(skipped)
+                st.download_button(
+                    label="📥 Info Filled 질문지 내려받기",
+                    data=out_bytes,
+                    file_name=out_name,
+                    mime=out_mime,
+                    type="primary",
+                )
+            except Exception as e:
+                st.error(f"파일 생성 중 오류가 발생했습니다: {e}")
