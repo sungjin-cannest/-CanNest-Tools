@@ -208,8 +208,6 @@ def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
             
             for page in doc:
                 text += page.get_text("text") + "\n"
-                
-                # 대화형 서식(Widget) 필드 리스트를 AI에게 제공
                 for w in page.widgets():
                     if w.field_value:
                         text += f"[{w.field_name}]: {w.field_value}\n"
@@ -254,28 +252,24 @@ def batch_process_client_files(files):
     return flat
 
 # ==========================================
-# 2. AI 질문지 분석 및 완벽 매핑
+# 2. AI 질문지 분석 및 완벽 매핑 (수정판)
 # ==========================================
 def analyze_qa_for_fill(client_files, target_file):
     prompt = """
     You are an expert Canadian immigration assistant filling out a blank questionnaire based on client documents.
     The FIRST document is the NEW BLANK QUESTIONNAIRE. The rest are CLIENT SOURCE MATERIALS.
 
-    [CRITICAL RULES - MUST OBEY]
-    1. UNKNOWN INFO = OMIT: If the client documents do NOT explicitly mention Tuberculosis, Medical issues, Crime, Visa Refusals, or Biometrics, you MUST OMIT those fields from the JSON entirely. ABSOLUTELY DO NOT GUESS "NO", "Off", or "False". Leave them unmapped.
-    2. ENGLISH TESTS: If the client uploaded an IELTS, CELPIP, or Duolingo score, you MUST find the exact checkbox field for "YES" (for the English test question) and map it to "Yes".
-    3. TABLE FILLING (NO ROW SKIPPING): Map the client's history (Work, Education, Travel) to the PDF table fields sequentially. 
-       - Start mapping the most recent entry to the VERY FIRST ROW fields (e.g., row 1). 
-       - DO NOT skip the first row even if the job is not 'Current'. The first row must NEVER be left blank if there is history.
-       - Continue to row 2, row 3 sequentially. NO EMPTY GAPS between rows.
-       - If you run out of boxes in the PDF, just map up to the available boxes.
-    4. TRAVEL HISTORY: Extract all travel history (countries visited, dates, purpose) and map them to the travel table fields. Do not omit travel history.
+    [CRITICAL RULES - MUST OBEY OR FAIL]
+    1. UNKNOWN INFO = DO NOT TOUCH: If the client documents do NOT explicitly state an answer for Tuberculosis, Medical issues, Crime, Visa Refusals, Biometrics, etc., YOU MUST LEAVE THEM BLANK. DO NOT GUESS "NO". DO NOT map them in the JSON.
+    2. ENGLISH TESTS: If the client uploaded an IELTS, CELPIP, or Duolingo score, you MUST find the "YES" radio button/checkbox for the English test question and map it to "Yes".
+    3. NO CURRENT JOB = LEAVE FIRST ROW BLANK: Today is October 2026. A job ending in "2026-09" or earlier is NOT current. In the work history table, the FIRST ROW is reserved for the "Current" job. IF THE CLIENT DOES NOT HAVE A CURRENT JOB, YOU MUST LEAVE THE ENTIRE FIRST ROW BLANK. Start mapping their past jobs from the SECOND ROW downwards.
+    4. SEQUENTIAL MAPPING: For Education and Travel history, start mapping from the first row sequentially. For Work history, start from Row 1 if they have a current job, otherwise start from Row 2.
     5. LANGUAGE: All output values MUST be in ENGLISH (Latin alphabet, numbers). NO KOREAN characters in values.
 
     Return ONLY a raw JSON object formatted strictly as:
     {
       "pdf_fields": {
-         "Exact_Field_Name_1": "Danyang",
+         "Exact_Field_Name_1": "Extracted Value",
          "Exact_Checkbox_Name_For_Yes": "Yes"
       },
       "docx_fields": {
@@ -300,6 +294,7 @@ def analyze_qa_for_fill(client_files, target_file):
 # 3. PDF 대화형 폼(Widget) 직접 채우기 엔진
 # ==========================================
 def fill_qa_pdf_interactive(target_bytes, qa_data):
+    """원본 PDF의 폼 필드(Widget)를 그대로 활용하여 텍스트를 기입합니다."""
     doc = fitz.open(stream=target_bytes, filetype="pdf")
     pdf_fields = qa_data.get("pdf_fields", {})
     fontfile = "cour.ttf" if os.path.exists("cour.ttf") else None
@@ -309,7 +304,7 @@ def fill_qa_pdf_interactive(target_bytes, qa_data):
             fn = w.field_name
             if fn in pdf_fields:
                 val = pdf_fields[fn]
-                if val is not None and val != "":
+                if val:
                     ftype = getattr(w, "field_type_string", "").lower()
                     
                     if "check" in ftype or "radio" in ftype:
@@ -325,7 +320,7 @@ def fill_qa_pdf_interactive(target_bytes, qa_data):
                                 pass
                     else:
                         if hasattr(w, "field_flags"):
-                            w.field_flags &= ~1 
+                            w.field_flags &= ~1  # 수정 가능 상태로 유지
                         w.field_value = str(val)
                         try:
                             w.text_font = "Cour" if fontfile else "Courier"
@@ -380,31 +375,31 @@ MENU_1 = "🍁 IMM5476 자동 작성"
 MENU_2 = "✈️ 한부모 동의서 자동 작성"
 MENU_3 = "📋 IMM서류 정보 정리"
 MENU_4 = "🏷️ CRM 파일명 생성 및 묶기"
-MENU_5 = "📝 질문지 자동 완성"
+MENU_5 = "📝 질문지 기존 정보 기입"
 
 st.sidebar.title("🦅 CanNest Tool")
 app_mode = st.sidebar.radio("원하시는 업무 도구를 선택하세요", [MENU_1, MENU_2, MENU_3, MENU_4, MENU_5])
 
-# 메뉴 1~4 생략 (기존 작동 완벽하게 동일함)
+# 메뉴 1~4 생략 (기존 로직 완벽히 유지됨)
 if app_mode == MENU_1:
     st.title(MENU_1)
-    st.info("좌측 메뉴에서 5번 '질문지 자동 완성' 기능을 테스트해 보세요.")
+    st.info("좌측 메뉴에서 5번 '질문지 기존 정보 기입' 기능을 테스트해 보세요.")
 elif app_mode == MENU_2:
     st.title(MENU_2)
-    st.info("좌측 메뉴에서 5번 '질문지 자동 완성' 기능을 테스트해 보세요.")
+    st.info("좌측 메뉴에서 5번 '질문지 기존 정보 기입' 기능을 테스트해 보세요.")
 elif app_mode == MENU_3:
     st.title(MENU_3)
-    st.info("좌측 메뉴에서 5번 '질문지 자동 완성' 기능을 테스트해 보세요.")
+    st.info("좌측 메뉴에서 5번 '질문지 기존 정보 기입' 기능을 테스트해 보세요.")
 elif app_mode == MENU_4:
     st.title(MENU_4)
-    st.info("좌측 메뉴에서 5번 '질문지 자동 완성' 기능을 테스트해 보세요.")
+    st.info("좌측 메뉴에서 5번 '질문지 기존 정보 기입' 기능을 테스트해 보세요.")
 
 # ------------------------------------------
-# 메뉴 5: 질문지 자동 이어채우기 (QA Re-fill)
+# 메뉴 5: 질문지 기존 정보 기입
 # ------------------------------------------
 elif app_mode == MENU_5:
     st.title(MENU_5)
-    st.caption("기존 손님 서류들과 새 빈 질문지를 올리시면, 알려진 정보를 폼 필드 칸에 정렬하여 완벽하게 채워 드립니다.")
+    st.caption("기존 손님 서류들과 새 빈 질문지를 올리시면, 알고 있는 정보를 서식 칸에 맞춰 기입해 드립니다.")
 
     if "qa_result_files" not in st.session_state:
         st.session_state.qa_result_files = None
@@ -431,7 +426,7 @@ elif app_mode == MENU_5:
     col_action, col_reset = st.columns([8, 2])
 
     with col_action:
-        if st.button("✨ 질문지 자동 완성하기", type="primary", use_container_width=True):
+        if st.button("✨ 질문지 정보 기입 시작", type="primary", use_container_width=True):
             if not source_files:
                 st.warning("1단계: 손님의 기존 서류를 최소 1개 이상 업로드해 주세요.")
             elif not new_q_file:
@@ -446,13 +441,14 @@ elif app_mode == MENU_5:
                         
                         if is_docx:
                             filled_bytes = fill_qa_docx(new_q_file.getvalue(), qa_data)
-                            q_filename = f"{base_name}_완성본.docx"
+                            q_filename = f"{base_name}_기존정보기입본.docx"
                             q_mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                         else:
                             filled_bytes = fill_qa_pdf_interactive(new_q_file.getvalue(), qa_data)
-                            q_filename = f"{base_name}_완성본.pdf"
+                            q_filename = f"{base_name}_기존정보기입본.pdf"
                             q_mime = "application/pdf"
 
+                        # 결과를 Session State에 저장하여 버튼 증발 방지
                         st.session_state.qa_result_files = {
                             "q_filename": q_filename,
                             "q_bytes": filled_bytes,
@@ -464,13 +460,13 @@ elif app_mode == MENU_5:
             st.session_state.qa_result_files = None
             st.rerun()
 
-    # 💡 결과 다운로드 렌더링
+    # 💡 결과 렌더링
     if st.session_state.qa_result_files:
         res = st.session_state.qa_result_files
-        st.success("✅ 질문지 작성이 완벽하게 완료되었습니다! 아래 버튼을 클릭하세요.")
+        st.success("✅ 기존 정보 기입이 완료되었습니다! 확인하지 못한 항목은 비워두었으니 손님께 마저 작성해 달라고 요청하세요.")
         
         st.download_button(
-            label=f"📥 완성된 질문지 내려받기",
+            label=f"📥 기존 정보 기입본 내려받기",
             data=res["q_bytes"],
             file_name=res["q_filename"],
             mime=res["q_mime"],
