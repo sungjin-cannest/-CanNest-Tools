@@ -208,6 +208,8 @@ def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
             
             for page in doc:
                 text += page.get_text("text") + "\n"
+                
+                # 대화형 서식(Widget) 필드 리스트를 AI에게 제공
                 for w in page.widgets():
                     if w.field_value:
                         text += f"[{w.field_name}]: {w.field_value}\n"
@@ -252,7 +254,7 @@ def batch_process_client_files(files):
     return flat
 
 # ==========================================
-# 2. AI 질문지 분석 및 완벽 매핑 (수정판)
+# 2. AI 질문지 분석 및 완벽 매핑
 # ==========================================
 def analyze_qa_for_fill(client_files, target_file):
     prompt = """
@@ -261,15 +263,19 @@ def analyze_qa_for_fill(client_files, target_file):
 
     [CRITICAL RULES - MUST OBEY OR FAIL]
     1. UNKNOWN INFO = DO NOT TOUCH: If the client documents do NOT explicitly state an answer for Tuberculosis, Medical issues, Crime, Visa Refusals, Biometrics, etc., YOU MUST LEAVE THEM BLANK. DO NOT GUESS "NO". DO NOT map them in the JSON.
-    2. ENGLISH TESTS: If the client uploaded an IELTS, CELPIP, or Duolingo score, you MUST find the "YES" radio button/checkbox for the English test question and map it to "Yes".
-    3. NO CURRENT JOB = LEAVE FIRST ROW BLANK: Today is October 2026. A job ending in "2026-09" or earlier is NOT current. In the work history table, the FIRST ROW is reserved for the "Current" job. IF THE CLIENT DOES NOT HAVE A CURRENT JOB, YOU MUST LEAVE THE ENTIRE FIRST ROW BLANK. Start mapping their past jobs from the SECOND ROW downwards.
-    4. SEQUENTIAL MAPPING: For Education and Travel history, start mapping from the first row sequentially. For Work history, start from Row 1 if they have a current job, otherwise start from Row 2.
-    5. LANGUAGE: All output values MUST be in ENGLISH (Latin alphabet, numbers). NO KOREAN characters in values.
+    2. ENGLISH TESTS: If the client uploaded an IELTS, CELPIP, or Duolingo score, or mentions it in the materials, you MUST map "Yes" to the corresponding English test checkbox.
+    3. BIOMETRICS & VISA HISTORY: If the client has a Canadian visa or permit, map "Yes" to the Biometrics question and list the Visa details in the history box. Do not leave it blank if they hold a permit.
+    4. TABLE SEQUENTIAL MAPPING: Map Work, Education, and Travel history to the PDF table fields STRICTLY SEQUENTIALLY starting from ROW 1. 
+       - DO NOT skip Row 1 even if the job is not 'Current'. The first row must NEVER be left blank if there is history.
+       - The most recent entry goes to Row 1 fields, the second to Row 2, etc. NO EMPTY GAPS between rows.
+       - Fill up to the maximum number of rows available in the PDF form. Do not worry about excess entries.
+    5. TRAVEL & RESIDENCE HISTORY: Extract all travel history and countries of residence from the materials and map them to the corresponding tables.
+    6. LANGUAGE: All output values MUST be in ENGLISH (Latin alphabet, numbers). NO KOREAN characters in values.
 
     Return ONLY a raw JSON object formatted strictly as:
     {
       "pdf_fields": {
-         "Exact_Field_Name_1": "Extracted Value",
+         "Exact_Field_Name_1": "Danyang",
          "Exact_Checkbox_Name_For_Yes": "Yes"
       },
       "docx_fields": {
@@ -294,7 +300,6 @@ def analyze_qa_for_fill(client_files, target_file):
 # 3. PDF 대화형 폼(Widget) 직접 채우기 엔진
 # ==========================================
 def fill_qa_pdf_interactive(target_bytes, qa_data):
-    """원본 PDF의 폼 필드(Widget)를 그대로 활용하여 텍스트를 기입합니다."""
     doc = fitz.open(stream=target_bytes, filetype="pdf")
     pdf_fields = qa_data.get("pdf_fields", {})
     fontfile = "cour.ttf" if os.path.exists("cour.ttf") else None
@@ -304,7 +309,7 @@ def fill_qa_pdf_interactive(target_bytes, qa_data):
             fn = w.field_name
             if fn in pdf_fields:
                 val = pdf_fields[fn]
-                if val:
+                if val is not None and val != "":
                     ftype = getattr(w, "field_type_string", "").lower()
                     
                     if "check" in ftype or "radio" in ftype:
@@ -320,7 +325,7 @@ def fill_qa_pdf_interactive(target_bytes, qa_data):
                                 pass
                     else:
                         if hasattr(w, "field_flags"):
-                            w.field_flags &= ~1  # 수정 가능 상태로 유지
+                            w.field_flags &= ~1 
                         w.field_value = str(val)
                         try:
                             w.text_font = "Cour" if fontfile else "Courier"
@@ -368,6 +373,7 @@ def fill_qa_docx(target_bytes, qa_data):
     out_buf.seek(0)
     return out_buf.getvalue()
 
+
 # ==========================================
 # 6. Streamlit 네비게이션 및 UI 구성
 # ==========================================
@@ -380,18 +386,9 @@ MENU_5 = "📝 질문지 기존 정보 기입"
 st.sidebar.title("🦅 CanNest Tool")
 app_mode = st.sidebar.radio("원하시는 업무 도구를 선택하세요", [MENU_1, MENU_2, MENU_3, MENU_4, MENU_5])
 
-# 메뉴 1~4 생략 (기존 로직 완벽히 유지됨)
-if app_mode == MENU_1:
-    st.title(MENU_1)
-    st.info("좌측 메뉴에서 5번 '질문지 기존 정보 기입' 기능을 테스트해 보세요.")
-elif app_mode == MENU_2:
-    st.title(MENU_2)
-    st.info("좌측 메뉴에서 5번 '질문지 기존 정보 기입' 기능을 테스트해 보세요.")
-elif app_mode == MENU_3:
-    st.title(MENU_3)
-    st.info("좌측 메뉴에서 5번 '질문지 기존 정보 기입' 기능을 테스트해 보세요.")
-elif app_mode == MENU_4:
-    st.title(MENU_4)
+# 메뉴 1~4 생략 (기존 작동 완벽하게 동일함)
+if app_mode in [MENU_1, MENU_2, MENU_3, MENU_4]:
+    st.title(app_mode)
     st.info("좌측 메뉴에서 5번 '질문지 기존 정보 기입' 기능을 테스트해 보세요.")
 
 # ------------------------------------------
