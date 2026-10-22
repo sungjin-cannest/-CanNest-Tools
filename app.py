@@ -5,11 +5,9 @@ st.set_page_config(page_title="CanNest 질문지 자동 완성", layout="wide")
 
 import google.generativeai as genai
 import fitz  # PyMuPDF
-from PIL import Image
 import io
 import json
 import os
-import re
 from concurrent.futures import ThreadPoolExecutor
 
 try:
@@ -46,7 +44,7 @@ def safe_generate_content(contents):
     raise last_error
 
 # ==========================================
-# 1. 파일 데이터 파싱
+# 1. 문서 파싱 및 AI 전송 준비
 # ==========================================
 def read_word_document_text(file_bytes, file_name=""):
     try:
@@ -82,6 +80,7 @@ def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
                 doc.close()
                 return [f"\n--- [Document: {file_name}] ---\n{text[:35000]}\n"]
             else:
+                from PIL import Image
                 images = []
                 for p_idx in range(min(len(doc), 10)):
                     page = doc.load_page(p_idx)
@@ -147,7 +146,7 @@ def analyze_and_extract_qa(client_files, target_file):
         "prev_spouse_dob": ""
       },
       "checkbox_checks": [
-        "기혼", "NO", "아니오"
+        "기혼", "NO", "아니오", "Single"
       ],
       "education_history": [
         {
@@ -192,7 +191,7 @@ def analyze_and_extract_qa(client_files, target_file):
         return None
 
 # ==========================================
-# 3. PDF 질문지 작성 엔진 (셀 감지 & 칸 초과 방지)
+# 3. PDF 질문지 작성 엔진 (PyMuPDF 표 칸 정확한 매핑)
 # ==========================================
 def fill_pdf_questionnaire(target_bytes, qa_data):
     doc = fitz.open(stream=target_bytes, filetype="pdf")
@@ -217,7 +216,6 @@ def fill_pdf_questionnaire(target_bytes, qa_data):
             rects = page.search_for(label)
             if rects:
                 r = rects[0]
-                # 표 셀 감지 시도
                 cell_box = None
                 try:
                     for tab in page.find_tables():
@@ -245,7 +243,7 @@ def fill_pdf_questionnaire(target_bytes, qa_data):
                     pass
                 break
 
-    # 2. 배우자 성/이름 나란히 있는 특수 라벨 처리
+    # 2. 배우자 성/이름 처리
     for page in doc:
         rects_surname = page.search_for("성:")
         rects_given = page.search_for("이름:")
@@ -271,8 +269,11 @@ def fill_pdf_questionnaire(target_bytes, qa_data):
                     pass
                 break
 
-    # 4. 학력 및 직장 표 채우기 (칸 수 초과 절대 방지)
+    # 4. 학력 및 직장 표 정확한 칸 채우기
     def fill_table_safely(page, keyword, items_list, col_keys):
+        if not items_list:
+            return
+            
         try:
             tables = page.find_tables()
             matched_tab = None
@@ -283,7 +284,6 @@ def fill_pdf_questionnaire(target_bytes, qa_data):
                     break
             
             if matched_tab and len(matched_tab.rows) > 1:
-                # 사용 가능한 실제 빈 행 수 계산
                 available_rows = len(matched_tab.rows) - 1
                 for idx in range(min(available_rows, len(items_list))):
                     data = items_list[idx]
@@ -291,11 +291,13 @@ def fill_pdf_questionnaire(target_bytes, qa_data):
                     for c_idx, key in enumerate(col_keys):
                         if c_idx < len(row_cells) and row_cells[c_idx]:
                             c_rect = fitz.Rect(row_cells[c_idx])
-                            pad_rect = fitz.Rect(c_rect.x0 + 3, c_rect.y0 + 2, c_rect.x1 - 3, c_rect.y1 - 2)
+                            # 셀 내부 패딩(Padding)을 주어 도장처럼 겹치지 않게 함
+                            pad_rect = fitz.Rect(c_rect.x0 + 4, c_rect.y0 + 3, c_rect.x1 - 4, c_rect.y1 - 3)
                             val = data.get(key, "")
-                            page.insert_textbox(pad_rect, str(val), fontsize=8.0, fontname="helv", color=BLUE_COLOR, align=0)
+                            if val:
+                                page.insert_textbox(pad_rect, str(val), fontsize=8.0, fontname="helv", color=BLUE_COLOR, align=0)
                 
-                # 칸이 부족하여 별첨으로 넘어간 경우 안내 기입
+                # 칸이 부족한 경우 마지막 셀 하단에 별첨 참조 표시
                 if len(items_list) > available_rows:
                     last_cell = matched_tab.rows[-1].cells[-1]
                     if last_cell:
@@ -303,7 +305,7 @@ def fill_pdf_questionnaire(target_bytes, qa_data):
                         page.insert_textbox(
                             fitz.Rect(r_annot.x0, r_annot.y1 - 10, r_annot.x1, r_annot.y1),
                             "*See attached sheet",
-                            fontsize=6.5,
+                            fontsize=7.0,
                             fontname="helv",
                             color=BLUE_COLOR
                         )
@@ -311,11 +313,8 @@ def fill_pdf_questionnaire(target_bytes, qa_data):
             pass
 
     for page in doc:
-        # 학교 정보 표
         fill_table_safely(page, "학교 정보", qa_data.get("education_history", []), ["from", "to", "field_degree", "school_name", "location"])
-        # 직장 정보 표
         fill_table_safely(page, "직장 정보", qa_data.get("work_history", []), ["from", "to", "job_title", "company_name", "location"])
-        # 여행 정보 표
         fill_table_safely(page, "여행 정보", qa_data.get("travel_history", []), ["from", "to", "city", "country", "purpose"])
 
     doc.need_appearances(True)
@@ -382,7 +381,6 @@ def create_appendix_docx(qa_data):
         s.left_margin = Inches(0.6)
         s.right_margin = Inches(0.6)
 
-    # 기본 폰트 설정
     doc.styles['Normal'].font.name = 'Calibri'
     doc.styles['Normal'].font.size = Pt(9.5)
 
@@ -414,11 +412,12 @@ def create_appendix_docx(qa_data):
     edu_list = qa_data.get("education_history", [])
     if edu_list:
         p_edu = doc.add_paragraph()
-        p_edu.add_run("1. Full Education History (학력 전체 내역)").bold = True
+        p_edu.add_run("1. Full Education History").bold = True
         p_edu.paragraph_format.space_after = Pt(2)
 
         t_edu = doc.add_table(rows=1, cols=5)
         t_edu.alignment = WD_TABLE_ALIGNMENT.CENTER
+        t_edu.style = 'Table Grid'
         headers = ["From (YYYY-MM)", "To (YYYY-MM)", "Field of Study / Degree", "School Name", "City / Country"]
         
         hdr_cells = t_edu.rows[0].cells
@@ -441,11 +440,12 @@ def create_appendix_docx(qa_data):
     work_list = qa_data.get("work_history", [])
     if work_list:
         p_work = doc.add_paragraph()
-        p_work.add_run("2. Full Work / Activity History (직장 및 활동 전체 내역)").bold = True
+        p_work.add_run("2. Full Work / Activity History").bold = True
         p_work.paragraph_format.space_after = Pt(2)
 
         t_work = doc.add_table(rows=1, cols=5)
         t_work.alignment = WD_TABLE_ALIGNMENT.CENTER
+        t_work.style = 'Table Grid'
         headers_work = ["From (YYYY-MM)", "To (YYYY-MM)", "Occupation / Title", "Company / School Name", "City / Country"]
         
         hdr_w = t_work.rows[0].cells
@@ -468,12 +468,13 @@ def create_appendix_docx(qa_data):
     travel_list = qa_data.get("travel_history", [])
     if travel_list:
         p_trv = doc.add_paragraph()
-        p_trv.add_run("3. Travel History (해외 출입국 전체 내역)").bold = True
+        p_trv.add_run("3. Travel History").bold = True
         p_trv.paragraph_format.space_after = Pt(2)
 
         t_trv = doc.add_table(rows=1, cols=5)
         t_trv.alignment = WD_TABLE_ALIGNMENT.CENTER
-        headers_trv = ["From (YYYY-MM)", "To (YYYY-MM)", "City", "Country", "Purpose of Travel"]
+        t_trv.style = 'Table Grid'
+        headers_trv = ["From (YYYY-MM-DD)", "To (YYYY-MM-DD)", "City", "Country", "Purpose of Travel"]
         
         hdr_t = t_trv.rows[0].cells
         for idx, text in enumerate(headers_trv):
@@ -504,7 +505,7 @@ c1, c2 = st.columns(2)
 with c1:
     st.subheader("1. 손님의 기존 자료들")
     source_files = st.file_uploader(
-        "이전 질문지, 여권, 퍼밋, 이력서 등 (복수 선택)",
+        "이전 질문지, 여권, 퍼밋, 이력서 등 (복수 선택 가능)",
         type=['pdf', 'docx', 'doc', 'jpg', 'jpeg', 'png', 'heic'],
         accept_multiple_files=True
     )
@@ -512,62 +513,73 @@ with c1:
 with c2:
     st.subheader("2. 새로 채울 빈 질문지")
     new_q_file = st.file_uploader(
-        "채워 넣을 새 질문지 1부 (.pdf 또는 .docx)",
+        "대상 질문지 1부 (.pdf 또는 .docx)",
         type=['pdf', 'docx']
     )
 
 st.markdown("---")
 
-if st.button("질문지 자동 완성하기", type="primary", use_container_width=True):
-    if not source_files:
-        st.warning("1단계: 손님의 기존 서류를 최소 1개 이상 업로드해 주세요.")
-    elif not new_q_file:
-        st.warning("2단계: 새로 채워야 할 질문지 파일을 업로드해 주세요.")
-    else:
-        with st.spinner("서류를 대조하여 질문지 칸에 맞게 작성 중입니다. 잠시만 기다려 주세요..."):
-            qa_data = analyze_and_extract_qa(source_files, new_q_file)
-            
-            if qa_data:
-                base_name = os.path.splitext(new_q_file.name)[0]
-                is_docx = new_q_file.name.lower().endswith(".docx")
-                app_info = qa_data.get("applicant", {})
-                client_name = app_info.get("full_name", "Client").replace(" ", "_")
+col_action, col_reset = st.columns([8, 2])
 
-                # 1. 질문지 본문 작성
-                if is_docx:
-                    filled_bytes = fill_docx_questionnaire(new_q_file.getvalue(), qa_data)
-                    q_filename = f"{base_name}_완성본.docx"
-                    q_mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                else:
-                    filled_bytes = fill_pdf_questionnaire(new_q_file.getvalue(), qa_data)
-                    q_filename = f"{base_name}_완성본.pdf"
-                    q_mime = "application/pdf"
-
-                st.success("✅ 작성이 완료되었습니다! 아래 버튼을 눌러 파일을 내려받으세요.")
+with col_action:
+    if st.button("질문지 자동 완성하기", type="primary", use_container_width=True):
+        if not source_files:
+            st.warning("1단계: 손님의 기존 서류를 최소 1개 이상 업로드해 주세요.")
+        elif not new_q_file:
+            st.warning("2단계: 새로 채워야 할 질문지 파일을 업로드해 주세요.")
+        else:
+            with st.spinner("서류를 대조하여 질문지 칸에 맞게 작성 중입니다. 잠시만 기다려 주세요..."):
+                qa_data = analyze_and_extract_qa(source_files, new_q_file)
                 
-                # 2. 다운로드 버튼 제공
-                col_btn1, col_btn2 = st.columns(2)
-                with col_btn1:
-                    st.download_button(
-                        label=f"📥 완성된 질문지 내려받기 ({q_filename})",
-                        data=filled_bytes,
-                        file_name=q_filename,
-                        mime=q_mime,
-                        type="primary",
-                        use_container_width=True
-                    )
+                if qa_data:
+                    base_name = os.path.splitext(new_q_file.name)[0]
+                    is_docx = new_q_file.name.lower().endswith(".docx")
+                    
+                    app_info = qa_data.get("applicant", {})
+                    client_name = app_info.get("full_name", "Client").replace(" ", "_")
 
-                # 3. 학력/직장 이력이 2건 이상인 경우 별첨 Word 서식 추가 제공
-                has_extra = len(qa_data.get("education_history", [])) > 2 or len(qa_data.get("work_history", [])) > 2
-                if has_extra:
-                    appendix_bytes = create_appendix_docx(qa_data)
-                    appendix_filename = f"{client_name}_Additional_History.docx"
-                    with col_btn2:
+                    # 1. 질문지 본문 작성
+                    if is_docx:
+                        filled_bytes = fill_docx_questionnaire(new_q_file.getvalue(), qa_data)
+                        q_filename = f"{base_name}_완성본.docx"
+                        q_mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    else:
+                        filled_bytes = fill_pdf_questionnaire(new_q_file.getvalue(), qa_data)
+                        q_filename = f"{base_name}_완성본.pdf"
+                        q_mime = "application/pdf"
+
+                    st.success("✅ 작성이 완료되었습니다! 아래 버튼을 눌러 파일을 내려받으세요.")
+                    
+                    # 2. 다운로드 버튼 제공
+                    dl_col1, dl_col2 = st.columns(2)
+                    with dl_col1:
                         st.download_button(
-                            label=f"📄 [별첨] 추가 학력·경력 내역서 내려받기 (.docx)",
-                            data=appendix_bytes,
-                            file_name=appendix_filename,
-                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                            type="secondary",
+                            label=f"📥 완성된 질문지 내려받기 ({q_filename})",
+                            data=filled_bytes,
+                            file_name=q_filename,
+                            mime=q_mime,
+                            type="primary",
                             use_container_width=True
                         )
+
+                    # 3. 학력/직장 이력이 2건 초과인 경우에만 별첨 생성
+                    edu_count = len(qa_data.get("education_history", []))
+                    work_count = len(qa_data.get("work_history", []))
+                    
+                    # 💡 PDF 질문지 칸을 초과한 정보가 있을 때만 별첨 생성 버튼 표시
+                    if edu_count > 2 or work_count > 2:
+                        appendix_bytes = create_appendix_docx(qa_data)
+                        appendix_filename = f"{client_name}_Additional_History.docx"
+                        with dl_col2:
+                            st.download_button(
+                                label=f"📄 [별첨] 전체 학력·경력 내역서 내려받기",
+                                data=appendix_bytes,
+                                file_name=appendix_filename,
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                type="secondary",
+                                use_container_width=True
+                            )
+
+with col_reset:
+    if st.button("🔄 전체 리셋", use_container_width=True):
+        st.rerun()
