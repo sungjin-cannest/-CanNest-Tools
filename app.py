@@ -5,6 +5,7 @@ st.set_page_config(page_title="CanNest 질문지 자동 완성", layout="wide")
 
 import google.generativeai as genai
 import fitz  # PyMuPDF
+from PIL import Image
 import io
 import json
 import os
@@ -13,7 +14,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 try:
     import docx
-    from docx.shared import RGBColor
+    from docx.shared import Inches, Pt, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_TABLE_ALIGNMENT
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
 except ImportError:
     pass
 
@@ -41,7 +46,7 @@ def safe_generate_content(contents):
     raise last_error
 
 # ==========================================
-# 1. 파일 읽기 및 텍스트/이미지 변환
+# 1. 파일 데이터 파싱
 # ==========================================
 def read_word_document_text(file_bytes, file_name=""):
     try:
@@ -61,7 +66,7 @@ def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
     if "word" in mime_type.lower() or ext in ['.doc', '.docx']:
         text = read_word_document_text(file_bytes, file_name)
         if text:
-            return [f"\n--- [Document: {file_name}] ---\n{text[:30000]}\n"]
+            return [f"\n--- [Document: {file_name}] ---\n{text[:35000]}\n"]
             
     if "pdf" in mime_type.lower() or ext == '.pdf':
         try:
@@ -74,9 +79,9 @@ def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
                         text += f"[{widget.field_name}]: {widget.field_value}\n"
             
             if len(text.strip()) > 100:
-                return [f"\n--- [Document: {file_name}] ---\n{text[:30000]}\n"]
+                doc.close()
+                return [f"\n--- [Document: {file_name}] ---\n{text[:35000]}\n"]
             else:
-                from PIL import Image
                 images = []
                 for p_idx in range(min(len(doc), 10)):
                     page = doc.load_page(p_idx)
@@ -103,64 +108,72 @@ def batch_process_client_files(files):
     return flat
 
 # ==========================================
-# 2. AI 대조 및 답변 매핑
+# 2. AI 질문지 분석 및 정형 추출
 # ==========================================
 def analyze_and_extract_qa(client_files, target_file):
     prompt = """
-    You are an expert AI assistant that auto-fills Canadian immigration questionnaires.
-    
-    [INPUT]
-    1. The FIRST attached document is the NEW BLANK QUESTIONNAIRE.
-    2. The REMAINING attached documents are CLIENT MATERIALS (past questionnaires, passports, permits, certificates, resumes, etc.).
+    You are an expert Canadian immigration case assistant.
+    The FIRST document is a NEW BLANK IMMIGRATION QUESTIONNAIRE.
+    The REMAINING documents are CLIENT MATERIALS (past questionnaires, passports, permits, resumes, certificates).
+
+    [TASK]
+    Extract all verified facts from client materials to fill into the new questionnaire.
 
     [STRICT RULES]
-    1. Extract all verified facts from the client materials and map them into the questions asked in the new questionnaire.
-    2. STRICT LANGUAGE RULE: All answers MUST be in ENGLISH (Latin letters, numbers, standard punctuation only). NEVER use Korean characters in the values.
-       - Names: strictly as in Passport (e.g., 'Jihyun Cheung').
-       - Marital Status: 'Married', 'Single', 'Divorced', 'Common-Law'.
-       - Dates: YYYY-MM-DD or YYYY-MM.
-    3. If information for a question does NOT exist in the materials, simply DO NOT include it. Leave it blank.
-    4. For Checkboxes (Yes/No, Marital status, etc.), provide the exact text label next to the box that should be checked (e.g. '기혼', 'YES', 'NO', '아니오').
+    1. LANGUAGE: All extracted values MUST be in ENGLISH (numbers, Latin alphabet, standard punctuation). NO Korean characters in values.
+    2. NAMES: Strictly match Passport Title Case (e.g., 'Jihyun Cheung').
+    3. ACCURACY: If information is not confirmed in the materials, return an empty string "". Do not guess.
+    4. EDUCATION & WORK: Extract ALL post-secondary and work history entries chronologically (most recent first).
 
-    Return ONLY a raw valid JSON object:
+    Return ONLY a raw JSON object with this exact structure:
     {
-      "text_fields": [
-        {"anchor": "출생 도시", "value": "Danyang"},
-        {"anchor": "출생 국가", "value": "Republic of Korea"},
-        {"anchor": "이메일 주소", "value": "ccamjik2@gmail.com"},
-        {"anchor": "연락처", "value": "514-567-5791"},
-        {"anchor": "현재 거주지 주소", "value": "#401, 2232 Douglas Rd. Burnaby BC V5C 5A7", "is_long": true},
-        {"anchor": "1) 배우자 이름", "sub_fields": [{"anchor": "성:", "value": "Jeong"}, {"anchor": "이름:", "value": "Taekhun"}]},
-        {"anchor": "사실혼이 시작된 날짜", "value": "2026-03-28"}
+      "applicant": {
+        "full_name": "Full Name",
+        "dob": "YYYY-MM-DD",
+        "birth_city": "City",
+        "birth_country": "Country",
+        "email": "Email",
+        "phone": "Phone Number",
+        "address": "Full Address with Postal Code",
+        "marital_status": "Married / Single / Common-Law / Divorced",
+        "spouse_surname": "Spouse Surname or empty",
+        "spouse_given_name": "Spouse Given Name or empty",
+        "marriage_date": "YYYY-MM-DD or empty",
+        "spouse_dob": "YYYY-MM-DD or empty",
+        "prev_spouse_surname": "",
+        "prev_spouse_given_name": "",
+        "prev_marriage_from": "",
+        "prev_marriage_to": "",
+        "prev_spouse_dob": ""
+      },
+      "checkbox_checks": [
+        "기혼", "NO", "아니오"
       ],
-      "checkboxes": [
-        {"anchor": "기혼"},
-        {"anchor": "NO"}
+      "education_history": [
+        {
+          "from": "YYYY-MM",
+          "to": "YYYY-MM",
+          "field_degree": "Degree / Field of Study",
+          "school_name": "School Name",
+          "location": "City, Country"
+        }
       ],
-      "table_records": [
+      "work_history": [
         {
-          "table_anchor": "학교 정보",
-          "rows": [
-            [
-              {"col_anchor": "From", "value": "2016-06"},
-              {"col_anchor": "To", "value": "2018-03"},
-              {"col_anchor": "전공", "value": "Senior High School"},
-              {"col_anchor": "학교명", "value": "Jacinto Catholic School"},
-              {"col_anchor": "도시", "value": "San Jacinto, Philippines"}
-            ]
-          ]
-        },
+          "from": "YYYY-MM",
+          "to": "YYYY-MM",
+          "job_title": "Occupation / Job Title",
+          "company_name": "Company / Organization Name",
+          "location": "City, Country"
+        }
+      ],
+      "travel_history": [
         {
-          "table_anchor": "직장 정보",
-          "rows": [
-            [
-              {"col_anchor": "From", "value": "2019-08"},
-              {"col_anchor": "To", "value": "2020-07"},
-              {"col_anchor": "직업", "value": "Customer Representative"},
-              {"col_anchor": "회사명", "value": "Tech Mahindra Limited"},
-              {"col_anchor": "도시", "value": "Quezon City, Philippines"}
-            ]
-          ]
+          "from": "YYYY-MM-DD",
+          "to": "YYYY-MM-DD",
+          "city": "City",
+          "country": "Country",
+          "purpose": "Tourism / Study / Work"
         }
       ]
     }
@@ -179,161 +192,175 @@ def analyze_and_extract_qa(client_files, target_file):
         return None
 
 # ==========================================
-# 3. PDF 질문지 작성 엔진 (위치 탐색 & 삽입)
+# 3. PDF 질문지 작성 엔진 (셀 감지 & 칸 초과 방지)
 # ==========================================
-def find_anchor_in_doc(doc, text_query):
-    """전체 PDF 페이지를 스캔하여 라벨의 위치 사각형과 해당 페이지를 찾습니다."""
-    queries = [text_query, text_query.replace(" ", ""), text_query[:4]]
-    for q in queries:
-        if not q or len(q.strip()) < 2:
-            continue
-        for page in doc:
-            rects = page.search_for(q)
-            if rects:
-                return page, rects[0]
-    return None, None
-
 def fill_pdf_questionnaire(target_bytes, qa_data):
     doc = fitz.open(stream=target_bytes, filetype="pdf")
-    BLUE_COLOR = (0.12, 0.31, 0.55)  # #1F4E8C
-    
-    # 1. 체크박스 마킹
-    for cb in qa_data.get("checkboxes", []):
-        anchor = cb.get("anchor", "").strip()
-        if not anchor:
+    BLUE_COLOR = (0.12, 0.31, 0.55)  # 타이핑 색상 (#1F4E8C)
+    app = qa_data.get("applicant", {})
+
+    # 1. 인적사항 단일 필드 매핑
+    label_mapping = [
+        ("출생 도시", app.get("birth_city", ""), False),
+        ("출생 국가", app.get("birth_country", ""), False),
+        ("이메일 주소", app.get("email", ""), False),
+        ("연락처", app.get("phone", ""), False),
+        ("현재 거주지 주소", app.get("address", ""), True),
+        ("사실혼이 시작된 날짜", app.get("marriage_date", ""), False),
+        ("3) 배우자 생년월일", app.get("spouse_dob", ""), False)
+    ]
+
+    for label, val, is_long in label_mapping:
+        if not val:
             continue
-        page, rect = find_anchor_in_doc(doc, anchor)
-        if page and rect:
-            # 체크박스(☐) 사각형 위치 계산 (라벨 왼쪽 약 16pt 지점)
-            chk_rect = fitz.Rect(rect.x0 - 16, rect.y0 - 1, rect.x0 - 2, rect.y1 + 1)
-            try:
-                page.insert_textbox(chk_rect, "V", fontsize=10, fontname="helv", color=BLUE_COLOR, align=1)
-            except Exception:
-                pass
+        for page in doc:
+            rects = page.search_for(label)
+            if rects:
+                r = rects[0]
+                # 표 셀 감지 시도
+                cell_box = None
+                try:
+                    for tab in page.find_tables():
+                        for row in tab.rows:
+                            for c_idx, cell in enumerate(row.cells):
+                                if cell and fitz.Rect(cell).intersects(r):
+                                    if c_idx + 1 < len(row.cells) and row.cells[c_idx + 1]:
+                                        cell_box = fitz.Rect(row.cells[c_idx + 1])
+                                        break
+                except Exception:
+                    pass
 
-    # 2. 단일 텍스트 필드 채우기
-    for item in qa_data.get("text_fields", []):
-        # 복합 필드(성/이름 등) 처리
-        sub_fields = item.get("sub_fields")
-        if sub_fields:
-            for sub in sub_fields:
-                s_anchor = sub.get("anchor", "").strip()
-                s_val = str(sub.get("value", "")).strip()
-                if not s_val:
-                    continue
-                page, rect = find_anchor_in_doc(doc, s_anchor)
-                if page and rect:
-                    box = fitz.Rect(rect.x1 + 6, rect.y0 - 2, rect.x1 + 140, rect.y1 + 3)
-                    try:
-                        page.insert_textbox(box, s_val, fontsize=9.0, fontname="helv", color=BLUE_COLOR, align=0)
-                    except Exception:
-                        pass
+                if cell_box:
+                    target_rect = fitz.Rect(cell_box.x0 + 4, cell_box.y0 + 2, cell_box.x1 - 4, cell_box.y1 - 2)
+                else:
+                    if is_long:
+                        target_rect = fitz.Rect(r.x1 + 10, r.y0 - 2, page.rect.width - 35, r.y1 + 18)
+                    else:
+                        target_rect = fitz.Rect(r.x1 + 8, r.y0 - 2, min(r.x1 + 220, page.rect.width - 35), r.y1 + 4)
+
+                fs = 8.5 if is_long else 9.5
+                try:
+                    page.insert_textbox(target_rect, val, fontsize=fs, fontname="helv", color=BLUE_COLOR, align=0)
+                except Exception:
+                    pass
+                break
+
+    # 2. 배우자 성/이름 나란히 있는 특수 라벨 처리
+    for page in doc:
+        rects_surname = page.search_for("성:")
+        rects_given = page.search_for("이름:")
+        if rects_surname and app.get("spouse_surname"):
+            r_s = rects_surname[0]
+            page.insert_textbox(fitz.Rect(r_s.x1 + 5, r_s.y0 - 2, r_s.x1 + 100, r_s.y1 + 3), app.get("spouse_surname"), fontsize=9.5, fontname="helv", color=BLUE_COLOR)
+        if rects_given and app.get("spouse_given_name"):
+            r_g = rects_given[0]
+            page.insert_textbox(fitz.Rect(r_g.x1 + 5, r_g.y0 - 2, r_g.x1 + 120, r_g.y1 + 3), app.get("spouse_given_name"), fontsize=9.5, fontname="helv", color=BLUE_COLOR)
+
+    # 3. 체크박스 마킹
+    for chk in qa_data.get("checkbox_checks", []):
+        if not chk:
             continue
+        for page in doc:
+            rects = page.search_for(chk)
+            if rects:
+                r = rects[0]
+                box = fitz.Rect(r.x0 - 16, r.y0 - 1, r.x0 - 2, r.y1 + 1)
+                try:
+                    page.insert_textbox(box, "V", fontsize=10, fontname="helv", color=BLUE_COLOR, align=1)
+                except Exception:
+                    pass
+                break
 
-        anchor = item.get("anchor", "").strip()
-        val = str(item.get("value", "")).strip()
-        is_long = item.get("is_long", False)
-
-        if not anchor or not val:
-            continue
-
-        page, rect = find_anchor_in_doc(doc, anchor)
-        if page and rect:
-            if is_long:
-                # 주소 등 긴 필드는 라벨 우측부터 페이지 여백 끝까지 넉넉하게 지정
-                box = fitz.Rect(rect.x1 + 10, rect.y0 - 2, page.rect.width - 40, rect.y1 + 22)
-                fs = 8.5
-            else:
-                # 일반 질문은 라벨 오른쪽 인접 칸에 배치
-                box = fitz.Rect(rect.x1 + 10, rect.y0 - 2, min(rect.x1 + 180, page.rect.width - 30), rect.y1 + 3)
-                fs = 9.0
-
-            try:
-                page.insert_textbox(box, val, fontsize=fs, fontname="helv", color=BLUE_COLOR, align=0)
-            except Exception:
-                pass
-
-    # 3. 다중 행 표(학력, 경력, 여행 등) 채우기
-    for t_record in qa_data.get("table_records", []):
-        t_anchor = t_record.get("table_anchor", "")
-        rows = t_record.get("rows", [])
-        if not rows:
-            continue
+    # 4. 학력 및 직장 표 채우기 (칸 수 초과 절대 방지)
+    def fill_table_safely(page, keyword, items_list, col_keys):
+        try:
+            tables = page.find_tables()
+            matched_tab = None
+            for tab in tables:
+                tab_text = page.get_text("text", clip=tab.bbox)
+                if keyword in tab_text:
+                    matched_tab = tab
+                    break
             
-        page, rect = find_anchor_in_doc(doc, t_anchor)
-        if page and rect:
-            # 표 헤더 기준 Y좌표 시작점
-            start_y = rect.y1 + 8
-            row_height = 20.0
-            
-            for r_idx, row_data in enumerate(rows):
-                cur_y0 = start_y + (r_idx * row_height)
-                cur_y1 = cur_y0 + row_height - 2
+            if matched_tab and len(matched_tab.rows) > 1:
+                # 사용 가능한 실제 빈 행 수 계산
+                available_rows = len(matched_tab.rows) - 1
+                for idx in range(min(available_rows, len(items_list))):
+                    data = items_list[idx]
+                    row_cells = matched_tab.rows[1 + idx].cells
+                    for c_idx, key in enumerate(col_keys):
+                        if c_idx < len(row_cells) and row_cells[c_idx]:
+                            c_rect = fitz.Rect(row_cells[c_idx])
+                            pad_rect = fitz.Rect(c_rect.x0 + 3, c_rect.y0 + 2, c_rect.x1 - 3, c_rect.y1 - 2)
+                            val = data.get(key, "")
+                            page.insert_textbox(pad_rect, str(val), fontsize=8.0, fontname="helv", color=BLUE_COLOR, align=0)
                 
-                for cell in row_data:
-                    c_anchor = cell.get("col_anchor", "")
-                    c_val = str(cell.get("value", "")).strip()
-                    if not c_val:
-                        continue
-                    
-                    # 해당 페이지 내에서 열 헤더 검색
-                    c_rects = page.search_for(c_anchor)
-                    if c_rects:
-                        col_r = c_rects[0]
-                        cell_box = fitz.Rect(col_r.x0 - 2, cur_y0, col_r.x1 + 80, cur_y1)
-                        try:
-                            page.insert_textbox(cell_box, c_val, fontsize=8.0, fontname="helv", color=BLUE_COLOR, align=0)
-                        except Exception:
-                            pass
+                # 칸이 부족하여 별첨으로 넘어간 경우 안내 기입
+                if len(items_list) > available_rows:
+                    last_cell = matched_tab.rows[-1].cells[-1]
+                    if last_cell:
+                        r_annot = fitz.Rect(last_cell)
+                        page.insert_textbox(
+                            fitz.Rect(r_annot.x0, r_annot.y1 - 10, r_annot.x1, r_annot.y1),
+                            "*See attached sheet",
+                            fontsize=6.5,
+                            fontname="helv",
+                            color=BLUE_COLOR
+                        )
+        except Exception:
+            pass
 
+    for page in doc:
+        # 학교 정보 표
+        fill_table_safely(page, "학교 정보", qa_data.get("education_history", []), ["from", "to", "field_degree", "school_name", "location"])
+        # 직장 정보 표
+        fill_table_safely(page, "직장 정보", qa_data.get("work_history", []), ["from", "to", "job_title", "company_name", "location"])
+        # 여행 정보 표
+        fill_table_safely(page, "여행 정보", qa_data.get("travel_history", []), ["from", "to", "city", "country", "purpose"])
+
+    doc.need_appearances(True)
     out_buf = io.BytesIO()
     doc.save(out_buf, deflate=True)
     doc.close()
     return out_buf.getvalue()
 
 # ==========================================
-# 4. Word 질문지 작성 엔진 (.docx)
+# 4. Word 질문지 채우기 엔진 (.docx)
 # ==========================================
 def fill_docx_questionnaire(target_bytes, qa_data):
     doc = docx.Document(io.BytesIO(target_bytes))
     BLUE_RGB = RGBColor(0x1F, 0x4E, 0x8C)
-    
-    # 단일 항목 매핑 사전 구성
-    fill_map = {}
-    for item in qa_data.get("text_fields", []):
-        if item.get("sub_fields"):
-            for sub in item["sub_fields"]:
-                if sub.get("anchor") and sub.get("value"):
-                    fill_map[sub["anchor"].strip().lower()] = str(sub["value"]).strip()
-        elif item.get("anchor") and item.get("value"):
-            fill_map[item["anchor"].strip().lower()] = str(item["value"]).strip()
+    app = qa_data.get("applicant", {})
 
-    def insert_blue_run(p, text):
+    fill_map = {
+        "출생 도시": app.get("birth_city", ""),
+        "출생 국가": app.get("birth_country", ""),
+        "이메일 주소": app.get("email", ""),
+        "연락처": app.get("phone", ""),
+        "현재 거주지 주소": app.get("address", ""),
+        "성:": app.get("spouse_surname", ""),
+        "이름:": app.get("spouse_given_name", ""),
+        "사실혼이 시작된 날짜": app.get("marriage_date", ""),
+        "배우자 생년월일": app.get("spouse_dob", "")
+    }
+
+    def insert_run(p, text):
         run = p.add_run(f" {text}")
         run.font.color.rgb = BLUE_RGB
         run.bold = True
 
-    # 1. 표(Table) 내부 탐색 후 입력
     for table in doc.tables:
         for row in table.rows:
             for c_idx, cell in enumerate(row.cells):
                 c_text = cell.text.strip().lower()
                 for q_label, ans in fill_map.items():
-                    if q_label in c_text and len(c_text) < len(q_label) + 20:
-                        # 다음 열 셀이 비어있으면 채움
+                    if ans and q_label.lower() in c_text and len(c_text) < len(q_label) + 20:
                         if c_idx + 1 < len(row.cells) and not row.cells[c_idx + 1].text.strip():
                             p = row.cells[c_idx + 1].paragraphs[0] if row.cells[c_idx + 1].paragraphs else row.cells[c_idx + 1].add_paragraph()
-                            insert_blue_run(p, ans)
+                            insert_run(p, ans)
                         elif "___" in cell.text or cell.text.endswith(":"):
                             p = cell.paragraphs[0] if cell.paragraphs else cell.add_paragraph()
-                            insert_blue_run(p, ans)
-
-    # 2. 본문 문단(Paragraph) 빈칸 채우기
-    for p in doc.paragraphs:
-        p_text = p.text.strip().lower()
-        for q_label, ans in fill_map.items():
-            if q_label in p_text and ("___" in p.text or p.text.strip().endswith(":")):
-                insert_blue_run(p, ans)
+                            insert_run(p, ans)
 
     out_buf = io.BytesIO()
     doc.save(out_buf)
@@ -341,17 +368,144 @@ def fill_docx_questionnaire(target_bytes, qa_data):
     return out_buf.getvalue()
 
 # ==========================================
-# 5. 간결한 UI (단독 도구)
+# 5. 별첨 Word 부속 서류 자동 생성 엔진
+# ==========================================
+def create_appendix_docx(qa_data):
+    """질문지 표 칸을 초과한 전체 학력 및 경력 내역을 담은 공식 Word 부속 서류 생성"""
+    doc = docx.Document()
+    
+    # 여백 설정 (Narrow 0.5인치)
+    sections = doc.sections
+    for s in sections:
+        s.top_margin = Inches(0.6)
+        s.bottom_margin = Inches(0.6)
+        s.left_margin = Inches(0.6)
+        s.right_margin = Inches(0.6)
+
+    # 기본 폰트 설정
+    doc.styles['Normal'].font.name = 'Calibri'
+    doc.styles['Normal'].font.size = Pt(9.5)
+
+    app = qa_data.get("applicant", {})
+    client_name = app.get("full_name", "APPLICANT")
+    client_dob = app.get("dob", "")
+
+    # 타이틀
+    h1 = doc.add_paragraph()
+    r1 = h1.add_run("ADDITIONAL INFORMATION SHEET")
+    r1.bold = True
+    r1.font.size = Pt(14)
+    h1.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    sub = doc.add_paragraph()
+    sub.add_run(f"Applicant Name: {client_name}   |   Date of Birth: {client_dob}").bold = True
+    sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    doc.add_paragraph().paragraph_format.space_after = Pt(4)
+
+    def set_cell_background(cell, fill_hex):
+        tcPr = cell._element.get_or_add_tcPr()
+        shd = OxmlElement('w:shd')
+        shd.set(qn('w:val'), 'clear')
+        shd.set(qn('w:color'), 'auto')
+        shd.set(qn('w:fill'), fill_hex)
+        tcPr.append(shd)
+
+    # 1. 학력 정보 표
+    edu_list = qa_data.get("education_history", [])
+    if edu_list:
+        p_edu = doc.add_paragraph()
+        p_edu.add_run("1. Full Education History (학력 전체 내역)").bold = True
+        p_edu.paragraph_format.space_after = Pt(2)
+
+        t_edu = doc.add_table(rows=1, cols=5)
+        t_edu.alignment = WD_TABLE_ALIGNMENT.CENTER
+        headers = ["From (YYYY-MM)", "To (YYYY-MM)", "Field of Study / Degree", "School Name", "City / Country"]
+        
+        hdr_cells = t_edu.rows[0].cells
+        for idx, text in enumerate(headers):
+            hdr_cells[idx].text = text
+            hdr_cells[idx].paragraphs[0].runs[0].bold = True
+            set_cell_background(hdr_cells[idx], "EAECEE")
+
+        for item in edu_list:
+            row_cells = t_edu.add_row().cells
+            row_cells[0].text = item.get("from", "")
+            row_cells[1].text = item.get("to", "")
+            row_cells[2].text = item.get("field_degree", "")
+            row_cells[3].text = item.get("school_name", "")
+            row_cells[4].text = item.get("location", "")
+
+        doc.add_paragraph().paragraph_format.space_after = Pt(8)
+
+    # 2. 직장 정보 표
+    work_list = qa_data.get("work_history", [])
+    if work_list:
+        p_work = doc.add_paragraph()
+        p_work.add_run("2. Full Work / Activity History (직장 및 활동 전체 내역)").bold = True
+        p_work.paragraph_format.space_after = Pt(2)
+
+        t_work = doc.add_table(rows=1, cols=5)
+        t_work.alignment = WD_TABLE_ALIGNMENT.CENTER
+        headers_work = ["From (YYYY-MM)", "To (YYYY-MM)", "Occupation / Title", "Company / School Name", "City / Country"]
+        
+        hdr_w = t_work.rows[0].cells
+        for idx, text in enumerate(headers_work):
+            hdr_w[idx].text = text
+            hdr_w[idx].paragraphs[0].runs[0].bold = True
+            set_cell_background(hdr_w[idx], "EAECEE")
+
+        for item in work_list:
+            row_cells = t_work.add_row().cells
+            row_cells[0].text = item.get("from", "")
+            row_cells[1].text = item.get("to", "")
+            row_cells[2].text = item.get("job_title", "")
+            row_cells[3].text = item.get("company_name", "")
+            row_cells[4].text = item.get("location", "")
+
+        doc.add_paragraph().paragraph_format.space_after = Pt(8)
+
+    # 3. 여행 정보 표
+    travel_list = qa_data.get("travel_history", [])
+    if travel_list:
+        p_trv = doc.add_paragraph()
+        p_trv.add_run("3. Travel History (해외 출입국 전체 내역)").bold = True
+        p_trv.paragraph_format.space_after = Pt(2)
+
+        t_trv = doc.add_table(rows=1, cols=5)
+        t_trv.alignment = WD_TABLE_ALIGNMENT.CENTER
+        headers_trv = ["From (YYYY-MM)", "To (YYYY-MM)", "City", "Country", "Purpose of Travel"]
+        
+        hdr_t = t_trv.rows[0].cells
+        for idx, text in enumerate(headers_trv):
+            hdr_t[idx].text = text
+            hdr_t[idx].paragraphs[0].runs[0].bold = True
+            set_cell_background(hdr_t[idx], "EAECEE")
+
+        for item in travel_list:
+            row_cells = t_trv.add_row().cells
+            row_cells[0].text = item.get("from", "")
+            row_cells[1].text = item.get("to", "")
+            row_cells[2].text = item.get("city", "")
+            row_cells[3].text = item.get("country", "")
+            row_cells[4].text = item.get("purpose", "")
+
+    out_buf = io.BytesIO()
+    doc.save(out_buf)
+    out_buf.seek(0)
+    return out_buf.getvalue()
+
+# ==========================================
+# 6. UI 화면 구성 (단독 도구)
 # ==========================================
 st.title("📝 질문지 자동 이어채우기")
-st.caption("기존 손님 서류들과 새 빈 질문지를 올리시면, 이미 있는 정보를 자동으로 채워 완성된 서류를 바로 내려받을 수 있습니다.")
+st.caption("기존 손님 서류들과 새 빈 질문지를 올리시면, 알고 있는 정보를 표 칸에 맞게 자동 기입하고 초과된 내역은 별도 Word 양식으로 생성해 드립니다.")
 
 c1, c2 = st.columns(2)
 with c1:
     st.subheader("1. 손님의 기존 자료들")
     source_files = st.file_uploader(
         "이전 질문지, 여권, 퍼밋, 이력서 등 (복수 선택)",
-        type=['pdf', 'docx', 'doc', 'jpg', 'jpeg', 'png'],
+        type=['pdf', 'docx', 'doc', 'jpg', 'jpeg', 'png', 'heic'],
         accept_multiple_files=True
     )
 
@@ -370,28 +524,50 @@ if st.button("질문지 자동 완성하기", type="primary", use_container_widt
     elif not new_q_file:
         st.warning("2단계: 새로 채워야 할 질문지 파일을 업로드해 주세요.")
     else:
-        with st.spinner("기존 서류들을 대조하여 새 질문지를 작성 중입니다. 잠시만 기다려 주세요..."):
+        with st.spinner("서류를 대조하여 질문지 칸에 맞게 작성 중입니다. 잠시만 기다려 주세요..."):
             qa_data = analyze_and_extract_qa(source_files, new_q_file)
             
             if qa_data:
                 base_name = os.path.splitext(new_q_file.name)[0]
                 is_docx = new_q_file.name.lower().endswith(".docx")
-                
+                app_info = qa_data.get("applicant", {})
+                client_name = app_info.get("full_name", "Client").replace(" ", "_")
+
+                # 1. 질문지 본문 작성
                 if is_docx:
-                    completed_bytes = fill_docx_questionnaire(new_q_file.getvalue(), qa_data)
-                    out_filename = f"{base_name}_완성본.docx"
-                    mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    filled_bytes = fill_docx_questionnaire(new_q_file.getvalue(), qa_data)
+                    q_filename = f"{base_name}_완성본.docx"
+                    q_mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                 else:
-                    completed_bytes = fill_pdf_questionnaire(new_q_file.getvalue(), qa_data)
-                    out_filename = f"{base_name}_완성본.pdf"
-                    mime_type = "application/pdf"
+                    filled_bytes = fill_pdf_questionnaire(new_q_file.getvalue(), qa_data)
+                    q_filename = f"{base_name}_완성본.pdf"
+                    q_mime = "application/pdf"
+
+                st.success("✅ 작성이 완료되었습니다! 아래 버튼을 눌러 파일을 내려받으세요.")
                 
-                st.success("✅ 질문지 작성이 완료되었습니다! 아래 버튼을 눌러 확인해 보세요.")
-                st.download_button(
-                    label=f"📥 {out_filename} 내려받기",
-                    data=completed_bytes,
-                    file_name=out_filename,
-                    mime=mime_type,
-                    type="primary",
-                    use_container_width=True
-                )
+                # 2. 다운로드 버튼 제공
+                col_btn1, col_btn2 = st.columns(2)
+                with col_btn1:
+                    st.download_button(
+                        label=f"📥 완성된 질문지 내려받기 ({q_filename})",
+                        data=filled_bytes,
+                        file_name=q_filename,
+                        mime=q_mime,
+                        type="primary",
+                        use_container_width=True
+                    )
+
+                # 3. 학력/직장 이력이 2건 이상인 경우 별첨 Word 서식 추가 제공
+                has_extra = len(qa_data.get("education_history", [])) > 2 or len(qa_data.get("work_history", [])) > 2
+                if has_extra:
+                    appendix_bytes = create_appendix_docx(qa_data)
+                    appendix_filename = f"{client_name}_Additional_History.docx"
+                    with col_btn2:
+                        st.download_button(
+                            label=f"📄 [별첨] 추가 학력·경력 내역서 내려받기 (.docx)",
+                            data=appendix_bytes,
+                            file_name=appendix_filename,
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            type="secondary",
+                            use_container_width=True
+                        )
