@@ -266,6 +266,47 @@ def _safe_on_state(w):
         pass
     return None
 
+# 질문지 안의 '구역 제목' 패턴 (신청자/배우자/자녀 등). 다른 질문지도 대부분 이 표현을 씀
+SECTION_HEADER_RE = re.compile(
+    r"(개인\s*정보|가족\s*관계\s*정보|personal\s+(information|details)|family\s+(information|members))",
+    re.IGNORECASE)
+
+def detect_sections(doc):
+    """각 페이지에서 구역 제목(예: '배우자의 개인 정보')의 위치를 찾아 (page, y, 제목) 목록 반환."""
+    headers = []
+    for p_idx, page in enumerate(doc):
+        for b in page.get_text("blocks"):
+            first_line = (b[4] or "").strip().split("\n")[0].strip()
+            if first_line and len(first_line) <= 60 and SECTION_HEADER_RE.search(first_line):
+                title = re.split(r"\s+-\s+|\(\*", first_line)[0].strip()
+                headers.append((p_idx, b[1], title))
+    headers.sort(key=lambda h: (h[0], h[1]))
+    return headers
+
+def person_for_section(title):
+    # 제목의 '주어' 부분만 판단 (예: '신청자 가족관계 정보 (부모님, 배우자, 자녀…)'의 괄호 속 단어는 무시)
+    t = (title or "").lower()
+    m0 = SECTION_HEADER_RE.search(t)
+    if m0:
+        t = t[:m0.start()]
+    m = re.search(r"자녀\s*\(?(\d+)\)?|child\s*\(?(\d+)\)?", t)
+    if m:
+        return f"CHILD {m.group(1) or m.group(2)}"
+    if "자녀" in t or "child" in t or "dependant" in t or "dependent" in t:
+        return "CHILD"
+    if "배우자" in t or "spouse" in t or "partner" in t:
+        return "SPOUSE"
+    return "MAIN APPLICANT"
+
+def section_for(headers, page_idx, y):
+    current = ""
+    for hp, hy, title in headers:
+        if hp < page_idx or (hp == page_idx and hy <= y + 2):
+            current = title
+        else:
+            break
+    return current
+
 def extract_pdf_form_fields(pdf_bytes):
     """
     [핵심 수정] 같은 이름을 공유하는 라디오/체크박스(예: Yes·No 한 그룹)는
@@ -274,6 +315,7 @@ def extract_pdf_form_fields(pdf_bytes):
     → 버튼마다 '이름 [상태값]' 형태의 고유 키를 부여해 AI가 정확히 하나만 고르게 합니다.
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    headers = detect_sections(doc)
     raw = []
     name_counts = {}
     for p_idx, page in enumerate(doc):
@@ -288,7 +330,9 @@ def extract_pdf_form_fields(pdf_bytes):
                 # 버튼 바로 오른쪽/왼쪽 글자 = 해당 선택지 이름 (Yes/No 구분용)
                 right = " ".join(page.get_text("text", clip=fitz.Rect(r.x1, r.y0 - 2, r.x1 + 45, r.y1 + 2)).split())
                 left = " ".join(page.get_text("text", clip=fitz.Rect(max(0, r.x0 - 30), r.y0 - 2, r.x0, r.y1 + 2)).split())
-                nearby = f"{nearby} || OPTION LABEL (left): {left[-20:]} | (right): {right[:20]}"
+                right_word = right.split()[0] if right.split() else ""
+                left_word = left.split()[-1] if left.split() else ""
+                nearby = f"{nearby} || THIS OPTION'S LABEL (text right after the box): {right_word or '?'} (text right before: {left_word or '?'})"
             info = {
                 "name": w.field_name or "",
                 "label": (w.field_label or "").strip(),
@@ -297,8 +341,11 @@ def extract_pdf_form_fields(pdf_bytes):
                 "on_state": _safe_on_state(w) if w.field_type in BUTTON_TYPES else None,
                 "choices": [c if isinstance(c, str) else c[-1] for c in (w.choice_values or [])] if w.field_type in CHOICE_TYPES else [],
                 "nearby": nearby,
+                "section": section_for(headers, p_idx, r.y0),
+                "person": person_for_section(section_for(headers, p_idx, r.y0)),
                 "page": p_idx,
                 "xref": w.xref,
+                "rect": (r.x0, r.y0, r.x1, r.y1),
                 "current": w.field_value,
             }
             raw.append(info)
@@ -343,14 +390,203 @@ def extract_pdf_form_fields(pdf_bytes):
     doc.close()
     return fields, xfa
 
+# ------------------------------------------
+# 1-1b. 표(경력·학력·주소·여행 등) 자동 인식
+# ------------------------------------------
+def detect_tables(pdf_bytes, fields):
+    """
+    위젯 위치로 표를 찾아 행/열 구조로 정리.
+    - 같은 높이의 텍스트 칸 2개 이상 = 한 행, 열 위치가 같은 행이 3개 이상 이어지면 = 표 (페이지를 넘어가도 이어짐)
+    - 행 안에 'Current'가 인쇄되어 있으면 그 행을 '현재 행'으로 표시
+    → AI는 행 데이터만 돌려주고, 어느 칸에 넣을지는 코드가 정확히 계산합니다.
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    cand = [f for f in fields if not f["duplicate"] and f["type"] == fitz.PDF_WIDGET_TYPE_TEXT]
+    cand.sort(key=lambda f: (f["page"], f["rect"][1], f["rect"][0]))
+
+    # 1) 행 묶기
+    rows = []
+    for f in cand:
+        if rows and rows[-1]["page"] == f["page"] and abs(rows[-1]["y0"] - f["rect"][1]) <= 4:
+            r = rows[-1]
+            r["fields"].append(f)
+            r["y1"] = max(r["y1"], f["rect"][3])
+        else:
+            rows.append({"page": f["page"], "y0": f["rect"][1], "y1": f["rect"][3], "fields": [f]})
+    for r in rows:
+        r["fields"].sort(key=lambda f: f["rect"][0])
+        r["xs"] = [f["rect"][0] for f in r["fields"]]
+
+    def compatible(a, b):
+        matches = sum(1 for x in a["xs"] if any(abs(x - y) <= 8 for y in b["xs"]))
+        return matches >= max(2, min(len(a["xs"]), len(b["xs"])) - 1)
+
+    # 2) 연속 행 → 표
+    groups, cur = [], []
+    for i, r in enumerate(rows):
+        ok = len(r["fields"]) >= 2
+        if ok and cur:
+            prev = cur[-1]
+            same_page_next = prev["page"] == r["page"] and r["y0"] - prev["y1"] < 15
+            next_page_top = (r["page"] == prev["page"] + 1 and rows[i - 1] is prev)
+            if not ((same_page_next or next_page_top) and compatible(prev, r)):
+                groups.append(cur)
+                cur = []
+        if ok:
+            cur.append(r)
+        else:
+            if cur:
+                groups.append(cur)
+            cur = []
+    if cur:
+        groups.append(cur)
+
+    tables = []
+    for g in groups:
+        if len(g) < 3:
+            continue
+        # 열 위치 모으기
+        col_xs = []
+        for r in g:
+            for x in r["xs"]:
+                if not any(abs(x - c) <= 8 for c in col_xs):
+                    col_xs.append(x)
+        col_xs.sort()
+        first = g[0]
+        page = doc[first["page"]]
+        top = first["y0"]
+        # 열 제목 (표 바로 위 32pt)
+        col_names = []
+        for ci, cx in enumerate(col_xs):
+            x_end = col_xs[ci + 1] if ci + 1 < len(col_xs) else page.rect.width
+            words = [w for w in page.get_text("words", clip=fitz.Rect(cx - 2, max(0, top - 34), x_end - 1, top - 1))]
+            name = " ".join(w[4] for w in sorted(words, key=lambda w: (round(w[1]), w[0])))
+            col_names.append(name.strip() or f"Column {ci + 1}")
+        title_txt = " ".join(page.get_text("text", clip=fitz.Rect(0, max(0, top - 110), page.rect.width, top - 34)).split())
+        # 행 구성 + Current 행 찾기
+        t_rows, current_idx = [], None
+        for ri, r in enumerate(g):
+            cells = {}
+            for f in r["fields"]:
+                ci = min(range(len(col_xs)), key=lambda c: abs(col_xs[c] - f["rect"][0]))
+                cells[ci] = f["key"]
+            pg = doc[r["page"]]
+            band = fitz.Rect(0, r["y0"] - 3, pg.rect.width, r["y1"] + 3)
+            words = [w[4].lower() for w in pg.get_text("words", clip=band)]
+            if current_idx is None and any(w.startswith("current") for w in words):
+                current_idx = ri
+            t_rows.append(cells)
+        to_col = next((i for i, n in enumerate(col_names) if re.match(r"\s*(to\b|까지)", n, re.I)), None)
+        tables.append({
+            "id": f"T{len(tables) + 1}",
+            "page": first["page"],
+            "person": first["fields"][0].get("person", "MAIN APPLICANT"),
+            "section": first["fields"][0].get("section", ""),
+            "title": title_txt[-160:],
+            "columns": col_names,
+            "rows": t_rows,
+            "current_row": current_idx,
+            "to_col": to_col,
+        })
+        for cells in t_rows:
+            for k in cells.values():
+                for f in fields:
+                    if f["key"] == k:
+                        f["table"] = tables[-1]["id"]
+    doc.close()
+    return tables
+
+def format_table_catalog(tables):
+    out = []
+    for t in tables:
+        cols = ", ".join(f'"c{i + 1}" = {n}' for i, n in enumerate(t["columns"]))
+        cur = ("YES - the form has a pre-printed 'Current' row for the present job/residence"
+               if t["current_row"] is not None else "no")
+        out.append(f"TABLE {t['id']} | PERSON: {t['person']} | SECTION: {t['section'] or '-'} | PAGE: {t['page'] + 1} | "
+                   f"ROWS: {len(t['rows'])} | CURRENT ROW: {cur}\n  TITLE/CONTEXT: {t['title']}\n  COLUMNS: {cols}")
+    return "\n".join(out)
+
+PRESENT_WORDS = {"present", "current", "now", "현재", "재직중", "재직 중", "ongoing", "to date", "-"}
+
+def _is_present(v):
+    return str(v or "").strip().lower() in PRESENT_WORDS
+
+def place_table_records(tables, ai_tables):
+    """
+    AI가 준 표 데이터(최근→과거 순 레코드 목록)를 실제 칸에 배치.
+    - 'Current' 행이 있는 표: 현재 레코드 → Current 행, 나머지 → 그 다음 행부터.
+      현재 레코드가 없으면 Current 행은 비우고 다음 행부터 작성.
+    - 중복 레코드 제거, 칸 수를 넘으면 넘친 개수 보고.
+    반환: ({key: value}, {key: "표 설명"}, [경고])
+    """
+    values, labels, warns = {}, {}, []
+    by_id = {t["id"]: t for t in tables}
+    for tid, records in (ai_tables or {}).items():
+        t = by_id.get(tid)
+        if t is None or not isinstance(records, list):
+            continue
+        # 정리 + 중복 제거
+        clean, seen = [], set()
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            vals = {}
+            for ci in range(len(t["columns"])):
+                v = rec.get(f"c{ci + 1}")
+                if v is not None and str(v).strip():
+                    vals[ci] = str(v).strip()
+            if not vals:
+                continue
+            sig = tuple(sorted((k, v.lower()) for k, v in vals.items()))
+            if sig in seen:
+                continue
+            seen.add(sig)
+            is_cur = bool(rec.get("is_current")) or (t["to_col"] is not None and _is_present(vals.get(t["to_col"])))
+            clean.append((is_cur, vals))
+
+        n_rows = len(t["rows"])
+        ci_row = t["current_row"]
+        order = []  # (row_index, vals)
+        if ci_row is not None:
+            currents = [v for c, v in clean if c]
+            others = [v for c, v in clean if not c]
+            nxt = ci_row + 1
+            if currents:
+                order.append((ci_row, currents[0]))
+                for v in currents[1:]:          # 현재 직장이 2개 이상이면 다음 행에 이어서
+                    order.append((nxt, v)); nxt += 1
+            for v in others:
+                order.append((nxt, v)); nxt += 1
+        else:
+            order = list(enumerate(v for _, v in clean))
+
+        overflow = 0
+        for ri, vals in order:
+            if ri >= n_rows:
+                overflow += 1
+                continue
+            cells = t["rows"][ri]
+            for ci, v in vals.items():
+                key = cells.get(ci)
+                if key is None:
+                    # Current 행의 'To' 칸처럼 칸 자체가 없는 경우 (인쇄된 Current) → 건너뜀
+                    continue
+                if ri == ci_row and ci == t["to_col"] and _is_present(v):
+                    v = "Present"
+                values[key] = v
+                labels[key] = f"[{t['id']}] {ri + 1}행 · {t['columns'][ci][:20]}" + (" (Current 행)" if ri == ci_row else "")
+        if overflow:
+            warns.append(f"표 {t['id']} ({t['title'][-30:]}): 칸이 부족해 {overflow}개 항목을 넣지 못했습니다. 별도 Word 파일로 정리해 주세요.")
+    return values, labels, warns
+
 def format_field_catalog(fields):
     lines = []
     for f in fields:
-        if f["duplicate"]:
+        if f["duplicate"] or f.get("table"):
             continue
         kind = {fitz.PDF_WIDGET_TYPE_CHECKBOX: "CHECKBOX",
                 fitz.PDF_WIDGET_TYPE_RADIOBUTTON: "RADIO"}.get(f["type"], f["type_str"].upper())
-        line = f"KEY: {json.dumps(f['key'], ensure_ascii=False)} | TYPE: {kind} | PAGE: {f['page'] + 1}"
+        line = f"KEY: {json.dumps(f['key'], ensure_ascii=False)} | PERSON: {f.get('person', 'MAIN APPLICANT')} | SECTION: {f.get('section') or '-'} | TYPE: {kind} | PAGE: {f['page'] + 1}"
         if f["label"]:
             line += f" | TOOLTIP: {f['label'][:120]}"
         line += f" | NEARBY TEXT: {f['nearby']}"
@@ -437,8 +673,8 @@ QA_RULES = """
 1. UNKNOWN INFO = OMIT: If the client documents do NOT explicitly answer Tuberculosis, Medical issues, Crime, Visa Refusals, or Biometrics, OMIT those fields entirely. NEVER guess "No".
 2. ENGLISH TESTS: Only if the client explicitly has an IELTS, CELPIP, or Duolingo score, select the English-test YES option and fill in the scores. Otherwise leave it blank.
 3. CANADA VISA HISTORY: If the client currently holds a Canadian permit (Visitor Record, Work Permit, Study Permit), record it in the Canada visa application history field (e.g., "Work Permit (Valid until YYYY-MM-DD)").
-4. CURRENT JOB LOGIC: Today is {today}. A job whose end date is before this month is NOT current. In the work history table, the FIRST ROW is reserved for the current job. If the client has NO current job, leave the entire first row blank and start past jobs from the SECOND row, most recent first.
-5. TABLE SEQUENTIAL MAPPING: Map Education and Travel history sequentially from Row 1 with no empty rows in between, most recent first.
+4. CURRENT JOB LOGIC: Today is {today}. A job whose end date is before this month is NOT current (is_current = false). Only a job the person still holds today is current.
+5. TABLE ORDER: All history tables are most recent first, with no duplicates.
 6. OVERSEAS RESIDENCE: If overseas residence is inferred only from overseas work, fill City/Country but leave From/To dates blank.
 7. FAMILY INFO: Fill spouse and children information if available.
 8. SIGNATURE / DATE OF SIGNING: Leave blank.
@@ -447,9 +683,30 @@ QA_RULES = """
 11. CONFLICTS: If documents disagree, prefer passport > permit/official letters > previous questionnaire > resume.
 """
 
-def analyze_qa_for_fill(client_files, target_file):
+def build_people_rules(main_applicant, spouse_name):
+    """주 신청자/배우자 구분 규칙. 여권이 2개 이상이면 누가 주 신청자인지 AI가 알 수 없으므로 직원이 지정."""
+    ma = main_applicant.strip() or "NOT SPECIFIED - infer from previous questionnaires / job offer / LMIA; if still unclear, fill ONLY sections that do not depend on who the main applicant is"
+    sp = spouse_name.strip() or "the main applicant's spouse/common-law partner, if any"
+    return f"""
+[WHO IS WHO - VERY IMPORTANT]
+- MAIN APPLICANT (주 신청자): {ma}
+- SPOUSE (배우자): {sp}
+- The client materials may contain documents of several family members (e.g. two passports). Identify each document's owner by the NAME on it.
+- Every field has a PERSON tag (MAIN APPLICANT / SPOUSE / CHILD n) and a SECTION tag. Fill each field ONLY with the data of that PERSON:
+  * Sections titled '신청자 ...' / 'Applicant ...' (or unprefixed sections) = MAIN APPLICANT's own data.
+  * Sections titled '배우자 ...' / 'Spouse ...' = SPOUSE's own data (spouse's address, education, work, travel, etc.).
+  * Sections titled '자녀(1)' / '자녀(2)' / 'Child' = that child's data, ordered oldest first.
+- Inside the MAIN APPLICANT's personal section, the questions "배우자 이름 / Spouse name / 배우자 생년월일" are about the SPOUSE (the main applicant's partner).
+  Inside the SPOUSE's personal section, the same questions are about the MAIN APPLICANT (the spouse's partner).
+- '신청자 가족관계 정보' (applicant family table) = the MAIN APPLICANT's parents, spouse, children, siblings.
+  '배우자 가족관계 정보' (spouse family table) = the SPOUSE's parents, siblings, and also the MAIN APPLICANT as 'Spouse' and their children.
+- NEVER copy one person's data (address history, schools, jobs, travel, birth place, height, eye colour) into another person's section.
+"""
+
+def analyze_qa_for_fill(client_files, target_file, main_applicant="", spouse_name=""):
     """반환: (result_dict | None, warnings, context)"""
     today = datetime.datetime.now(LOCAL_TZ).strftime("%B %d, %Y")
+    people_rules = build_people_rules(main_applicant, spouse_name)
     target_bytes = target_file.getvalue()
     is_docx = target_file.name.lower().endswith(".docx")
 
@@ -463,6 +720,7 @@ def analyze_qa_for_fill(client_files, target_file):
         prompt = f"""
 You are an expert Canadian immigration assistant filling out a blank questionnaire (Word document) using the client's existing documents.
 {QA_RULES.format(today=today)}
+{people_rules}
 OUTPUT: Return ONLY a JSON object: {{"docx_fields": {{"<exact question/label text copied from the form>": "<answer>"}}}}
 - Keys MUST be copied exactly (character for character) from the form text below, e.g. the Korean label "출생 도시" or "Date of Birth".
 - Use the most specific label (e.g. "Father's Name", not just "Name").
@@ -482,6 +740,7 @@ OUTPUT: Return ONLY a JSON object: {{"docx_fields": {{"<exact question/label tex
             return None, warnings, None
         if has_xfa:
             warnings.append("이 PDF는 XFA(동적) 양식입니다. Adobe Acrobat에서는 채운 값이 보이지 않을 수 있으니 결과를 꼭 열어서 확인하세요.")
+        tables = detect_tables(target_bytes, fields)
         page_text = ""
         try:
             d = fitz.open(stream=target_bytes, filetype="pdf")
@@ -492,14 +751,27 @@ OUTPUT: Return ONLY a JSON object: {{"docx_fields": {{"<exact question/label tex
         prompt = f"""
 You are an expert Canadian immigration assistant filling out a blank fillable PDF questionnaire using the client's existing documents.
 {QA_RULES.format(today=today)}
+{people_rules}
 HOW TO FILL:
 - Each fillable field has a unique KEY listed below. Use KEYS EXACTLY as written (including any " [..]" suffix).
 - TEXT / COMBOBOX: value is the answer text. For a COMBOBOX use one of its ALLOWED VALUES.
 - CHECKBOX / RADIO: to select an option, set that option's KEY to "Yes". For a Yes/No question, select ONLY the one correct option key (e.g. "Q3 [Yes]": "Yes"). Never set "No" or "Off" — simply omit options that should not be selected.
-- Use PAGE and NEARBY TEXT to understand which question and which table row each field belongs to.
-OUTPUT: Return ONLY a JSON object: {{"pdf_fields": {{"<KEY>": "<value>"}}}}
+- Use PAGE and NEARBY TEXT to understand which question each field belongs to.
+TABLES (work history, education, addresses, travel, relatives, etc.):
+- Do NOT fill table cells by key. Instead return the table's records under "tables" -> table id, as a list of objects using the column ids ("c1", "c2", ...).
+- List records MOST RECENT FIRST, each real record ONLY ONCE (never repeat the same job/school/address).
+- Add "is_current": true for a record that is ongoing today (still working there / still living there / still studying). For those, put "Present" in the To column.
+- Do NOT leave empty records to skip rows — the program places records into the right rows automatically
+  (a current record goes to the pre-printed 'Current' row; if there is no current record, that row stays blank and past records start on the next row).
+- Fill each table with the data of that table's PERSON only.
+OUTPUT: Return ONLY a JSON object:
+{{"pdf_fields": {{"<KEY>": "<value>"}},
+  "tables": {{"<TABLE ID>": [{{"is_current": true, "c1": "2025-09", "c2": "Present", "c3": "..."}}, {{"is_current": false, "c1": "...", "c2": "..."}}]}}}}
 
-===== FILLABLE FIELDS OF THE TARGET FORM =====
+===== TABLES OF THE TARGET FORM =====
+{format_table_catalog(tables)}
+
+===== OTHER FILLABLE FIELDS OF THE TARGET FORM =====
 {format_field_catalog(fields)}
 ===== FORM PAGE TEXT (for context) =====
 {page_text[:40000]}
@@ -507,7 +779,7 @@ OUTPUT: Return ONLY a JSON object: {{"pdf_fields": {{"<KEY>": "<value>"}}}}
 
 ===== CLIENT SOURCE MATERIALS =====
 """
-        context = {"kind": "pdf", "fields": fields}
+        context = {"kind": "pdf", "fields": fields, "tables": tables}
 
     try:
         response = safe_generate_content([prompt] + source_parts, json_mode=True)
@@ -524,7 +796,12 @@ def build_review_rows(data, context):
     rows = []
     if context["kind"] == "pdf":
         by_key = {f["key"]: f for f in context["fields"] if not f["duplicate"]}
-        for k, v in (data.get("pdf_fields") or {}).items():
+        t_values, t_labels, t_warns = place_table_records(context.get("tables", []), data.get("tables"))
+        context["table_warnings"] = t_warns
+        plain = {k: v for k, v in (data.get("pdf_fields") or {}).items()
+                 if not (by_key.get(k) or {}).get("table")}  # 표 칸은 표 로직 결과만 사용
+        merged = list(t_values.items()) + list(plain.items())
+        for k, v in merged:
             if v is None or str(v).strip() == "":
                 continue
             f = by_key.get(k)
@@ -542,15 +819,16 @@ def build_review_rows(data, context):
                 note = "⚠️ 한글 포함"
             elif f["choices"] and v.lower() not in [c.lower() for c in f["choices"]]:
                 note = "⚠️ 선택지에 없는 값"
-            rows.append({"기입": f is not None, "칸 (Key)": k,
-                         "주변 문구": (f["nearby"] if f else "")[:80],
+            rows.append({"기입": f is not None, "구역": ({"MAIN APPLICANT": "신청자", "SPOUSE": "배우자"}.get(f.get("person"), (f.get("person") or "").replace("CHILD", "자녀")) if f else ""),
+                         "칸 (Key)": k,
+                         "주변 문구": (t_labels.get(k) or (f["nearby"] if f else ""))[:80],
                          "값": v, "확인 필요": note})
     else:
         for k, v in (data.get("docx_fields") or {}).items():
             if v is None or str(v).strip() == "":
                 continue
             v = str(v).strip()
-            rows.append({"기입": True, "칸 (Key)": k, "주변 문구": "", "값": v,
+            rows.append({"기입": True, "구역": "", "칸 (Key)": k, "주변 문구": "", "값": v,
                          "확인 필요": "⚠️ 한글 포함" if HANGUL_RE.search(v) else ""})
     return rows
 
@@ -564,6 +842,24 @@ def _fit_fontsize(text, rect_width, base=10.0, min_size=6.0):
     while size > min_size and fitz.get_text_length(text, fontname="cour", fontsize=size) > rect_width - 4:
         size -= 0.5
     return size
+
+def _fit_multiline(text, width, height, max_size=9.0, min_size=5.0):
+    """줄바꿈했을 때 칸 높이에 들어가는 가장 큰 글자 크기 (없으면 None)."""
+    size = max_size
+    words = text.split()
+    while size >= min_size:
+        lines, cur = 1, ""
+        for wd in words:
+            trial = (cur + " " + wd).strip()
+            if fitz.get_text_length(trial, fontname="cour", fontsize=size) <= width - 4:
+                cur = trial
+            else:
+                lines += 1
+                cur = wd
+        if lines * size * 1.3 + 3 <= height:
+            return size
+        size -= 0.5
+    return None
 
 def fill_qa_pdf_interactive(target_bytes, values_by_key, fields):
     """values_by_key: {key: value}. 필드 키 → xref로 정확히 해당 위젯만 채움."""
@@ -606,7 +902,15 @@ def fill_qa_pdf_interactive(target_bytes, values_by_key, fields):
                 multiline = bool(w.field_flags & (1 << 12))
                 if not multiline and not (w.field_flags & (1 << 24)):  # 콤(Comb) 칸 제외
                     base = w.text_fontsize if w.text_fontsize and w.text_fontsize > 0 else 10
-                    w.text_fontsize = _fit_fontsize(val, w.rect.width, base=min(base, 11))
+                    size = _fit_fontsize(val, w.rect.width, base=min(base, 11))
+                    too_long = fitz.get_text_length(val, fontname="cour", fontsize=size) > w.rect.width - 4
+                    if too_long or size < 7.5:
+                        # 한 줄로는 너무 작거나 안 들어가면 2~3줄로 줄바꿈 (예: 'Intermediate Environmental Designer')
+                        ml = _fit_multiline(val, w.rect.width, w.rect.height)
+                        if ml and (too_long or ml > size):
+                            w.field_flags |= (1 << 12)
+                            size = ml
+                    w.text_fontsize = size
                 w.update()
             filled += 1
         except Exception:
@@ -766,8 +1070,21 @@ elif app_mode == MENU_5:
             key=f"qa_target_{st.session_state.menu5_uploader_key}"
         )
 
+    st.subheader("3. 누구의 질문지인가요?")
+    p1, p2 = st.columns(2)
+    with p1:
+        main_applicant = st.text_input(
+            "주 신청자 이름 (여권 영문 이름)", placeholder="예: KIM JIYOUNG",
+            key=f"qa_main_{st.session_state.menu5_uploader_key}",
+            help="가족 서류를 함께 올릴 때 필수입니다. 이 사람의 정보가 '신청자' 칸에 들어갑니다.")
+    with p2:
+        spouse_name = st.text_input(
+            "배우자 이름 (해당 시)", placeholder="예: LEE MINHO",
+            key=f"qa_spouse_{st.session_state.menu5_uploader_key}",
+            help="이 사람의 정보가 '배우자' 칸에 들어갑니다.")
+
     # [수정] 파일을 바꾸면 이전 손님의 결과가 남아 잘못 다운로드되는 문제 방지
-    current_sig = files_signature(list(source_files or []) + [new_q_file])
+    current_sig = files_signature(list(source_files or []) + [new_q_file]) + main_applicant.strip().lower() + "|" + spouse_name.strip().lower()
     if st.session_state.qa_sig and st.session_state.qa_sig != current_sig:
         st.session_state.qa_rows = None
         st.session_state.qa_ctx = None
@@ -783,11 +1100,15 @@ elif app_mode == MENU_5:
                 st.warning("1단계: 손님의 기존 서류를 최소 1개 이상 업로드해 주세요.")
             elif not new_q_file:
                 st.warning("2단계: 새로 채워야 할 질문지 파일을 업로드해 주세요.")
+            elif len(source_files) > 1 and not main_applicant.strip() and not st.session_state.get("qa_skip_name_check"):
+                st.warning("여러 서류를 올리셨습니다. 가족 서류가 섞여 있다면 '주 신청자 이름'을 입력해 주세요. "
+                           "(본인 서류만 있다면 버튼을 한 번 더 누르면 그대로 진행합니다)")
+                st.session_state.qa_skip_name_check = True
             elif new_q_file.name.lower().endswith(".docx") and not DOCX_AVAILABLE:
                 st.error("서버에 python-docx가 설치되어 있지 않습니다. requirements.txt에 python-docx를 추가해 주세요.")
             else:
                 with st.spinner("원본 폼 필드를 분석하여 작성 중입니다. 잠시만 기다려 주세요..."):
-                    data, warns, ctx = analyze_qa_for_fill(source_files, new_q_file)
+                    data, warns, ctx = analyze_qa_for_fill(source_files, new_q_file, main_applicant, spouse_name)
                     st.session_state.qa_warnings = warns
                     if data and ctx:
                         st.session_state.qa_rows = build_review_rows(data, ctx)
@@ -797,7 +1118,7 @@ elif app_mode == MENU_5:
 
     with col_reset:
         if st.button("🔄 전체 리셋", use_container_width=True):
-            for k in ("qa_rows", "qa_ctx", "qa_sig", "qa_warnings", "qa_base"):
+            for k in ("qa_rows", "qa_ctx", "qa_sig", "qa_warnings", "qa_base", "qa_skip_name_check"):
                 st.session_state[k] = None
             st.session_state.menu5_uploader_key = str(uuid.uuid4())
             st.rerun()
@@ -811,8 +1132,10 @@ elif app_mode == MENU_5:
         if not rows:
             st.info("자료에서 질문지에 기입할 수 있는 정보를 찾지 못했습니다.")
         else:
-            st.subheader("3. 기입 내용 확인 및 수정")
+            st.subheader("4. 기입 내용 확인 및 수정")
             st.caption("값을 직접 고치거나, '기입' 체크를 해제하면 그 칸은 비워둡니다. 수정 내용은 다운로드 파일에 바로 반영됩니다.")
+            for tw in (st.session_state.qa_ctx or {}).get("table_warnings", []) or []:
+                st.warning(tw)
             need_check = sum(1 for r in rows if r["확인 필요"])
             if need_check:
                 st.warning(f"⚠️ 확인이 필요한 항목이 {need_check}개 있습니다. '확인 필요' 열을 살펴봐 주세요.")
@@ -822,7 +1145,7 @@ elif app_mode == MENU_5:
                 key=f"qa_editor_{st.session_state.qa_sig}",
                 use_container_width=True,
                 hide_index=True,
-                disabled=["칸 (Key)", "주변 문구", "확인 필요"],
+                disabled=["구역", "칸 (Key)", "주변 문구", "확인 필요"],
                 column_config={
                     "기입": st.column_config.CheckboxColumn(width="small"),
                     "값": st.column_config.TextColumn(width="large"),
