@@ -262,20 +262,20 @@ def analyze_qa_for_fill(client_files, target_file):
     The FIRST document is the NEW BLANK QUESTIONNAIRE. The rest are CLIENT SOURCE MATERIALS.
 
     [CRITICAL RULES - MUST OBEY OR FAIL]
-    1. UNKNOWN INFO = DO NOT TOUCH: If the client documents do NOT explicitly state an answer for Tuberculosis, Medical issues, Crime, Visa Refusals, Biometrics, etc., YOU MUST LEAVE THEM BLANK. DO NOT GUESS "NO". DO NOT map them in the JSON.
-    2. ENGLISH TESTS: If the client uploaded an IELTS, CELPIP, or Duolingo score, or mentions it in the materials, you MUST map "Yes" to the corresponding English test checkbox.
-    3. BIOMETRICS & VISA HISTORY: If the client has a Canadian visa or permit, map "Yes" to the Biometrics question and list the Visa details in the history box. Do not leave it blank if they hold a permit.
-    4. TABLE SEQUENTIAL MAPPING: Map Work, Education, and Travel history to the PDF table fields STRICTLY SEQUENTIALLY starting from ROW 1. 
-       - DO NOT skip Row 1 even if the job is not 'Current'. The first row must NEVER be left blank if there is history.
-       - The most recent entry goes to Row 1 fields, the second to Row 2, etc. NO EMPTY GAPS between rows.
-       - Fill up to the maximum number of rows available in the PDF form. Do not worry about excess entries.
-    5. TRAVEL & RESIDENCE HISTORY: Extract all travel history and countries of residence from the materials and map them to the corresponding tables.
-    6. LANGUAGE: All output values MUST be in ENGLISH (Latin alphabet, numbers). NO KOREAN characters in values.
+    1. UNKNOWN INFO = OMIT: If the client documents do NOT explicitly mention an answer for Tuberculosis, Medical issues, Crime, Visa Refusals, or Biometrics, YOU MUST OMIT those fields from the JSON entirely. ABSOLUTELY DO NOT GUESS "NO", "Off", or "False". Leave them unmapped and blank.
+    2. ENGLISH TESTS: If AND ONLY IF the client explicitly has an IELTS, CELPIP, or Duolingo score in the materials, map "Yes" to the English test YES checkbox. Otherwise, LEAVE IT COMPLETELY BLANK.
+    3. CANADA VISA HISTORY: If the client currently holds a Canadian permit (e.g., Visitor Record, Work Permit, Study Permit), they obviously applied for it. You MUST map this fact to the "Canada Visa Application History" text field (e.g., "Visitor Record (Valid until YYYY-MM-DD)").
+    4. CURRENT JOB LOGIC: Today is October 2026. A job ending in "2026-09" or earlier is NOT current. In the work history table, the FIRST ROW is reserved for the "Current" job. IF THE CLIENT DOES NOT HAVE A CURRENT JOB, YOU MUST LEAVE THE ENTIRE FIRST ROW BLANK. Start mapping their past jobs from the SECOND ROW downwards.
+    5. TABLE SEQUENTIAL MAPPING: Map Education and Travel history sequentially starting from Row 1. NO empty gaps between rows. Map Work history from Row 2 if there is no current job, otherwise Row 1.
+    6. OVERSEAS RESIDENCE: If you infer overseas residence from overseas work experience, DO NOT fill in the "From/To" dates for that residence (leave dates blank), but DO fill in the City/Country.
+    7. FAMILY INFO: Extract Spouse and Children information if available and map them.
+    8. SIGNATURE DATE = BLANK: DO NOT fill in the signature Date. Leave it blank.
+    9. LANGUAGE: All output values MUST be in ENGLISH (Latin alphabet, numbers). NO KOREAN inside values.
 
     Return ONLY a raw JSON object formatted strictly as:
     {
       "pdf_fields": {
-         "Exact_Field_Name_1": "Danyang",
+         "Exact_Field_Name_1": "Extracted Value",
          "Exact_Checkbox_Name_For_Yes": "Yes"
       },
       "docx_fields": {
@@ -309,7 +309,7 @@ def fill_qa_pdf_interactive(target_bytes, qa_data):
             fn = w.field_name
             if fn in pdf_fields:
                 val = pdf_fields[fn]
-                if val is not None and val != "":
+                if val:
                     ftype = getattr(w, "field_type_string", "").lower()
                     
                     if "check" in ftype or "radio" in ftype:
@@ -386,7 +386,6 @@ MENU_5 = "📝 질문지 기존 정보 기입"
 st.sidebar.title("🦅 CanNest Tool")
 app_mode = st.sidebar.radio("원하시는 업무 도구를 선택하세요", [MENU_1, MENU_2, MENU_3, MENU_4, MENU_5])
 
-# 메뉴 1~4 생략 (기존 작동 완벽하게 동일함)
 if app_mode in [MENU_1, MENU_2, MENU_3, MENU_4]:
     st.title(app_mode)
     st.info("좌측 메뉴에서 5번 '질문지 기존 정보 기입' 기능을 테스트해 보세요.")
@@ -398,6 +397,10 @@ elif app_mode == MENU_5:
     st.title(MENU_5)
     st.caption("기존 손님 서류들과 새 빈 질문지를 올리시면, 알고 있는 정보를 서식 칸에 맞춰 기입해 드립니다.")
 
+    # 파일 업로더 초기화를 위한 동적 Key 생성
+    if "menu5_uploader_key" not in st.session_state:
+        st.session_state.menu5_uploader_key = str(uuid.uuid4())
+
     if "qa_result_files" not in st.session_state:
         st.session_state.qa_result_files = None
 
@@ -408,14 +411,14 @@ elif app_mode == MENU_5:
             "이전 질문지, 여권, 퍼밋, 이력서 등 (복수 선택)",
             type=['pdf', 'docx', 'doc', 'jpg', 'jpeg', 'png', 'heic'],
             accept_multiple_files=True,
-            key="qa_sources"
+            key=f"qa_sources_{st.session_state.menu5_uploader_key}"
         )
     with c2:
         st.subheader("2. 새로 채울 빈 질문지")
         new_q_file = st.file_uploader(
             "채워 넣을 대상 질문지 1부 (.pdf 또는 .docx)",
             type=['pdf', 'docx'],
-            key="qa_target"
+            key=f"qa_target_{st.session_state.menu5_uploader_key}"
         )
 
     st.markdown("---")
@@ -438,11 +441,11 @@ elif app_mode == MENU_5:
                         
                         if is_docx:
                             filled_bytes = fill_qa_docx(new_q_file.getvalue(), qa_data)
-                            q_filename = f"{base_name}_기존정보기입본.docx"
+                            q_filename = f"{base_name}_Info_Filled.docx"
                             q_mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                         else:
                             filled_bytes = fill_qa_pdf_interactive(new_q_file.getvalue(), qa_data)
-                            q_filename = f"{base_name}_기존정보기입본.pdf"
+                            q_filename = f"{base_name}_Info_Filled.pdf"
                             q_mime = "application/pdf"
 
                         # 결과를 Session State에 저장하여 버튼 증발 방지
@@ -453,8 +456,9 @@ elif app_mode == MENU_5:
                         }
 
     with col_reset:
-        if st.button("🔄 전체 리셋", use_container_width=True, key="reset_menu5"):
+        if st.button("🔄 전체 리셋", use_container_width=True):
             st.session_state.qa_result_files = None
+            st.session_state.menu5_uploader_key = str(uuid.uuid4()) # 새로운 키를 생성하여 업로더 완전 초기화
             st.rerun()
 
     # 💡 결과 렌더링
@@ -463,7 +467,7 @@ elif app_mode == MENU_5:
         st.success("✅ 기존 정보 기입이 완료되었습니다! 확인하지 못한 항목은 비워두었으니 손님께 마저 작성해 달라고 요청하세요.")
         
         st.download_button(
-            label=f"📥 기존 정보 기입본 내려받기",
+            label=f"📥 Info Filled 질문지 내려받기",
             data=res["q_bytes"],
             file_name=res["q_filename"],
             mime=res["q_mime"],
