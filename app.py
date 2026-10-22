@@ -26,7 +26,7 @@ pillow_heif.register_heif_opener()
 Image.MAX_IMAGE_PIXELS = None
 
 # ==========================================
-# 0. API 키 설정
+# 0. API 키 설정 및 보안
 # ==========================================
 if "GEMINI_API_KEY" not in st.secrets:
     st.error("⚠️ Streamlit Cloud의 Secrets에 GEMINI_API_KEY 설정이 필요합니다.")
@@ -49,7 +49,7 @@ def safe_generate_content(contents):
     raise last_error
 
 # ==========================================
-# 1. 파일 데이터 파싱 (PDF 폼 필드 이름 추출 기능 포함)
+# 1. 문서 파싱 엔진
 # ==========================================
 def read_word_document_text(file_bytes, file_name=""):
     try:
@@ -80,7 +80,7 @@ def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
             for page in doc:
                 text += page.get_text("text") + "\n"
                 
-                # 💡 [핵심 기술] PDF 내부에 존재하는 모든 클릭 가능한 서식(Widget)의 고유 이름(Field Name)을 AI에게 전달
+                # 대화형 서식(Widget) 필드 리스트를 AI에게 제공
                 for w in page.widgets():
                     if w.field_value:
                         text += f"[{w.field_name}]: {w.field_value}\n"
@@ -88,7 +88,7 @@ def prepare_document_for_gemini(file_bytes, mime_type, file_name=""):
                     r = w.rect
                     clip = fitz.Rect(max(0, r.x0 - 100), max(0, r.y0 - 25), min(page.rect.width, r.x1 + 50), min(page.rect.height, r.y1 + 25))
                     nearby = page.get_text("text", clip=clip).replace('\n', ' ').strip()
-                    field_list.append(f"Field Name: '{w.field_name}' | Context Nearby: '{nearby}' | Type: {w.field_type_string}")
+                    field_list.append(f"Field Name: '{w.field_name}' | Nearby Text: '{nearby}' | Type: {w.field_type_string}")
             
             if field_list:
                 text += "\n\n--- [FILLABLE PDF FIELDS AVAILABLE] ---\n"
@@ -125,20 +125,19 @@ def batch_process_client_files(files):
     return flat
 
 # ==========================================
-# 2. AI 질문지 분석 및 매핑 (오류 수정판)
+# 2. AI 질문지 분석 및 완벽 매핑
 # ==========================================
 def analyze_qa_for_fill(client_files, target_file):
     prompt = """
     You are an expert Canadian immigration assistant filling out a blank questionnaire based on client documents.
     The FIRST document is the NEW BLANK QUESTIONNAIRE. The rest are CLIENT SOURCE MATERIALS.
 
-    [CRITICAL RULES]
-    1. CURRENT DATE: Today is October 2026.
-    2. CURRENT JOB LOGIC: If a job's end date is BEFORE October 2026 (e.g., '2026-09-26' or '2025-06-30'), it is NOT 'Current'. ONLY jobs marked as 'Present' or with end dates in the future (e.g., '2028-05') belong in the "Current Occupation" section.
-    3. LANGUAGE: All output values MUST be in ENGLISH (Latin alphabet, numbers). NO KOREAN inside values.
-    4. PDF MAPPING: Look at the [FILLABLE PDF FIELDS AVAILABLE] section I provided for the blank form. Put the EXACT "Field Name" as the key in the `pdf_fields` dictionary, and the extracted English answer as the value.
-    5. CHECKBOXES: For checkboxes/radio buttons in PDF, set the value to "Yes" if it applies.
-    6. FULL HISTORY ARRAYS: Always provide the COMPLETE chronological history in the `full_education_history`, `full_work_history`, and `full_travel_history` arrays. We will use these arrays to generate an Additional Information Word document if the history exceeds the PDF boxes. Fill the PDF boxes with the most recent entries up to the available slots.
+    [CRITICAL RULES - MUST OBEY]
+    1. UNKNOWN INFO = LEAVE BLANK: Do NOT assume "No" for questions like Tuberculosis, Medical issues, Crime, Visa Refusals, or Biometrics. If the client documents do NOT explicitly say "No", you MUST leave the checkboxes completely UNMAPPED (omit them from the JSON). DO NOT GUESS.
+    2. ENGLISH TESTS: If the client uploaded an IELTS, CELPIP, or Duolingo score, you MUST check "YES" for the English test question.
+    3. NO ROW SKIPPING: When mapping Work, Education, or Travel history to the PDF fields, map them CONTINUOUSLY starting from the very first available row. DO NOT skip any rows or fields. If there is no "Current" job, leave the "Current" row blank and map the most recent past job to the very next row (e.g., Row 2). DO NOT leave empty gaps between entries.
+    4. CURRENT DATE: Today is October 2026. A job ending in "2026-09" or earlier is NOT current.
+    5. LANGUAGE: ALL output values MUST be in ENGLISH (Latin alphabet, numbers). NO KOREAN inside values.
 
     Return ONLY a raw JSON object formatted strictly as:
     {
@@ -180,15 +179,10 @@ def analyze_qa_for_fill(client_files, target_file):
 # 3. PDF 대화형 폼(Widget) 직접 채우기 엔진
 # ==========================================
 def fill_qa_pdf_interactive(target_bytes, qa_data):
-    """
-    도장 찍듯 덮어씌우는 것이 아니라, 원본 PDF의 폼 필드(Widget) 속성에 
-    직접 값을 기입하여 정렬과 폰트 크기를 PDF 고유 서식에 맡기는 완벽한 방식입니다.
-    """
     doc = fitz.open(stream=target_bytes, filetype="pdf")
     pdf_fields = qa_data.get("pdf_fields", {})
     fontfile = "cour.ttf" if os.path.exists("cour.ttf") else None
     
-    # PDF 문서 내의 모든 폼 필드를 순회하며 값 주입
     for page in doc:
         for w in page.widgets():
             fn = w.field_name
@@ -197,19 +191,19 @@ def fill_qa_pdf_interactive(target_bytes, qa_data):
                 if val:
                     ftype = getattr(w, "field_type_string", "").lower()
                     
-                    # 체크박스 처리
+                    # 체크박스/라디오 버튼 처리
                     if "check" in ftype or "radio" in ftype:
                         if str(val).lower() in ['yes', 'true', 'v', 'on', '1', 'checked']:
                             try:
                                 on_states = w.on_state()
                                 if on_states:
-                                    w.field_value = on_states[0]  # PDF에 정의된 '선택' 값 (예: 'Yes')
+                                    w.field_value = on_states[0]
                                 else:
                                     w.field_value = "Yes"
                             except Exception:
                                 w.field_value = True
                     
-                    # 일반 텍스트 필드 처리
+                    # 텍스트 필드 처리
                     else:
                         w.field_value = str(val)
                         if hasattr(w, "field_flags"):
@@ -227,7 +221,7 @@ def fill_qa_pdf_interactive(target_bytes, qa_data):
     return out_buf.getvalue()
 
 # ==========================================
-# 4. Word 질문지 작성 엔진 (.docx)
+# 4. Word 질문지 채우기 엔진 (.docx)
 # ==========================================
 def fill_docx_questionnaire(target_bytes, qa_data):
     doc = docx.Document(io.BytesIO(target_bytes))
@@ -264,9 +258,10 @@ def fill_docx_questionnaire(target_bytes, qa_data):
     return out_buf.getvalue()
 
 # ==========================================
-# 5. 별첨 Word 부속 서류(Additional History) 생성 엔진
+# 5. 별첨 부속 서류(Additional History) 스마트 생성
 # ==========================================
-def create_qa_appendix_docx(qa_data):
+def create_qa_appendix_docx(qa_data, has_edu, has_work, has_travel):
+    """칸을 초과한 섹션(학력/경력/여행)만 선별하여 공식 부속 서류 생성"""
     doc = docx.Document()
     for s in doc.sections:
         s.top_margin = Inches(0.6)
@@ -311,17 +306,19 @@ def create_qa_appendix_docx(qa_data):
                 row[i].text = item.get(key, "")
         doc.add_paragraph().paragraph_format.space_after = Pt(10)
 
-    build_table("1. Full Education History", qa_data.get("full_education_history", []), 
-                ["From", "To", "Field of Study / Degree", "School Name", "City / Country"], 
-                ["from", "to", "field_degree", "school_name", "location"])
-                
-    build_table("2. Full Work / Activity History", qa_data.get("full_work_history", []), 
-                ["From", "To", "Occupation / Title", "Company Name", "City / Country"], 
-                ["from", "to", "job_title", "company_name", "location"])
-                
-    build_table("3. Travel History", qa_data.get("full_travel_history", []), 
-                ["From", "To", "City", "Country", "Purpose"], 
-                ["from", "to", "city", "country", "purpose"])
+    # 초과된 이력만 전체 표로 생성
+    if has_edu:
+        build_table("1. Full Education History", qa_data.get("full_education_history", []), 
+                    ["From", "To", "Field of Study / Degree", "School Name", "City / Country"], 
+                    ["from", "to", "field_degree", "school_name", "location"])
+    if has_work:
+        build_table("2. Full Work / Activity History", qa_data.get("full_work_history", []), 
+                    ["From", "To", "Occupation / Title", "Company Name", "City / Country"], 
+                    ["from", "to", "job_title", "company_name", "location"])
+    if has_travel:
+        build_table("3. Travel History", qa_data.get("full_travel_history", []), 
+                    ["From", "To", "City", "Country", "Purpose"], 
+                    ["from", "to", "city", "country", "purpose"])
 
     out_buf = io.BytesIO()
     doc.save(out_buf)
@@ -329,10 +326,10 @@ def create_qa_appendix_docx(qa_data):
     return out_buf.getvalue()
 
 # ==========================================
-# 6. UI 화면 구성 (단독 5번 도구)
+# 6. UI 화면 구성 (5번 단독 도구)
 # ==========================================
 st.title("📝 질문지 자동 이어채우기")
-st.caption("기존 손님 서류들과 새 빈 질문지를 올리시면, 알고 있는 정보를 빈칸에 맞게 정확히 기입해 드립니다.")
+st.caption("손님의 기존 서류와 새 빈 질문지를 올리시면, 알려진 정보를 폼 필드 칸에 정렬하여 완벽하게 채워 드립니다.")
 
 if "qa_result_files" not in st.session_state:
     st.session_state.qa_result_files = None
@@ -359,13 +356,13 @@ st.markdown("---")
 col_action, col_reset = st.columns([8, 2])
 
 with col_action:
-    if st.button("질문지 자동 완성하기", type="primary", use_container_width=True):
+    if st.button("✨ 질문지 자동 완성하기", type="primary", use_container_width=True):
         if not source_files:
             st.warning("1단계: 손님의 기존 서류를 최소 1개 이상 업로드해 주세요.")
         elif not new_q_file:
             st.warning("2단계: 새로 채워야 할 질문지 파일을 업로드해 주세요.")
         else:
-            with st.spinner("원본 서식 필드(Widget)를 스캔하고 정확한 위치에 답변을 채우는 중입니다..."):
+            with st.spinner("원본 폼 필드를 분석하여 빈틈없이 작성 중입니다. 잠시만 기다려 주세요..."):
                 qa_data = analyze_qa_for_fill(source_files, new_q_file)
                 
                 if qa_data:
@@ -382,21 +379,21 @@ with col_action:
                         q_filename = f"{base_name}_완성본.pdf"
                         q_mime = "application/pdf"
 
-                    # 💡 PDF 폼 필드 칸 수(보통 2~3개)를 초과하는 히스토리가 있을 때만 별첨 생성 판단
-                    # 대부분의 질문지 양식에는 학력 2개, 경력 2개가 들어갑니다.
-                    edu_count = len(qa_data.get("full_education_history", []))
-                    work_count = len(qa_data.get("full_work_history", []))
-                    travel_count = len(qa_data.get("full_travel_history", []))
+                    # 💡 칸이 초과된 섹션만 독립적으로 파악
+                    # 보통 학력 2칸, 직장 2칸, 여행 3칸 제공됨
+                    has_edu = len(qa_data.get("full_education_history", [])) > 2
+                    has_work = len(qa_data.get("full_work_history", [])) > 2
+                    has_travel = len(qa_data.get("full_travel_history", [])) > 3
                     
-                    has_extra = edu_count > 2 or work_count > 2 or travel_count > 3
+                    has_extra = has_edu or has_work or has_travel
                     
                     appendix_bytes = None
                     appendix_filename = ""
                     if has_extra:
-                        appendix_bytes = create_qa_appendix_docx(qa_data)
+                        appendix_bytes = create_qa_appendix_docx(qa_data, has_edu, has_work, has_travel)
                         appendix_filename = f"{app_info}_Additional_History.docx"
                     
-                    # 💡 다운로드 버튼을 눌러도 사라지지 않도록 Session State에 데이터 보존
+                    # 결과를 Session State에 안전하게 저장하여 버튼 증발 방지
                     st.session_state.qa_result_files = {
                         "q_filename": q_filename,
                         "q_bytes": filled_bytes,
@@ -411,7 +408,7 @@ with col_reset:
         st.session_state.qa_result_files = None
         st.rerun()
 
-# 💡 Session State에 저장된 파일이 있으면 다운로드 버튼을 렌더링
+# 💡 다운로드 버튼 렌더링 (State 유지)
 if st.session_state.qa_result_files:
     res = st.session_state.qa_result_files
     st.success("✅ 질문지 작성이 완벽하게 완료되었습니다! 아래 버튼을 클릭하세요.")
@@ -419,7 +416,7 @@ if st.session_state.qa_result_files:
     dl_c1, dl_c2 = st.columns(2)
     with dl_c1:
         st.download_button(
-            label=f"📥 1. 완성된 질문지 내려받기 (.pdf/.docx)",
+            label=f"📥 1. 완성된 질문지 내려받기",
             data=res["q_bytes"],
             file_name=res["q_filename"],
             mime=res["q_mime"],
@@ -430,7 +427,7 @@ if st.session_state.qa_result_files:
     with dl_c2:
         if res["has_extra"]:
             st.download_button(
-                label=f"📄 2. [별첨] 추가 학력·경력 내역서 내려받기 (.docx)",
+                label=f"📄 2. [별첨] 칸을 초과한 전체 내역서 내려받기",
                 data=res["app_bytes"],
                 file_name=res["app_filename"],
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -438,4 +435,4 @@ if st.session_state.qa_result_files:
                 use_container_width=True
             )
         else:
-            st.info("💡 학력/경력이 질문지 칸 내에 모두 들어가서 별첨 서류는 생성되지 않았습니다.")
+            st.info("💡 모든 정보가 질문지 칸 내에 전부 들어가서 별첨 서류는 생성되지 않았습니다.")
