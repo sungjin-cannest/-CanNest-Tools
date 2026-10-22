@@ -653,9 +653,11 @@ def prepare_document_for_gemini(file_bytes, mime_type, file_name="", max_chars=3
 
     return [], f"{file_name}: 지원하지 않는 형식입니다."
 
-def batch_process_client_files(files):
+def batch_process_client_files(files, owner=None):
+    """owner: 'MAIN APPLICANT' 또는 'FAMILY MEMBER' — 업로드 칸 기준으로 서류 주인을 표시."""
     def worker(f):
-        return prepare_document_for_gemini(f.getvalue(), f.type, f.name)
+        label = f"{owner} | {f.name}" if owner else f.name
+        return prepare_document_for_gemini(f.getvalue(), f.type, label)
     with ThreadPoolExecutor(max_workers=4) as executor:
         results = list(executor.map(worker, files))
     flat, warnings = [], []
@@ -683,34 +685,45 @@ QA_RULES = """
 11. CONFLICTS: If documents disagree, prefer passport > permit/official letters > previous questionnaire > resume.
 """
 
-def build_people_rules(main_applicant, spouse_name):
-    """주 신청자/배우자 구분 규칙. 여권이 2개 이상이면 누가 주 신청자인지 AI가 알 수 없으므로 직원이 지정."""
-    ma = main_applicant.strip() or "NOT SPECIFIED - infer from previous questionnaires / job offer / LMIA; if still unclear, fill ONLY sections that do not depend on who the main applicant is"
-    sp = spouse_name.strip() or "the main applicant's spouse/common-law partner, if any"
-    return f"""
+PEOPLE_RULES = """
 [WHO IS WHO - VERY IMPORTANT]
-- MAIN APPLICANT (주 신청자): {ma}
-- SPOUSE (배우자): {sp}
-- The client materials may contain documents of several family members (e.g. two passports). Identify each document's owner by the NAME on it.
+- Each client document header says whose document it is:
+  * "[Document: MAIN APPLICANT | ...]" = a document of the MAIN APPLICANT (주 신청자).
+  * "[Document: FAMILY MEMBER | ...]" = a document of a family member (spouse, common-law partner, or child).
+- For each FAMILY MEMBER document, decide who that person is relative to the main applicant, using the documents themselves
+  (marriage certificate, family relation certificate, birth date/age, previous questionnaire, names) and the questionnaire:
+  * married spouse or common-law partner → SPOUSE sections (choose 기혼/married vs 사실혼/common-law from the evidence)
+  * child → CHILD sections, oldest child = CHILD 1
+- A FAMILY MEMBER document may be that person's OWN previous questionnaire. In it, the '신청자/Applicant' sections describe
+  THAT FAMILY MEMBER (not our main applicant). Use it as that person's own data, and use its spouse/family sections to work out
+  the relationship (e.g. if it lists our main applicant as its spouse → this person is the SPOUSE; if it lists our main applicant
+  as a parent → this person is a CHILD).
+- A MAIN APPLICANT document may still mention family members (e.g. spouse name in a previous questionnaire) — use that for the
+  main applicant's spouse/family questions, but the main applicant's OWN data always comes from MAIN APPLICANT documents.
 - Every field has a PERSON tag (MAIN APPLICANT / SPOUSE / CHILD n) and a SECTION tag. Fill each field ONLY with the data of that PERSON:
   * Sections titled '신청자 ...' / 'Applicant ...' (or unprefixed sections) = MAIN APPLICANT's own data.
   * Sections titled '배우자 ...' / 'Spouse ...' = SPOUSE's own data (spouse's address, education, work, travel, etc.).
-  * Sections titled '자녀(1)' / '자녀(2)' / 'Child' = that child's data, ordered oldest first.
-- Inside the MAIN APPLICANT's personal section, the questions "배우자 이름 / Spouse name / 배우자 생년월일" are about the SPOUSE (the main applicant's partner).
-  Inside the SPOUSE's personal section, the same questions are about the MAIN APPLICANT (the spouse's partner).
+  * Sections titled '자녀(1)' / '자녀(2)' / 'Child' = that child's data.
+- Inside the MAIN APPLICANT's personal section, the questions "배우자 이름 / Spouse name / 배우자 생년월일" are about the SPOUSE.
+  Inside the SPOUSE's personal section, the same questions are about the MAIN APPLICANT.
 - '신청자 가족관계 정보' (applicant family table) = the MAIN APPLICANT's parents, spouse, children, siblings.
   '배우자 가족관계 정보' (spouse family table) = the SPOUSE's parents, siblings, and also the MAIN APPLICANT as 'Spouse' and their children.
 - NEVER copy one person's data (address history, schools, jobs, travel, birth place, height, eye colour) into another person's section.
+- If there are NO family member documents, fill only the main applicant's sections (plus spouse/child names and dates if the main applicant's documents state them).
 """
 
-def analyze_qa_for_fill(client_files, target_file, main_applicant="", spouse_name=""):
+def analyze_qa_for_fill(main_files, family_files, target_file):
     """반환: (result_dict | None, warnings, context)"""
     today = datetime.datetime.now(LOCAL_TZ).strftime("%B %d, %Y")
-    people_rules = build_people_rules(main_applicant, spouse_name)
+    people_rules = PEOPLE_RULES
     target_bytes = target_file.getvalue()
     is_docx = target_file.name.lower().endswith(".docx")
 
-    source_parts, warnings = batch_process_client_files(client_files)
+    source_parts, warnings = batch_process_client_files(main_files or [], "MAIN APPLICANT")
+    if family_files:
+        fam_parts, fam_warn = batch_process_client_files(family_files, "FAMILY MEMBER")
+        source_parts += fam_parts
+        warnings += fam_warn
     if not source_parts:
         st.error("읽을 수 있는 손님 자료가 없습니다.")
         return None, warnings, None
@@ -1052,39 +1065,36 @@ elif app_mode == MENU_5:
     for k in ("qa_rows", "qa_ctx", "qa_sig", "qa_warnings", "qa_base"):
         st.session_state.setdefault(k, None)
 
+    UPLOAD_TYPES = ['pdf', 'docx', 'jpg', 'jpeg', 'png', 'heic', 'heif', 'webp']
     c1, c2 = st.columns(2)
     with c1:
-        st.subheader("1. 손님의 기존 자료들")
-        source_files = st.file_uploader(
-            "이전 질문지, 여권, 퍼밋, 이력서 등 (복수 선택)",
-            type=['pdf', 'docx', 'jpg', 'jpeg', 'png', 'heic', 'heif', 'webp'],
+        st.subheader("1. 주 신청자 서류")
+        main_files = st.file_uploader(
+            "주 신청자의 이전 질문지, 여권, 퍼밋, 이력서 등 (복수 선택)",
+            type=UPLOAD_TYPES,
             accept_multiple_files=True,
-            key=f"qa_sources_{st.session_state.menu5_uploader_key}"
+            key=f"qa_main_files_{st.session_state.menu5_uploader_key}"
         )
-        st.caption("※ 구형 .doc 파일은 Word에서 .docx 또는 PDF로 저장 후 올려주세요.")
     with c2:
-        st.subheader("2. 새로 채울 빈 질문지")
-        new_q_file = st.file_uploader(
-            "채워 넣을 대상 질문지 1부 (입력 칸이 있는 .pdf 또는 .docx)",
-            type=['pdf', 'docx'],
-            key=f"qa_target_{st.session_state.menu5_uploader_key}"
+        st.subheader("2. 가족 서류 (해당 시)")
+        family_files = st.file_uploader(
+            "배우자·사실혼 파트너·자녀의 이전 질문지, 여권, 퍼밋, 혼인/가족관계증명서 등",
+            type=UPLOAD_TYPES,
+            accept_multiple_files=True,
+            key=f"qa_family_files_{st.session_state.menu5_uploader_key}",
+            help="배우자인지, 사실혼 파트너인지, 자녀인지는 서류와 질문지 내용을 보고 자동으로 구분합니다."
         )
+    st.caption("※ 구형 .doc 파일은 Word에서 .docx 또는 PDF로 저장 후 올려주세요.")
 
-    st.subheader("3. 누구의 질문지인가요?")
-    p1, p2 = st.columns(2)
-    with p1:
-        main_applicant = st.text_input(
-            "주 신청자 이름 (여권 영문 이름)", placeholder="예: KIM JIYOUNG",
-            key=f"qa_main_{st.session_state.menu5_uploader_key}",
-            help="가족 서류를 함께 올릴 때 필수입니다. 이 사람의 정보가 '신청자' 칸에 들어갑니다.")
-    with p2:
-        spouse_name = st.text_input(
-            "배우자 이름 (해당 시)", placeholder="예: LEE MINHO",
-            key=f"qa_spouse_{st.session_state.menu5_uploader_key}",
-            help="이 사람의 정보가 '배우자' 칸에 들어갑니다.")
+    st.subheader("3. 새로 채울 빈 질문지")
+    new_q_file = st.file_uploader(
+        "채워 넣을 대상 질문지 1부 (입력 칸이 있는 .pdf 또는 .docx)",
+        type=['pdf', 'docx'],
+        key=f"qa_target_{st.session_state.menu5_uploader_key}"
+    )
 
     # [수정] 파일을 바꾸면 이전 손님의 결과가 남아 잘못 다운로드되는 문제 방지
-    current_sig = files_signature(list(source_files or []) + [new_q_file]) + main_applicant.strip().lower() + "|" + spouse_name.strip().lower()
+    current_sig = "|".join([files_signature(main_files or []), files_signature(family_files or []), files_signature([new_q_file])])
     if st.session_state.qa_sig and st.session_state.qa_sig != current_sig:
         st.session_state.qa_rows = None
         st.session_state.qa_ctx = None
@@ -1096,19 +1106,15 @@ elif app_mode == MENU_5:
 
     with col_action:
         if st.button("✨ 질문지 정보 기입 시작", type="primary", use_container_width=True):
-            if not source_files:
-                st.warning("1단계: 손님의 기존 서류를 최소 1개 이상 업로드해 주세요.")
+            if not main_files:
+                st.warning("1단계: 주 신청자의 서류를 최소 1개 이상 업로드해 주세요.")
             elif not new_q_file:
-                st.warning("2단계: 새로 채워야 할 질문지 파일을 업로드해 주세요.")
-            elif len(source_files) > 1 and not main_applicant.strip() and not st.session_state.get("qa_skip_name_check"):
-                st.warning("여러 서류를 올리셨습니다. 가족 서류가 섞여 있다면 '주 신청자 이름'을 입력해 주세요. "
-                           "(본인 서류만 있다면 버튼을 한 번 더 누르면 그대로 진행합니다)")
-                st.session_state.qa_skip_name_check = True
+                st.warning("3단계: 새로 채워야 할 질문지 파일을 업로드해 주세요.")
             elif new_q_file.name.lower().endswith(".docx") and not DOCX_AVAILABLE:
                 st.error("서버에 python-docx가 설치되어 있지 않습니다. requirements.txt에 python-docx를 추가해 주세요.")
             else:
                 with st.spinner("원본 폼 필드를 분석하여 작성 중입니다. 잠시만 기다려 주세요..."):
-                    data, warns, ctx = analyze_qa_for_fill(source_files, new_q_file, main_applicant, spouse_name)
+                    data, warns, ctx = analyze_qa_for_fill(main_files, family_files, new_q_file)
                     st.session_state.qa_warnings = warns
                     if data and ctx:
                         st.session_state.qa_rows = build_review_rows(data, ctx)
@@ -1118,7 +1124,7 @@ elif app_mode == MENU_5:
 
     with col_reset:
         if st.button("🔄 전체 리셋", use_container_width=True):
-            for k in ("qa_rows", "qa_ctx", "qa_sig", "qa_warnings", "qa_base", "qa_skip_name_check"):
+            for k in ("qa_rows", "qa_ctx", "qa_sig", "qa_warnings", "qa_base"):
                 st.session_state[k] = None
             st.session_state.menu5_uploader_key = str(uuid.uuid4())
             st.rerun()
