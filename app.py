@@ -161,6 +161,13 @@ def safe_generate_content(contents, json_mode=False):
             except Exception as e:
                 last_error = e
                 msg = str(e).lower()
+                if any(k in msg for k in ("credits are depleted", "prepayment", "billing", "api key not valid",
+                                          "api_key_invalid", "permission denied", "quota exceeded for quota metric")):
+                    # 결제/키 문제는 재시도해도 소용없음 → 바로 안내
+                    raise RuntimeError(
+                        "Gemini API 결제 또는 API 키 문제로 분석할 수 없습니다. "
+                        "AI Studio(https://ai.studio/projects)에서 크레딧 잔액·결제 설정·API 키를 확인해 주세요. "
+                        f"(원본 오류: {e})") from e
                 if _is_model_gone(msg):
                     break  # 다음 모델로
                 if any(k in msg for k in ["429", "500", "503", "unavailable", "overloaded", "deadline", "resource exhausted"]):
