@@ -71,6 +71,33 @@ genai.configure(api_key=GEMINI_API_KEY)
 # [수정] gemini-1.5-flash는 서비스 종료됨 → 현재 운영 중인 모델로 폴백 체인 교체
 CANDIDATE_MODELS = ['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-2.5-flash']
 
+def clean_text(s):
+    """
+    [수정] PDF/Word에서 읽은 글자 중 깨진 특수문자(쪼개진 이모지 등 'surrogate')를 정리.
+    이게 남아 있으면 Gemini 전송 시 "'utf-8' codec can't encode ... surrogates not allowed" 오류가 납니다.
+    - 짝이 맞는 조각은 원래 글자로 복원, 짝 없는 조각은 제거
+    """
+    if not isinstance(s, str):
+        return s
+    try:
+        s.encode("utf-8")
+        return s  # 문제 없으면 그대로
+    except UnicodeEncodeError:
+        pass
+    fixed = s.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+    return fixed.replace("\ufffd", "")
+
+def _clean_contents(contents):
+    out = []
+    for c in contents:
+        if isinstance(c, str):
+            out.append(clean_text(c))
+        elif isinstance(c, dict) and isinstance(c.get("data"), str):
+            out.append({**c, "data": clean_text(c["data"])})
+        else:
+            out.append(c)
+    return out
+
 def safe_generate_content(contents, json_mode=False):
     """모델 폴백 + 일시적 오류(429/500/503) 재시도."""
     gen_config = {"temperature": 0}
@@ -82,7 +109,7 @@ def safe_generate_content(contents, json_mode=False):
         mod = genai.GenerativeModel(model_name, generation_config=gen_config)
         for attempt in range(3):
             try:
-                return mod.generate_content(contents)
+                return mod.generate_content(_clean_contents(contents))
             except Exception as e:
                 last_error = e
                 msg = str(e).lower()
@@ -128,7 +155,7 @@ def read_word_document_text(file_bytes, file_name=""):
                         cells.append(cell.text.strip())
                 if cells:
                     text_list.append(" | ".join(cells))
-        return "\n".join(text_list)
+        return clean_text("\n".join(text_list))
     except Exception:
         return ""
 
@@ -325,21 +352,21 @@ def extract_pdf_form_fields(pdf_bytes):
             r = w.rect
             clip = fitz.Rect(max(0, r.x0 - 120), max(0, r.y0 - 20),
                              min(page.rect.width, r.x1 + 60), min(page.rect.height, r.y1 + 20))
-            nearby = " ".join(page.get_text("text", clip=clip).split())[:160]
+            nearby = clean_text(" ".join(page.get_text("text", clip=clip).split())[:160])
             if w.field_type in BUTTON_TYPES:
                 # 버튼 바로 오른쪽/왼쪽 글자 = 해당 선택지 이름 (Yes/No 구분용)
-                right = " ".join(page.get_text("text", clip=fitz.Rect(r.x1, r.y0 - 2, r.x1 + 45, r.y1 + 2)).split())
-                left = " ".join(page.get_text("text", clip=fitz.Rect(max(0, r.x0 - 30), r.y0 - 2, r.x0, r.y1 + 2)).split())
+                right = clean_text(" ".join(page.get_text("text", clip=fitz.Rect(r.x1, r.y0 - 2, r.x1 + 45, r.y1 + 2)).split()))
+                left = clean_text(" ".join(page.get_text("text", clip=fitz.Rect(max(0, r.x0 - 30), r.y0 - 2, r.x0, r.y1 + 2)).split()))
                 right_word = right.split()[0] if right.split() else ""
                 left_word = left.split()[-1] if left.split() else ""
                 nearby = f"{nearby} || THIS OPTION'S LABEL (text right after the box): {right_word or '?'} (text right before: {left_word or '?'})"
             info = {
                 "name": w.field_name or "",
-                "label": (w.field_label or "").strip(),
+                "label": clean_text((w.field_label or "").strip()),
                 "type": w.field_type,
                 "type_str": w.field_type_string,
                 "on_state": _safe_on_state(w) if w.field_type in BUTTON_TYPES else None,
-                "choices": [c if isinstance(c, str) else c[-1] for c in (w.choice_values or [])] if w.field_type in CHOICE_TYPES else [],
+                "choices": [clean_text(c if isinstance(c, str) else c[-1]) for c in (w.choice_values or [])] if w.field_type in CHOICE_TYPES else [],
                 "nearby": nearby,
                 "section": section_for(headers, p_idx, r.y0),
                 "person": person_for_section(section_for(headers, p_idx, r.y0)),
@@ -356,11 +383,12 @@ def extract_pdf_form_fields(pdf_bytes):
     fields, used = [], set()
     btn_index = {}
     for f in raw:
-        key = f["name"]
+        # 칸 이름에 깨진 글자가 있어도 AI가 돌려준 키와 맞도록 정리된 이름을 키로 사용 (채우기는 xref로 함)
+        key = clean_text(f["name"])
         if f["type"] in BUTTON_TYPES and name_counts.get(f["name"], 0) > 1:
             btn_index[f["name"]] = btn_index.get(f["name"], 0) + 1
-            suffix = f["on_state"] or f"#{btn_index[f['name']]}"
-            key = f"{f['name']} [{suffix}]"
+            suffix = clean_text(f["on_state"] or f"#{btn_index[f['name']]}")
+            key = f"{key} [{suffix}]"
         if f["type"] not in BUTTON_TYPES and key in used:
             # 같은 이름의 텍스트 필드는 값이 공유되므로 한 번만 노출
             f["key"] = key
@@ -461,8 +489,8 @@ def detect_tables(pdf_bytes, fields):
             x_end = col_xs[ci + 1] if ci + 1 < len(col_xs) else page.rect.width
             words = [w for w in page.get_text("words", clip=fitz.Rect(cx - 2, max(0, top - 34), x_end - 1, top - 1))]
             name = " ".join(w[4] for w in sorted(words, key=lambda w: (round(w[1]), w[0])))
-            col_names.append(name.strip() or f"Column {ci + 1}")
-        title_txt = " ".join(page.get_text("text", clip=fitz.Rect(0, max(0, top - 110), page.rect.width, top - 34)).split())
+            col_names.append(clean_text(name.strip()) or f"Column {ci + 1}")
+        title_txt = clean_text(" ".join(page.get_text("text", clip=fitz.Rect(0, max(0, top - 110), page.rect.width, top - 34)).split()))
         # 행 구성 + Current 행 찾기
         t_rows, current_idx = [], None
         for ri, r in enumerate(g):
