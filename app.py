@@ -33,6 +33,13 @@ pillow_heif.register_heif_opener()
 Image.MAX_IMAGE_PIXELS = None
 
 LOCAL_TZ = ZoneInfo("America/Vancouver")
+
+# Streamlit 버전에 따라 '가로 꽉 채우기' 옵션 이름이 다름 (신버전: width="stretch")
+import inspect as _inspect
+try:
+    _WIDE = {"width": "stretch"} if "width" in _inspect.signature(st.download_button).parameters else {"use_container_width": True}
+except Exception:
+    _WIDE = {"use_container_width": True}
 HANGUL_RE = re.compile(r"[ㄱ-ㆎ가-힣]")
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.heic', '.heif', '.webp')
 
@@ -334,6 +341,56 @@ def section_for(headers, page_idx, y):
             break
     return current
 
+# ------------------------------------------
+# 1-1a. '현재 정보' 칸 (손님이 직접 최신으로 작성) → 항상 비워둠
+# ------------------------------------------
+CURRENT_ADDRESS_RE = re.compile(
+    r"현재\s*거주지|current\s+(residential\s+|home\s+)?address|residential\s+address|present\s+address",
+    re.IGNORECASE)
+RECENT_ENTRY_PHRASES = ["가장 최근 입국", "최근 입국", "most recent entry", "last entry", "latest entry", "most recent arrival"]
+FIRST_ENTRY_PHRASES = ["최초 입국", "처음 입국", "first entry", "original entry", "first arrival"]
+
+def mark_always_blank(doc, fields):
+    """
+    현재 거주지 주소, 캐나다 가장 최근 입국 정보 칸에 always_blank 표시.
+    - 주소: 칸 왼쪽 라벨/툴팁이 '현재 거주지 주소' 등인 칸 (가족표의 '현재 주소'는 제외)
+    - 최근 입국: 칸 위쪽 100pt 안의 제목 중 가로로 가장 가까운 것이 '최근 입국'인 칸
+    """
+    phrase_cache = {}
+    def phrases_on(p_idx):
+        if p_idx not in phrase_cache:
+            page = doc[p_idx]
+            found = []
+            for kind, plist in (("recent", RECENT_ENTRY_PHRASES), ("first", FIRST_ENTRY_PHRASES)):
+                seen_rects = []
+                for ph in plist:
+                    for r in page.search_for(ph):
+                        if any(r.intersects(x) for x in seen_rects):
+                            continue  # '가장 최근 입국' 안의 '최근 입국' 중복 방지
+                        seen_rects.append(r)
+                        found.append((kind, r))
+            phrase_cache[p_idx] = found
+        return phrase_cache[p_idx]
+
+    for f in fields:
+        if f["type"] != fitz.PDF_WIDGET_TYPE_TEXT:
+            continue
+        page = doc[f["page"]]
+        x0, y0, x1, y1 = f["rect"]
+        left = " ".join(page.get_text("text", clip=fitz.Rect(max(0, x0 - 220), y0 - 1, x0, y1 + 1)).split())
+        if CURRENT_ADDRESS_RE.search(left) or CURRENT_ADDRESS_RE.search(f.get("label") or ""):
+            f["always_blank"] = "현재 거주지 주소"
+            continue
+        cx = (x0 + x1) / 2
+        above = [(kind, r) for kind, r in phrases_on(f["page"]) if r.y0 <= y0 + 2 and y0 - r.y1 < 100]  # 위쪽 또는 같은 높이 라벨
+        if not above:
+            continue
+        # 바로 위 제목 줄을 먼저 고르고, 그 줄 안에서 가로로 가장 가까운 제목을 선택
+        closest_y = max(r.y1 for _, r in above)
+        same_row = [(abs(cx - (r.x0 + r.x1) / 2), kind) for kind, r in above if closest_y - r.y1 <= 6]
+        if min(same_row)[1] == "recent":
+            f["always_blank"] = "가장 최근 입국 정보"
+
 def extract_pdf_form_fields(pdf_bytes):
     """
     [핵심 수정] 같은 이름을 공유하는 라디오/체크박스(예: Yes·No 한 그룹)는
@@ -403,6 +460,8 @@ def extract_pdf_form_fields(pdf_bytes):
         f["key"] = key
         f["duplicate"] = False
         fields.append(f)
+
+    mark_always_blank(doc, fields)
 
     xfa = False
     try:
@@ -542,8 +601,9 @@ def _is_present(v):
 def place_table_records(tables, ai_tables):
     """
     AI가 준 표 데이터(최근→과거 순 레코드 목록)를 실제 칸에 배치.
-    - 'Current' 행이 있는 표: 현재 레코드 → Current 행, 나머지 → 그 다음 행부터.
-      현재 레코드가 없으면 Current 행은 비우고 다음 행부터 작성.
+    - 'Current' 행이 있는 표: Current 행은 항상 비워둠 (손님이 최신 정보로 직접 작성).
+      이전 자료에서 '~ Current/Present'였던 레코드는 Current 바로 아래 행에 넣고 To 칸은 비움.
+    - Current 행이 없는 표도 진행 중 레코드의 To 칸은 비움.
     - 중복 레코드 제거, 칸 수를 넘으면 넘친 개수 보고.
     반환: ({key: value}, {key: "표 설명"}, [경고])
     """
@@ -575,18 +635,16 @@ def place_table_records(tables, ai_tables):
         n_rows = len(t["rows"])
         ci_row = t["current_row"]
         order = []  # (row_index, vals)
-        if ci_row is not None:
-            currents = [v for c, v in clean if c]
-            others = [v for c, v in clean if not c]
-            nxt = ci_row + 1
-            if currents:
-                order.append((ci_row, currents[0]))
-                for v in currents[1:]:          # 현재 직장이 2개 이상이면 다음 행에 이어서
-                    order.append((nxt, v)); nxt += 1
-            for v in others:
-                order.append((nxt, v)); nxt += 1
-        else:
-            order = list(enumerate(v for _, v in clean))
+        # 진행 중 레코드는 To 칸 비우기 ('Present', 'Current' 등 제거)
+        prepared = []
+        for is_cur, vals in clean:
+            if t["to_col"] is not None and (is_cur or _is_present(vals.get(t["to_col"]))):
+                vals = {ci: v for ci, v in vals.items() if ci != t["to_col"]}
+            prepared.append((is_cur, vals))
+        # 진행 중이던 레코드가 맨 위 (최근 순)
+        prepared.sort(key=lambda x: not x[0])
+        start = (ci_row + 1) if ci_row is not None else 0
+        order = [(start + i, v) for i, (_, v) in enumerate(prepared)]
 
         overflow = 0
         for ri, vals in order:
@@ -599,10 +657,8 @@ def place_table_records(tables, ai_tables):
                 if key is None:
                     # Current 행의 'To' 칸처럼 칸 자체가 없는 경우 (인쇄된 Current) → 건너뜀
                     continue
-                if ri == ci_row and ci == t["to_col"] and _is_present(v):
-                    v = "Present"
                 values[key] = v
-                labels[key] = f"[{t['id']}] {ri + 1}행 · {t['columns'][ci][:20]}" + (" (Current 행)" if ri == ci_row else "")
+                labels[key] = f"[{t['id']}] {ri + 1}행 · {t['columns'][ci][:20]}"
         if overflow:
             warns.append(f"표 {t['id']} ({t['title'][-30:]}): 칸이 부족해 {overflow}개 항목을 넣지 못했습니다. 별도 Word 파일로 정리해 주세요.")
     return values, labels, warns
@@ -610,7 +666,7 @@ def place_table_records(tables, ai_tables):
 def format_field_catalog(fields):
     lines = []
     for f in fields:
-        if f["duplicate"] or f.get("table"):
+        if f["duplicate"] or f.get("table") or f.get("always_blank"):
             continue
         kind = {fitz.PDF_WIDGET_TYPE_CHECKBOX: "CHECKBOX",
                 fitz.PDF_WIDGET_TYPE_RADIOBUTTON: "RADIO"}.get(f["type"], f["type_str"].upper())
@@ -798,12 +854,13 @@ HOW TO FILL:
 - TEXT / COMBOBOX: value is the answer text. For a COMBOBOX use one of its ALLOWED VALUES.
 - CHECKBOX / RADIO: to select an option, set that option's KEY to "Yes". For a Yes/No question, select ONLY the one correct option key (e.g. "Q3 [Yes]": "Yes"). Never set "No" or "Off" — simply omit options that should not be selected.
 - Use PAGE and NEARBY TEXT to understand which question each field belongs to.
+- Current residential address and the most recent entry to Canada are intentionally NOT listed — the client fills them in. Do not try to fill them.
 TABLES (work history, education, addresses, travel, relatives, etc.):
 - Do NOT fill table cells by key. Instead return the table's records under "tables" -> table id, as a list of objects using the column ids ("c1", "c2", ...).
 - List records MOST RECENT FIRST, each real record ONLY ONCE (never repeat the same job/school/address).
-- Add "is_current": true for a record that is ongoing today (still working there / still living there / still studying). For those, put "Present" in the To column.
+- Add "is_current": true for a record that was ongoing in the latest client document (e.g. "2020-04 ~ Present/Current" in a previous questionnaire). Leave its To column empty.
 - Do NOT leave empty records to skip rows — the program places records into the right rows automatically
-  (a current record goes to the pre-printed 'Current' row; if there is no current record, that row stays blank and past records start on the next row).
+  (the pre-printed 'Current' row is always left blank for the client to update; all records start on the row below it).
 - Fill each table with the data of that table's PERSON only.
 OUTPUT: Return ONLY a JSON object:
 {{"pdf_fields": {{"<KEY>": "<value>"}},
@@ -840,7 +897,7 @@ def build_review_rows(data, context):
         t_values, t_labels, t_warns = place_table_records(context.get("tables", []), data.get("tables"))
         context["table_warnings"] = t_warns
         plain = {k: v for k, v in (data.get("pdf_fields") or {}).items()
-                 if not (by_key.get(k) or {}).get("table")}  # 표 칸은 표 로직 결과만 사용
+                 if not (by_key.get(k) or {}).get("table") and not (by_key.get(k) or {}).get("always_blank")}  # 표 칸은 표 로직 결과만 사용
         merged = list(t_values.items()) + list(plain.items())
         for k, v in merged:
             if v is None or str(v).strip() == "":
@@ -902,16 +959,40 @@ def _fit_multiline(text, width, height, max_size=9.0, min_size=5.0):
         size -= 0.5
     return None
 
+def ensure_acroform_font(doc, alias="Cour", base_font="Courier"):
+    """
+    [수정] 질문지 PDF의 폼 글꼴 목록(DR)에 Courier가 없으면, Adobe가 칸을 다시 그릴 때 글자 크기를 무시하고
+    크게 표시해서 'COMMUNITY MANAGE…'처럼 칸을 넘쳤음 → Courier를 폼 글꼴 목록에 등록.
+    """
+    try:
+        cat = doc.pdf_catalog()
+        af = doc.xref_get_key(cat, "AcroForm")
+        if af[0] != "xref":
+            return
+        af_xref = int(af[1].split()[0])
+        if doc.xref_get_key(af_xref, f"DR/Font/{alias}")[0] != "null":
+            return
+        fx = doc.get_new_xref()
+        doc.update_object(fx, f"<< /Type /Font /Subtype /Type1 /BaseFont /{base_font} /Encoding /WinAnsiEncoding >>")
+        if doc.xref_get_key(af_xref, "DR")[0] == "null":
+            doc.xref_set_key(af_xref, "DR", "<< /Font << >> >>")
+        elif doc.xref_get_key(af_xref, "DR/Font")[0] == "null":
+            doc.xref_set_key(af_xref, "DR/Font", "<< >>")
+        doc.xref_set_key(af_xref, f"DR/Font/{alias}", f"{fx} 0 R")
+    except Exception:
+        pass
+
 def fill_qa_pdf_interactive(target_bytes, values_by_key, fields):
     """values_by_key: {key: value}. 필드 키 → xref로 정확히 해당 위젯만 채움."""
     doc = fitz.open(stream=target_bytes, filetype="pdf")
+    ensure_acroform_font(doc)
     # 같은 이름 텍스트 필드(중복)도 함께 채우기 위해 이름 → 대표 키 매핑
     key_by_name = {f["name"]: f["key"] for f in fields if not f["duplicate"] and f["type"] not in BUTTON_TYPES}
     filled, skipped = 0, []
 
     for f in fields:
         key = key_by_name.get(f["name"], f["key"]) if f["duplicate"] else f["key"]
-        if key not in values_by_key:
+        if key not in values_by_key or f.get("always_blank"):
             continue
         val = str(values_by_key[key]).strip()
         if not val:
@@ -957,7 +1038,7 @@ def fill_qa_pdf_interactive(target_bytes, values_by_key, fields):
         except Exception:
             skipped.append(key)
 
-    doc.need_appearances(True)
+    doc.need_appearances(False)  # 우리가 만든 모양(글자 크기·줄바꿈) 그대로 표시
     out_buf = io.BytesIO()
     doc.save(out_buf, garbage=1, deflate=True)
     doc.close()
@@ -1130,32 +1211,32 @@ elif app_mode == MENU_5:
         st.session_state.qa_sig = None
 
     st.markdown("---")
-    col_action, col_reset = st.columns([8, 2])
 
-    with col_action:
-        if st.button("✨ 질문지 정보 기입 시작", type="primary", use_container_width=True):
-            if not main_files:
-                st.warning("1단계: 주 신청자의 서류를 최소 1개 이상 업로드해 주세요.")
-            elif not new_q_file:
-                st.warning("3단계: 새로 채워야 할 질문지 파일을 업로드해 주세요.")
-            elif new_q_file.name.lower().endswith(".docx") and not DOCX_AVAILABLE:
-                st.error("서버에 python-docx가 설치되어 있지 않습니다. requirements.txt에 python-docx를 추가해 주세요.")
-            else:
-                with st.spinner("원본 폼 필드를 분석하여 작성 중입니다. 잠시만 기다려 주세요..."):
-                    data, warns, ctx = analyze_qa_for_fill(main_files, family_files, new_q_file)
-                    st.session_state.qa_warnings = warns
-                    if data and ctx:
-                        st.session_state.qa_rows = build_review_rows(data, ctx)
-                        st.session_state.qa_ctx = ctx
-                        st.session_state.qa_sig = current_sig
-                        st.session_state.qa_base = os.path.splitext(new_q_file.name)[0]
+    def reset_menu5():
+        for k in ("qa_rows", "qa_ctx", "qa_sig", "qa_warnings", "qa_base"):
+            st.session_state[k] = None
+        st.session_state.menu5_uploader_key = str(uuid.uuid4())
 
-    with col_reset:
-        if st.button("🔄 전체 리셋", use_container_width=True):
-            for k in ("qa_rows", "qa_ctx", "qa_sig", "qa_warnings", "qa_base"):
-                st.session_state[k] = None
-            st.session_state.menu5_uploader_key = str(uuid.uuid4())
-            st.rerun()
+    # 결과가 나온 뒤에는 기입 버튼을 회색으로 바꾸고, 아래 다운로드 버튼을 강조
+    has_result = bool(st.session_state.qa_rows) and new_q_file is not None
+    start_label = "🔁 다시 기입하기" if has_result else "✨ 질문지 정보 기입 시작"
+    if st.button(start_label, type="secondary" if has_result else "primary", **_WIDE):
+        if not main_files:
+            st.warning("1단계: 주 신청자의 서류를 최소 1개 이상 업로드해 주세요.")
+        elif not new_q_file:
+            st.warning("3단계: 새로 채워야 할 질문지 파일을 업로드해 주세요.")
+        elif new_q_file.name.lower().endswith(".docx") and not DOCX_AVAILABLE:
+            st.error("서버에 python-docx가 설치되어 있지 않습니다. requirements.txt에 python-docx를 추가해 주세요.")
+        else:
+            with st.spinner("원본 폼 필드를 분석하여 작성 중입니다. 잠시만 기다려 주세요..."):
+                data, warns, ctx = analyze_qa_for_fill(main_files, family_files, new_q_file)
+            st.session_state.qa_warnings = warns
+            if data and ctx:
+                st.session_state.qa_rows = build_review_rows(data, ctx)
+                st.session_state.qa_ctx = ctx
+                st.session_state.qa_sig = current_sig
+                st.session_state.qa_base = os.path.splitext(new_q_file.name)[0]
+                st.rerun()  # 버튼 색 바로 반영
 
     for w in (st.session_state.qa_warnings or []):
         st.warning(w)
@@ -1177,7 +1258,7 @@ elif app_mode == MENU_5:
             edited = st.data_editor(
                 rows,
                 key=f"qa_editor_{st.session_state.qa_sig}",
-                use_container_width=True,
+                **_WIDE,
                 hide_index=True,
                 disabled=["구역", "칸 (Key)", "주변 문구", "확인 필요"],
                 column_config={
@@ -1200,6 +1281,11 @@ elif app_mode == MENU_5:
                     file_name=out_name,
                     mime=out_mime,
                     type="primary",
+                    **_WIDE,
                 )
             except Exception as e:
                 st.error(f"파일 생성 중 오류가 발생했습니다: {e}")
+
+    # 전체 리셋은 맨 아래
+    st.markdown("")
+    st.button("🔄 전체 리셋", **_WIDE, on_click=reset_menu5)
