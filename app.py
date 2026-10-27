@@ -3,7 +3,15 @@ import streamlit as st
 # 📌 페이지 설정
 st.set_page_config(page_title="CanNest 통합 업무 시스템", layout="wide")
 
-import google.generativeai as genai
+# [수정] 새 Gemini 라이브러리(google-genai) 우선 사용 — 구버전(google-generativeai)은 지원 종료되었고
+# '생각 단계(thinking)' 길이를 조절할 수 없어 Gemini 3.x에서 느림
+try:
+    from google import genai as gg
+    from google.genai import types as gtypes
+    NEW_SDK = True
+except ImportError:
+    import google.generativeai as genai
+    NEW_SDK = False
 try:
     import pymupdf as fitz  # PyMuPDF 최신 버전
 except ImportError:
@@ -73,7 +81,18 @@ if not check_password():
     st.stop()
 
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
-genai.configure(api_key=GEMINI_API_KEY)
+
+@st.cache_resource(show_spinner=False)
+def get_gemini_client(api_key):
+    return gg.Client(api_key=api_key)
+
+if NEW_SDK:
+    gclient = get_gemini_client(GEMINI_API_KEY)
+else:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+# 생각 단계 길이: low = 빠름 (질문지 칸 채우기는 깊은 추론보다 정확한 옮겨 적기가 중요)
+THINKING_LEVEL = "low"
 
 # [수정] Google이 구모델을 계속 종료하므로(2.5/3.5/3.6 → 신규 사용자 차단),
 # 최신 모델 우선 + 모두 막히면 이 API 키로 쓸 수 있는 최신 Flash 모델을 자동으로 찾아 사용
@@ -89,9 +108,10 @@ def discover_flash_models():
     """API 키로 사용 가능한 모델 목록에서 텍스트 생성용 Flash 모델을 최신 버전 순으로 반환."""
     found = []
     try:
-        for m in genai.list_models():
+        models = gclient.models.list() if NEW_SDK else genai.list_models()
+        for m in models:
             name = m.name.split("/")[-1]
-            methods = getattr(m, "supported_generation_methods", []) or []
+            methods = (getattr(m, "supported_actions", None) or getattr(m, "supported_generation_methods", None) or [])
             if "generateContent" not in methods or "flash" not in name:
                 continue
             if any(x in name for x in ("lite", "image", "tts", "live", "audio", "embedding", "exp", "preview")):
@@ -130,12 +150,36 @@ def _clean_contents(contents):
             out.append(c)
     return out
 
-def safe_generate_content(contents, json_mode=False):
-    """모델 폴백 + 일시적 오류(429/500/503) 재시도."""
+def _to_new_sdk_parts(contents):
+    parts = []
+    for c in contents:
+        if isinstance(c, dict) and "data" in c:
+            data = c["data"] if isinstance(c["data"], bytes) else str(c["data"]).encode("utf-8")
+            parts.append(gtypes.Part.from_bytes(data=data, mime_type=c.get("mime_type", "application/octet-stream")))
+        else:
+            parts.append(c)
+    return parts
+
+def _call_model(model_name, contents, json_mode, use_thinking):
+    if NEW_SDK:
+        cfg = {}
+        if json_mode:
+            cfg["response_mime_type"] = "application/json"
+        if use_thinking:
+            cfg["thinking_config"] = gtypes.ThinkingConfig(thinking_level=THINKING_LEVEL)
+        if not model_name.startswith("gemini-3") and "latest" not in model_name:
+            cfg["temperature"] = 0  # Gemini 3는 temperature를 무시하므로 구모델에만
+        return gclient.models.generate_content(
+            model=model_name, contents=_to_new_sdk_parts(contents),
+            config=gtypes.GenerateContentConfig(**cfg))
     gen_config = {"temperature": 0}
     if json_mode:
         gen_config["response_mime_type"] = "application/json"
+    return genai.GenerativeModel(model_name, generation_config=gen_config).generate_content(contents)
 
+def safe_generate_content(contents, json_mode=False):
+    """모델 폴백 + 일시적 오류(429/500/503) 재시도. 걸린 시간과 모델을 session_state에 기록."""
+    contents = _clean_contents(contents)
     last_error = None
     # 지난번에 성공한 모델을 먼저 시도 → 매번 종료된 모델부터 두드리지 않음
     working = st.session_state.get("gemini_working_model")
@@ -152,11 +196,14 @@ def safe_generate_content(contents, json_mode=False):
         if model_name in tried:
             continue
         tried.add(model_name)
-        mod = genai.GenerativeModel(model_name, generation_config=gen_config)
-        for attempt in range(3):
+        use_thinking = NEW_SDK
+        attempt = 0
+        while attempt < 3:
+            t0 = time.time()
             try:
-                resp = mod.generate_content(_clean_contents(contents))
+                resp = _call_model(model_name, contents, json_mode, use_thinking)
                 st.session_state["gemini_working_model"] = model_name
+                st.session_state["gemini_last_run"] = {"model": model_name, "seconds": round(time.time() - t0, 1)}
                 return resp
             except Exception as e:
                 last_error = e
@@ -168,10 +215,14 @@ def safe_generate_content(contents, json_mode=False):
                         "Gemini API 결제 또는 API 키 문제로 분석할 수 없습니다. "
                         "AI Studio(https://ai.studio/projects)에서 크레딧 잔액·결제 설정·API 키를 확인해 주세요. "
                         f"(원본 오류: {e})") from e
+                if use_thinking and "thinking" in msg:
+                    use_thinking = False  # 생각 단계 설정을 지원하지 않는 모델 → 설정 없이 다시
+                    continue
                 if _is_model_gone(msg):
                     break  # 다음 모델로
                 if any(k in msg for k in ["429", "500", "503", "unavailable", "overloaded", "deadline", "resource exhausted"]):
-                    time.sleep(2 * (attempt + 1))
+                    attempt += 1
+                    time.sleep(2 * attempt)
                     continue  # 같은 모델 재시도
                 raise
         # 재시도 소진 또는 404 → 다음 모델
@@ -397,10 +448,21 @@ def section_for(headers, page_idx, y):
 # 1-1a. '현재 정보' 칸 (손님이 직접 최신으로 작성) → 항상 비워둠
 # ------------------------------------------
 CURRENT_ADDRESS_RE = re.compile(
-    r"현재\s*거주지|current\s+(residential\s+|home\s+)?address|residential\s+address|present\s+address",
+    r"current\s+(residential\s+|home\s+)?address|residential\s+address|present\s+address|home\s+address",
     re.IGNORECASE)
-RECENT_ENTRY_PHRASES = ["가장 최근 입국", "최근 입국", "most recent entry", "last entry", "latest entry", "most recent arrival"]
-FIRST_ENTRY_PHRASES = ["최초 입국", "처음 입국", "first entry", "original entry", "first arrival"]
+# 한글 라벨은 글자 사이가 띄어진 PDF가 있어 공백을 모두 지우고 비교 (예: '현재 거 주지 주소')
+CURRENT_ADDRESS_KO_RE = re.compile(r"현재(거주지|집주소|거주하는곳|사는곳)")
+
+def _is_current_address_label(text):
+    if not text:
+        return False
+    if "사망" in text:  # 가족표 '현재 주소 (사망 시…)'는 제외
+        return False
+    return bool(CURRENT_ADDRESS_RE.search(text) or CURRENT_ADDRESS_KO_RE.search(re.sub(r"\s+", "", text)))
+RECENT_ENTRY_PHRASES = ["가장 최근 입국", "최근 입국", "가장 최근에 들어온", "최근에 들어온", "최근 들어온",
+                        "most recent entry", "last entry", "latest entry", "most recent arrival"]
+FIRST_ENTRY_PHRASES = ["최초 입국", "처음 입국", "처음 들어온", "최초로 들어온",
+                       "first entry", "original entry", "first arrival"]
 
 def mark_always_blank(doc, fields):
     """
@@ -413,14 +475,31 @@ def mark_always_blank(doc, fields):
         if p_idx not in phrase_cache:
             page = doc[p_idx]
             found = []
+            # 단어 단위로 문구 찾기 (일부 PDF는 글자 검색 위치가 틀어져 있어 search_for를 쓰지 않음)
+            words = page.get_text("words")
+            lines = {}
+            for w in words:
+                lines.setdefault((w[5], w[6]), []).append(w)  # (block, line)
             for kind, plist in (("recent", RECENT_ENTRY_PHRASES), ("first", FIRST_ENTRY_PHRASES)):
                 seen_rects = []
-                for ph in plist:
-                    for r in page.search_for(ph):
-                        if any(r.intersects(x) for x in seen_rects):
-                            continue  # '가장 최근 입국' 안의 '최근 입국' 중복 방지
-                        seen_rects.append(r)
-                        found.append((kind, r))
+                targets = [re.sub(r"\s+", "", ph.lower()) for ph in plist]
+                for lw in lines.values():
+                    lw.sort(key=lambda w: w[0])
+                    for i in range(len(lw)):
+                        acc = ""
+                        for j in range(i, len(lw)):
+                            acc += lw[j][4].lower()
+                            hit = next((t for t in targets if acc.startswith(t) or acc == t), None)
+                            if hit:
+                                r = fitz.Rect(lw[i][:4])
+                                for k in range(i, j + 1):
+                                    r |= fitz.Rect(lw[k][:4])
+                                if not any(r.intersects(x) for x in seen_rects):
+                                    seen_rects.append(r)
+                                    found.append((kind, r))
+                                break
+                            if not any(t.startswith(acc) for t in targets):
+                                break
             phrase_cache[p_idx] = found
         return phrase_cache[p_idx]
 
@@ -430,7 +509,8 @@ def mark_always_blank(doc, fields):
         page = doc[f["page"]]
         x0, y0, x1, y1 = f["rect"]
         left = " ".join(page.get_text("text", clip=fitz.Rect(max(0, x0 - 220), y0 - 1, x0, y1 + 1)).split())
-        if CURRENT_ADDRESS_RE.search(left) or CURRENT_ADDRESS_RE.search(f.get("label") or ""):
+        if (_is_current_address_label(f.get("printed_label") or "") or _is_current_address_label(left)
+                or _is_current_address_label(f.get("label") or "")):
             f["always_blank"] = "현재 거주지 주소"
             continue
         cx = (x0 + x1) / 2
@@ -442,6 +522,56 @@ def mark_always_blank(doc, fields):
         same_row = [(abs(cx - (r.x0 + r.x1) / 2), kind) for kind, r in above if closest_y - r.y1 <= 6]
         if min(same_row)[1] == "recent":
             f["always_blank"] = "가장 최근 입국 정보"
+
+    # 현재 주소 바로 옆/아래의 '우편번호'만 있는 칸도 현재 주소의 일부 → 비움
+    addr = [f for f in fields if f.get("always_blank") == "현재 거주지 주소"]
+    for f in fields:
+        if f.get("always_blank") or f["type"] != fitz.PDF_WIDGET_TYPE_TEXT:
+            continue
+        lab = " ".join(x for x in (f.get("printed_label"), f.get("label")) if x)
+        if not re.search(r"우\s*편\s*번\s*호|postal|zip", lab, re.I):
+            continue
+        for a in addr:
+            if a["page"] != f["page"]:
+                continue
+            ax0, ay0, ax1, ay1 = a["rect"]
+            fx0, fy0, fx1, fy1 = f["rect"]
+            same_row = fy0 < ay1 - 2 and fy1 > ay0 + 2
+            just_below = 0 <= fy0 - ay1 < 30 and fx0 < ax1 and fx1 > ax0
+            if same_row or just_below:
+                f["always_blank"] = "현재 거주지 주소"
+                break
+
+def compute_printed_labels(doc, fields):
+    """
+    [수정] 각 칸에 '인쇄된 질문 라벨'을 정확히 하나 찾음.
+    - 같은 줄 왼쪽 라벨 (단, 왼쪽에 다른 칸이 있으면 그 칸 오른쪽 글자만)
+    - 왼쪽에 없으면 바로 위 라벨 (위에 다른 칸이 있으면 그 칸 아래 글자만)
+    칸 내부 이름(예: 'Telephone')이 잘못 붙어 있어도, 실제 화면의 라벨로 판단하게 하기 위함.
+    """
+    by_page = {}
+    for f in fields:
+        by_page.setdefault(f["page"], []).append(f)
+    for p_idx, flist in by_page.items():
+        page = doc[p_idx]
+        words = page.get_text("words")
+        rects = [f["rect"] for f in flist]
+        for f in flist:
+            if f["type"] in BUTTON_TYPES:
+                f["printed_label"] = ""
+                continue
+            x0, y0, x1, y1 = f["rect"]
+            # 왼쪽 막는 칸
+            block_x = max([r[2] for r in rects if r[2] <= x0 + 1 and r[1] < y1 - 2 and r[3] > y0 + 2 and r != f["rect"]] + [x0 - 260])
+            left = [w for w in words if w[2] <= x0 + 2 and w[0] >= block_x - 1
+                    and y0 - 2 <= (w[1] + w[3]) / 2 <= y1 + 2]
+            label = " ".join(w[4] for w in sorted(left, key=lambda w: (round(w[1] / 3), w[0])))
+            if not label.strip():
+                block_y = max([r[3] for r in rects if r[3] <= y0 + 1 and r[0] < x1 - 2 and r[2] > x0 + 2 and r != f["rect"]] + [y0 - 40])
+                above = [w for w in words if w[3] <= y0 + 2 and w[1] >= block_y - 1
+                         and x0 - 4 <= (w[0] + w[2]) / 2 <= x1 + 4]
+                label = " ".join(w[4] for w in sorted(above, key=lambda w: (round(w[1] / 3), w[0])))
+            f["printed_label"] = clean_text(label.strip())[:120]
 
 def extract_pdf_form_fields(pdf_bytes):
     """
@@ -513,6 +643,7 @@ def extract_pdf_form_fields(pdf_bytes):
         f["duplicate"] = False
         fields.append(f)
 
+    compute_printed_labels(doc, fields)
     mark_always_blank(doc, fields)
 
     xfa = False
@@ -723,6 +854,8 @@ def format_field_catalog(fields):
         kind = {fitz.PDF_WIDGET_TYPE_CHECKBOX: "CHECKBOX",
                 fitz.PDF_WIDGET_TYPE_RADIOBUTTON: "RADIO"}.get(f["type"], f["type_str"].upper())
         line = f"KEY: {json.dumps(f['key'], ensure_ascii=False)} | PERSON: {f.get('person', 'MAIN APPLICANT')} | SECTION: {f.get('section') or '-'} | TYPE: {kind} | PAGE: {f['page'] + 1}"
+        if f.get("printed_label"):
+            line += f" | PRINTED LABEL: {f['printed_label']}"
         if f["label"]:
             line += f" | TOOLTIP: {f['label'][:120]}"
         line += f" | NEARBY TEXT: {f['nearby']}"
@@ -906,6 +1039,9 @@ HOW TO FILL:
 - TEXT / COMBOBOX: value is the answer text. For a COMBOBOX use one of its ALLOWED VALUES.
 - CHECKBOX / RADIO: to select an option, set that option's KEY to "Yes". For a Yes/No question, select ONLY the one correct option key (e.g. "Q3 [Yes]": "Yes"). Never set "No" or "Off" — simply omit options that should not be selected.
 - Use PAGE and NEARBY TEXT to understand which question each field belongs to.
+- Decide what a box asks by its PRINTED LABEL first (the question printed right next to / above the box), then TOOLTIP, then NEARBY TEXT.
+  KEY names are internal names that are often copied or wrong (e.g. a box named "Telephone" may actually be the bank-balance box) — never decide by the KEY name alone.
+- Put a value only into a box whose label asks for exactly that kind of information. A phone number goes only into a phone/contact box, money only into a balance/amount box, etc.
 - Current residential address and the most recent entry to Canada are intentionally NOT listed — the client fills them in. Do not try to fill them.
 TABLES (work history, education, addresses, travel, relatives, etc.):
 - Do NOT fill table cells by key. Instead return the table's records under "tables" -> table id, as a list of objects using the column ids ("c1", "c2", ...).
@@ -941,6 +1077,30 @@ OUTPUT: Return ONLY a JSON object:
         st.error(f"서류 분석 중 오류가 발생했습니다: {e}")
         return None, warnings, None
 
+PHONE_RE = re.compile(r"^\+?\(?\d{1,4}\)?[\s.-]?\d{2,4}[\s.-]\d{3,4}[\s.-]?\d{3,4}$")
+MONEY_LABEL_RE = re.compile(r"balance|amount|잔고|잔액|금액|salary|income|wage|급여|연봉|\$|cad|usd|krw", re.I)
+PHONE_LABEL_RE = re.compile(r"phone|telephone|tel\b|mobile|cell|연락처|전화|휴대", re.I)
+EMAIL_LABEL_RE = re.compile(r"e-?mail|이메일", re.I)
+DATE_LABEL_RE = re.compile(r"yyyy|yy-mm|date|날짜|생년월일|from|to\b", re.I)
+
+def check_value_fits_label(f, v):
+    """값이 칸 라벨과 성격이 맞는지 간단 점검. 안 맞으면 경고 문구 반환 (해당 칸은 기본 '기입 안 함')."""
+    if f["type"] != fitz.PDF_WIDGET_TYPE_TEXT:
+        return ""
+    label = " ".join(x for x in (f.get("printed_label"), f.get("label")) if x)
+    if not label:
+        return ""
+    is_phone_val = bool(PHONE_RE.match(v.strip())) or bool(re.match(r"^(\+?82[\s-]?)?0?1[016789][\s-]?\d{3,4}[\s-]?\d{4}$", v.strip()))
+    if MONEY_LABEL_RE.search(label) and not PHONE_LABEL_RE.search(label) and is_phone_val:
+        return "⚠️ 금액 칸에 전화번호가 들어감 (기입 해제됨)"
+    if EMAIL_LABEL_RE.search(label) and not PHONE_LABEL_RE.search(label) and "@" not in v:
+        return "⚠️ 이메일 칸인데 이메일 형식이 아님 (기입 해제됨)"
+    if "@" in v and not EMAIL_LABEL_RE.search(label):
+        return "⚠️ 이메일 칸이 아닌데 이메일이 들어감 (기입 해제됨)"
+    if PHONE_LABEL_RE.search(label) and not EMAIL_LABEL_RE.search(label) and not re.search(r"\d{3}", v) and not re.search(r"^(n/?a|none|없음)$", v, re.I):
+        return "⚠️ 전화번호 칸인데 숫자가 없음 (기입 해제됨)"
+    return ""
+
 def build_review_rows(data, context):
     """AI 결과를 검토용 표로 변환 (없는 키·한글 값 표시)."""
     rows = []
@@ -963,15 +1123,18 @@ def build_review_rows(data, context):
             if f is not None and f["type"] in BUTTON_TYPES and v.lower() not in TRUE_WORDS:
                 continue  # "No"/"Off" 지정은 체크하지 않으므로 표에서도 제외
             note = ""
+            mismatch = check_value_fits_label(f, v) if f is not None else ""
             if f is None:
                 note = "⚠️ 서식에 없는 칸 (기입 안 됨)"
+            elif mismatch:
+                note = mismatch
             elif HANGUL_RE.search(v):
                 note = "⚠️ 한글 포함"
             elif f["choices"] and v.lower() not in [c.lower() for c in f["choices"]]:
                 note = "⚠️ 선택지에 없는 값"
-            rows.append({"기입": f is not None, "구역": ({"MAIN APPLICANT": "신청자", "SPOUSE": "배우자"}.get(f.get("person"), (f.get("person") or "").replace("CHILD", "자녀")) if f else ""),
+            rows.append({"기입": f is not None and not mismatch, "구역": ({"MAIN APPLICANT": "신청자", "SPOUSE": "배우자"}.get(f.get("person"), (f.get("person") or "").replace("CHILD", "자녀")) if f else ""),
                          "칸 (Key)": k,
-                         "주변 문구": (t_labels.get(k) or (f["nearby"] if f else ""))[:80],
+                         "주변 문구": (t_labels.get(k) or (f.get("printed_label") if f else "") or (f["nearby"] if f else ""))[:80],
                          "값": v, "확인 필요": note})
     else:
         for k, v in (data.get("docx_fields") or {}).items():
@@ -1324,6 +1487,9 @@ elif app_mode == MENU_5:
                 out_bytes, out_name, out_mime, filled, skipped = build_output_file(
                     edited_rows, st.session_state.qa_ctx, new_q_file.getvalue(), st.session_state.qa_base)
                 st.success(f"✅ {filled}개 칸에 기입했습니다. 확인하지 못한 항목은 비워두었으니 손님께 마저 작성해 달라고 요청하세요.")
+                run = st.session_state.get("gemini_last_run")
+                if run:
+                    st.caption(f"AI 분석: {run['model']} · {run['seconds']}초")
                 if skipped:
                     with st.expander(f"서식에서 위치를 찾지 못해 기입되지 않은 항목 {len(skipped)}개"):
                         st.write(skipped)
