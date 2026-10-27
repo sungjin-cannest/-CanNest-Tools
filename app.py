@@ -403,41 +403,71 @@ def _safe_on_state(w):
         pass
     return None
 
-# 질문지 안의 '구역 제목' 패턴 (신청자/배우자/자녀 등). 다른 질문지도 대부분 이 표현을 씀
+# 질문지 안의 '구역 제목' 패턴
 SECTION_HEADER_RE = re.compile(
-    r"(개인\s*정보|가족\s*관계\s*정보|personal\s+(information|details)|family\s+(information|members))",
+    r"(개인\s*정보|가족\s*관계\s*정보|personal\s+(information|details)|family\s+(information|members)|background\s+information)",
     re.IGNORECASE)
+# '누구에 대한 구역인지'를 정하는 제목: 사람을 가리키는 단어로 시작해야 함
+# (예: '[ SPOUSE - BACKGROUND INFORMATION ]', '배우자의 개인 정보', '자녀(1)의 개인 정보', '[ DEPENDANT CHILD 1 ]')
+# '[ Required for Applicants Aged 18 or Older ]'처럼 중간에 단어가 섞인 제목은 사람 구역으로 보지 않음
+PERSON_HEADER_RE = re.compile(
+    r"^[\[\(\s]*(main\s+applicant|principal\s+applicant|applicant|spouse|common[\s-]*law\s+partner|partner|"
+    r"dependa?e?nt\s+child|child|신청자|주\s*신청자|배우자|자녀)", re.IGNORECASE)
+
+def _person_from_text(t):
+    t = (t or "").lower()
+    m = re.search(r"자녀\s*\(?(\d+)\)?|child\s*\(?(\d+)\)?", t)
+    if m:
+        return f"CHILD {m.group(1) or m.group(2)}"
+    if re.match(r"^[\[\(\s]*(자녀|dependa?e?nt|child)", t):
+        return "CHILD"
+    if re.match(r"^[\[\(\s]*(배우자|spouse|common[\s-]*law|partner)", t):
+        return "SPOUSE"
+    return "MAIN APPLICANT"
 
 def detect_sections(doc):
-    """각 페이지에서 구역 제목(예: '배우자의 개인 정보')의 위치를 찾아 (page, y, 제목) 목록 반환."""
+    """
+    구역 제목 위치 목록 [(page, y, 제목, 사람 또는 None)].
+    - 사람 제목(신청자/배우자/자녀)은 이후 칸들의 '누구' 를 바꿈
+    - 일반 제목([ TRAVEL HISTORY ], [ FAMILY INFORMATION ] 등)은 구역 이름만 바꾸고 '누구'는 유지
+    """
     headers = []
     for p_idx, page in enumerate(doc):
         for b in page.get_text("blocks"):
-            first_line = (b[4] or "").strip().split("\n")[0].strip()
-            if first_line and len(first_line) <= 60 and SECTION_HEADER_RE.search(first_line):
-                title = re.split(r"\s+-\s+|\(\*", first_line)[0].strip()
-                headers.append((p_idx, b[1], title))
+            first_line = clean_text((b[4] or "").strip().split("\n")[0].strip())
+            if not first_line or len(first_line) > 80:
+                continue
+            is_person = bool(PERSON_HEADER_RE.search(first_line)) and (
+                SECTION_HEADER_RE.search(first_line) or first_line.lstrip().startswith("[")
+                or re.search(r"정보|information|details", first_line, re.I))
+            is_general = bool(SECTION_HEADER_RE.search(first_line)) or bool(re.match(r"^\[\s*[A-Z][A-Z &/-]{3,}\s*\]", first_line))
+            if is_person or is_general:
+                title = re.split(r"\s+[-–]\s+If applicable|\(\*|\s+-\s+모든", first_line)[0].strip()
+                headers.append((p_idx, b[1], title, _person_from_text(first_line) if is_person else None))
     headers.sort(key=lambda h: (h[0], h[1]))
     return headers
 
 def person_for_section(title):
-    # 제목의 '주어' 부분만 판단 (예: '신청자 가족관계 정보 (부모님, 배우자, 자녀…)'의 괄호 속 단어는 무시)
-    t = (title or "").lower()
+    """(구버전 호환) 제목 하나로 사람 판단."""
+    t = (title or "")
     m0 = SECTION_HEADER_RE.search(t)
     if m0:
         t = t[:m0.start()]
-    m = re.search(r"자녀\s*\(?(\d+)\)?|child\s*\(?(\d+)\)?", t)
-    if m:
-        return f"CHILD {m.group(1) or m.group(2)}"
-    if "자녀" in t or "child" in t or "dependant" in t or "dependent" in t:
-        return "CHILD"
-    if "배우자" in t or "spouse" in t or "partner" in t:
-        return "SPOUSE"
-    return "MAIN APPLICANT"
+    return _person_from_text(t)
+
+def person_for(headers, page_idx, y):
+    person = "MAIN APPLICANT"
+    for hp, hy, title, who in headers:
+        if hp < page_idx or (hp == page_idx and hy <= y + 2):
+            if who:
+                person = who
+        else:
+            break
+    return person
 
 def section_for(headers, page_idx, y):
     current = ""
-    for hp, hy, title in headers:
+    for hp, hy, title, who in headers:
         if hp < page_idx or (hp == page_idx and hy <= y + 2):
             current = title
         else:
@@ -559,6 +589,7 @@ def compute_printed_labels(doc, fields):
         for f in flist:
             if f["type"] in BUTTON_TYPES:
                 f["printed_label"] = ""
+                f["label_side"] = ""
                 continue
             x0, y0, x1, y1 = f["rect"]
             # 왼쪽 막는 칸
@@ -566,6 +597,7 @@ def compute_printed_labels(doc, fields):
             left = [w for w in words if w[2] <= x0 + 2 and w[0] >= block_x - 1
                     and y0 - 2 <= (w[1] + w[3]) / 2 <= y1 + 2]
             label = " ".join(w[4] for w in sorted(left, key=lambda w: (round(w[1] / 3), w[0])))
+            f["label_side"] = "left" if label.strip() else ""
             if not label.strip():
                 block_y = max([r[3] for r in rects if r[3] <= y0 + 1 and r[0] < x1 - 2 and r[2] > x0 + 2 and r != f["rect"]] + [y0 - 40])
                 above = [w for w in words if w[3] <= y0 + 2 and w[1] >= block_y - 1
@@ -608,7 +640,7 @@ def extract_pdf_form_fields(pdf_bytes):
                 "choices": [clean_text(c if isinstance(c, str) else c[-1]) for c in (w.choice_values or [])] if w.field_type in CHOICE_TYPES else [],
                 "nearby": nearby,
                 "section": section_for(headers, p_idx, r.y0),
-                "person": person_for_section(section_for(headers, p_idx, r.y0)),
+                "person": person_for(headers, p_idx, r.y0),
                 "page": p_idx,
                 "xref": w.xref,
                 "rect": (r.x0, r.y0, r.x1, r.y1),
@@ -714,6 +746,13 @@ def detect_tables(pdf_bytes, fields):
     tables = []
     for g in groups:
         if len(g) < 3:
+            continue
+        # [수정] '라벨 | 칸 | 라벨 | 칸' 형태의 개인정보 칸 묶음은 표가 아님
+        # (예: City of Birth [ ] Country of Birth [ ]) → 칸마다 왼쪽에 자기 라벨이 있으면 제외
+        cells = [f for r in g for f in r["fields"]]
+        labeled = sum(1 for f in cells if f.get("label_side") == "left"
+                      and not re.fullmatch(r"\s*current\s*", f.get("printed_label") or "", re.I))
+        if labeled >= len(cells) * 0.5:
             continue
         # 열 위치 모으기
         col_xs = []
@@ -1381,8 +1420,7 @@ if app_mode in [MENU_1, MENU_2, MENU_3, MENU_4]:
 # ------------------------------------------
 elif app_mode == MENU_5:
     st.title(MENU_5)
-    st.caption("기존 손님 서류들과 새 빈 질문지를 올리시면, 알고 있는 정보를 서식 칸에 맞춰 기입해 드립니다. "
-               "결과는 다운로드 전에 표에서 확인·수정할 수 있습니다.")
+    st.caption("기존 손님 서류들과 새 빈 질문지를 올리시면, 알고 있는 정보를 서식 칸에 맞춰 기입해 드립니다.")
 
     if "menu5_uploader_key" not in st.session_state:
         st.session_state.menu5_uploader_key = str(uuid.uuid4())
@@ -1456,43 +1494,28 @@ elif app_mode == MENU_5:
     for w in (st.session_state.qa_warnings or []):
         st.warning(w)
 
-    # 💡 결과 검토 및 다운로드
+    # 💡 결과 다운로드 (검토 표 없이 바로 — 다운로드한 파일에서 더블체크)
     if st.session_state.qa_rows is not None and new_q_file is not None:
         rows = st.session_state.qa_rows
         if not rows:
             st.info("자료에서 질문지에 기입할 수 있는 정보를 찾지 못했습니다.")
         else:
-            st.subheader("4. 기입 내용 확인 및 수정")
-            st.caption("값을 직접 고치거나, '기입' 체크를 해제하면 그 칸은 비워둡니다. 수정 내용은 다운로드 파일에 바로 반영됩니다.")
             for tw in (st.session_state.qa_ctx or {}).get("table_warnings", []) or []:
                 st.warning(tw)
-            need_check = sum(1 for r in rows if r["확인 필요"])
-            if need_check:
-                st.warning(f"⚠️ 확인이 필요한 항목이 {need_check}개 있습니다. '확인 필요' 열을 살펴봐 주세요.")
-
-            edited = st.data_editor(
-                rows,
-                key=f"qa_editor_{st.session_state.qa_sig}",
-                **_WIDE,
-                hide_index=True,
-                disabled=["구역", "칸 (Key)", "주변 문구", "확인 필요"],
-                column_config={
-                    "기입": st.column_config.CheckboxColumn(width="small"),
-                    "값": st.column_config.TextColumn(width="large"),
-                },
-            )
-            edited_rows = edited.to_dict("records") if hasattr(edited, "to_dict") else edited
-
             try:
                 out_bytes, out_name, out_mime, filled, skipped = build_output_file(
-                    edited_rows, st.session_state.qa_ctx, new_q_file.getvalue(), st.session_state.qa_base)
+                    rows, st.session_state.qa_ctx, new_q_file.getvalue(), st.session_state.qa_base)
                 st.success(f"✅ {filled}개 칸에 기입했습니다. 확인하지 못한 항목은 비워두었으니 손님께 마저 작성해 달라고 요청하세요.")
                 run = st.session_state.get("gemini_last_run")
                 if run:
                     st.caption(f"AI 분석: {run['model']} · {run['seconds']}초")
-                if skipped:
-                    with st.expander(f"서식에서 위치를 찾지 못해 기입되지 않은 항목 {len(skipped)}개"):
-                        st.write(skipped)
+                excluded = [r for r in rows if not r.get("기입") and r.get("확인 필요")]
+                if excluded or skipped:
+                    with st.expander(f"기입하지 않은 항목 {len(excluded) + len(skipped)}개 (값이 칸과 맞지 않거나 위치를 못 찾음)"):
+                        for r in excluded:
+                            st.write(f"- {r['주변 문구'] or r['칸 (Key)']}: {r['값']}  — {r['확인 필요']}")
+                        for k in skipped:
+                            st.write(f"- {k}: 서식에서 위치를 찾지 못함")
                 st.download_button(
                     label="📥 Info Filled 질문지 내려받기",
                     data=out_bytes,
