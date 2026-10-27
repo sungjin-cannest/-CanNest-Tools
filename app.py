@@ -75,8 +75,33 @@ if not check_password():
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 genai.configure(api_key=GEMINI_API_KEY)
 
-# [수정] gemini-1.5-flash는 서비스 종료됨 → 현재 운영 중인 모델로 폴백 체인 교체
-CANDIDATE_MODELS = ['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-2.5-flash']
+# [수정] Google이 구모델을 계속 종료하므로(2.5/3.5/3.6 → 신규 사용자 차단),
+# 최신 모델 우선 + 모두 막히면 이 API 키로 쓸 수 있는 최신 Flash 모델을 자동으로 찾아 사용
+CANDIDATE_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-3.7-flash']
+
+def _is_model_gone(msg):
+    m = msg.lower()
+    return ("404" in m or "not found" in m or "no longer available" in m
+            or "not supported" in m or "deprecated" in m)
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def discover_flash_models():
+    """API 키로 사용 가능한 모델 목록에서 텍스트 생성용 Flash 모델을 최신 버전 순으로 반환."""
+    found = []
+    try:
+        for m in genai.list_models():
+            name = m.name.split("/")[-1]
+            methods = getattr(m, "supported_generation_methods", []) or []
+            if "generateContent" not in methods or "flash" not in name:
+                continue
+            if any(x in name for x in ("lite", "image", "tts", "live", "audio", "embedding", "exp", "preview")):
+                continue
+            ver = re.findall(r"gemini-(\d+(?:\.\d+)?)", name)
+            found.append((float(ver[0]) if ver else 0.0, name))
+    except Exception:
+        return []
+    found.sort(reverse=True)
+    return [n for _, n in found]
 
 def clean_text(s):
     """
@@ -112,21 +137,41 @@ def safe_generate_content(contents, json_mode=False):
         gen_config["response_mime_type"] = "application/json"
 
     last_error = None
-    for model_name in CANDIDATE_MODELS:
+    # 지난번에 성공한 모델을 먼저 시도 → 매번 종료된 모델부터 두드리지 않음
+    working = st.session_state.get("gemini_working_model")
+    order = ([working] if working else []) + CANDIDATE_MODELS
+    tried = set()
+
+    def model_iter():
+        for n in order:
+            yield n
+        for n in discover_flash_models():  # 위 후보가 모두 막혔을 때만 목록 조회
+            yield n
+
+    for model_name in model_iter():
+        if model_name in tried:
+            continue
+        tried.add(model_name)
         mod = genai.GenerativeModel(model_name, generation_config=gen_config)
         for attempt in range(3):
             try:
-                return mod.generate_content(_clean_contents(contents))
+                resp = mod.generate_content(_clean_contents(contents))
+                st.session_state["gemini_working_model"] = model_name
+                return resp
             except Exception as e:
                 last_error = e
                 msg = str(e).lower()
-                if "404" in msg or "not found" in msg:
+                if _is_model_gone(msg):
                     break  # 다음 모델로
                 if any(k in msg for k in ["429", "500", "503", "unavailable", "overloaded", "deadline", "resource exhausted"]):
                     time.sleep(2 * (attempt + 1))
                     continue  # 같은 모델 재시도
                 raise
         # 재시도 소진 또는 404 → 다음 모델
+    if last_error is not None and _is_model_gone(str(last_error)):
+        raise RuntimeError(
+            f"사용 가능한 Gemini 모델을 찾지 못했습니다 (시도: {', '.join(tried)}). "
+            f"코드의 CANDIDATE_MODELS에 Google이 안내하는 최신 모델명을 추가해 주세요. 원본 오류: {last_error}")
     raise last_error
 
 def parse_json_response(text):
