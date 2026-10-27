@@ -1,7 +1,6 @@
 streamlit
-google-generativeai
-PyMuPDF
-pypdf
-Pillow
+google-genai
+pymupdf
+pillow
 pillow-heif
 python-docx
