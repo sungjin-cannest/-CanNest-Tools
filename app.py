@@ -202,10 +202,9 @@ def _call_model(model_name, contents, json_mode, thinking_level):
 
 def safe_generate_content(contents, json_mode=False, thinking=None):
     """
-    모든 메뉴 공통 AI 호출.
-    - thinking: None이면 모델 기본값 (메뉴 1~4), "low"면 빠르게 (메뉴 5)
+    모든 메뉴 공통 AI 호출. 모델 폴백 + 일시적 오류(429/500/503) 재시도. 걸린 시간과 모델을 session_state에 기록.
+    - thinking: None이면 모델 기본값, "low"면 빠르게
     """
-    """모델 폴백 + 일시적 오류(429/500/503) 재시도. 걸린 시간과 모델을 session_state에 기록."""
     contents = _clean_contents(contents)
     last_error = None
     # 지난번에 성공한 모델을 먼저 시도 → 매번 종료된 모델부터 두드리지 않음
@@ -249,6 +248,10 @@ def safe_generate_content(contents, json_mode=False, thinking=None):
                     break  # 다음 모델로
                 if any(k in msg for k in ["429", "500", "503", "unavailable", "overloaded", "deadline", "resource exhausted"]):
                     attempt += 1
+                    try:  # 왜 오래 걸리는지 화면에 알려줌
+                        st.toast(f"AI 서버가 바빠서 다시 시도 중입니다… ({attempt}/3, {model_name})")
+                    except Exception:
+                        pass
                     time.sleep(2 * attempt)
                     continue  # 같은 모델 재시도
                 raise
@@ -1087,6 +1090,8 @@ def normalize_qa_filename(filename):
 # 모든 페이지를 AI에 '한 번에' 보내야 서류 묶기(여권+스탬프, 은행내역 여러 장 등)가 정확하므로
 # 요청을 나누지 않고, 장수가 많을수록 미리보기 이미지를 작게 만들어 요청 용량 한도 안에 맞춤.
 CRM_MAX_PAGES = 200
+# AI '생각 단계' 길이: "low" = 빠름. 분류·회전 정확도가 떨어진다 싶으면 None(모델 기본값, 느림)으로 바꾸세요.
+CRM_THINKING_LEVEL = "low"
 CRM_PAYLOAD_LIMIT = 15 * 1024 * 1024  # AI 요청 한 번의 이미지 총량 목표 (한도 약 20MB보다 여유 있게)
 
 def count_total_pages(files):
@@ -2814,8 +2819,8 @@ elif app_mode == MENU_4:
       shrink_previews_to_fit(global_pages)
 
       status_text.text(
-          "2. AI가 페이지별 문맥을 분석하여 연관 서류를 묶거나 나누는"
-          " 중입니다..."
+          f"2. AI가 {len(global_pages)}페이지의 문맥을 분석하여 연관 서류를 묶거나 나누는"
+          " 중입니다... (페이지가 많을수록 오래 걸립니다)"
       )
 
       prompt = f"""
@@ -2920,7 +2925,9 @@ elif app_mode == MENU_4:
         )
 
       try:
-        response = safe_generate_content(contents)
+        _t0 = time.time()
+        response = safe_generate_content(contents, thinking=CRM_THINKING_LEVEL)
+        st.session_state["crm_ai_seconds"] = round(time.time() - _t0, 1)
         clean_text = (
             response.text.strip().replace("```json", "").replace("```", "")
         )
@@ -3249,6 +3256,9 @@ elif app_mode == MENU_4:
   if st.session_state.analysis_results:
     st.markdown("---")
     st.subheader("변환 완료된 서류 다운로드")
+    if st.session_state.get("crm_ai_seconds") is not None:
+      _run = st.session_state.get("gemini_last_run") or {}
+      st.caption(f"AI 분석: {_run.get('model', '')} · {st.session_state['crm_ai_seconds']}초")
 
     zip_buffer = io.BytesIO()
     final_downloads = []
