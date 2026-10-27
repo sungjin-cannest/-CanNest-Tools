@@ -1084,6 +1084,104 @@ def normalize_qa_filename(filename):
 
 
 # ==========================================
+# 5-0b. [메뉴 4] Word(.doc/.docx) → PDF 실제 변환
+# ==========================================
+# [수정] 기존에는 Word의 글자만 뽑아 빈 페이지 왼쪽 위에 찍어서, 서식·로고·줄바꿈이 사라지고
+# 긴 줄은 오른쪽이 잘렸음 → LibreOffice로 원본 모양 그대로 PDF 변환.
+# (Streamlit Cloud에서는 packages.txt에 libreoffice-writer 가 있어야 함. 없으면 아래 대체 방식 사용)
+import shutil
+import subprocess
+import tempfile
+
+def _find_soffice():
+    return shutil.which("soffice") or shutil.which("libreoffice")
+
+@st.cache_data(show_spinner=False, max_entries=50)
+def word_to_pdf_bytes(file_bytes, file_name):
+    """Word → PDF. 반환: (pdf_bytes 또는 None, 방식 'libreoffice' | 'basic')"""
+    soffice = _find_soffice()
+    if soffice:
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                ext = os.path.splitext(file_name)[1].lower() or ".docx"
+                src = os.path.join(tmp, "input" + ext)
+                with open(src, "wb") as f:
+                    f.write(file_bytes)
+                profile = "file://" + os.path.join(tmp, "lo_profile")  # 동시 실행 시 프로필 잠김 방지
+                subprocess.run(
+                    [soffice, f"-env:UserInstallation={profile}", "--headless", "--norestore",
+                     "--convert-to", "pdf", "--outdir", tmp, src],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120,
+                    env={**os.environ, "HOME": tmp})
+                out = os.path.join(tmp, "input.pdf")
+                if os.path.exists(out) and os.path.getsize(out) > 0:
+                    with open(out, "rb") as f:
+                        return f.read(), "libreoffice"
+        except Exception:
+            pass
+    # 대체 방식: 문단·글머리표·굵게·표를 살려 자동 줄바꿈되는 PDF로 (로고 등 그림은 빠짐)
+    try:
+        return _docx_to_pdf_basic(file_bytes), "basic"
+    except Exception:
+        return None, "failed"
+
+def _docx_to_pdf_basic(file_bytes):
+    import html as _html
+    d = docx.Document(io.BytesIO(file_bytes))
+    parts = []
+
+    def runs_html(p):
+        out = ""
+        for r in p.runs:
+            t = _html.escape(r.text)
+            if not t:
+                continue
+            if r.bold:
+                t = f"<b>{t}</b>"
+            if r.italic:
+                t = f"<i>{t}</i>"
+            if r.underline:
+                t = f"<u>{t}</u>"
+            out += t
+        return out or _html.escape(p.text)
+
+    body = d.element.body
+    for child in body.iterchildren():
+        tag = child.tag.split("}")[-1]
+        if tag == "p":
+            p = docx.text.paragraph.Paragraph(child, d)
+            txt = runs_html(p)
+            style = (p.style.name or "").lower() if p.style is not None else ""
+            is_list = "list" in style or child.find(".//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}numPr") is not None
+            align = {1: "center", 2: "right", 3: "justify"}.get(int(p.alignment) if p.alignment is not None else 0, "left")
+            if is_list:
+                parts.append(f"<ul><li>{txt}</li></ul>")
+            elif style.startswith("heading"):
+                parts.append(f"<h3 style='text-align:{align}'>{txt}</h3>")
+            else:
+                parts.append(f"<p style='text-align:{align}'>{txt or '&nbsp;'}</p>")
+        elif tag == "tbl":
+            t = docx.table.Table(child, d)
+            rows = "".join("<tr>" + "".join(f"<td>{_html.escape(c.text)}</td>" for c in r.cells) + "</tr>" for r in t.rows)
+            parts.append(f"<table border='1' cellspacing='0' cellpadding='3'>{rows}</table>")
+    html_doc = "".join(parts)
+    css = "* {font-family: sans-serif; font-size: 10.5pt;} p {margin: 0 0 6px 0;} ul {margin: 0 0 2px 0;} td {font-size: 9.5pt;}"
+    story = fitz.Story(html=html_doc, user_css=css)
+    buf = io.BytesIO()
+    writer = fitz.DocumentWriter(buf)
+    mediabox = fitz.paper_rect("letter")
+    where = mediabox + (54, 54, -54, -54)
+    more = True
+    while more:
+        dev = writer.begin_page(mediabox)
+        more, _ = story.place(where)
+        story.draw(dev)
+        writer.end_page()
+    writer.close()
+    return buf.getvalue()
+
+
+# ==========================================
 # 5-1. [메뉴 4] 페이지 수 제한 완화 도우미
 # ==========================================
 # [수정] 기존 40장 제한 → 200장.
@@ -2732,7 +2830,38 @@ elif app_mode == MENU_4:
         mime_type = file.type if file.type else "application/pdf"
         fname_lower = file.name.lower()
 
+        word_pdf = None
         if fname_lower.endswith((".doc", ".docx")):
+          word_pdf, _how = word_to_pdf_bytes(file_bytes, file.name)
+          if _how == "basic":
+            st.caption(f"ℹ️ {file.name}: 서버에 LibreOffice가 없어 간이 변환했습니다 (로고·그림 제외).")
+
+        if word_pdf:
+          # [수정] Word를 실제 PDF로 바꾼 뒤 PDF와 똑같이 처리 (AI도 실제 페이지 모양을 보고 분류)
+          text_content = read_word_document_text(file_bytes, file.name)
+          wdoc = fitz.open(stream=word_pdf, filetype="pdf")
+          for i in range(len(wdoc)):
+            if page_counter > CRM_MAX_PAGES:
+              break
+            pix = wdoc.load_page(i).get_pixmap(matrix=fitz.Matrix(prev_zoom, prev_zoom))
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=prev_quality)
+            global_pages.append({
+                "global_idx": page_counter,
+                "original_name": file.name,
+                "mime_type": "application/pdf",
+                "file_bytes": word_pdf,
+                "pdf_page_idx": i,
+                "preview_bytes": buf.getvalue(),
+                "is_word": True,
+                "word_text": text_content,
+                "word_orig_bytes": file_bytes,  # 이력서는 원본 Word 그대로 내려주기 위함
+                "word_orig_mime": mime_type,
+            })
+            page_counter += 1
+          wdoc.close()
+        elif fname_lower.endswith((".doc", ".docx")):
           if page_counter > CRM_MAX_PAGES:
             continue
           text_content = read_word_document_text(file_bytes, file.name)
@@ -3048,8 +3177,8 @@ elif app_mode == MENU_4:
           orig_ext = os.path.splitext(group_pages[0]["original_name"])[1]
           final_name = base_name + orig_ext
 
-          comp_bytes = group_pages[0]["file_bytes"]
-          out_mime = group_pages[0]["mime_type"]
+          comp_bytes = group_pages[0].get("word_orig_bytes", group_pages[0]["file_bytes"])
+          out_mime = group_pages[0].get("word_orig_mime", group_pages[0]["mime_type"])
           orig_kb = len(comp_bytes) / 1024
           comp_kb = orig_kb
 
@@ -3127,7 +3256,7 @@ elif app_mode == MENU_4:
             for p_data in group_pages:
               rot = int(rotations.get(str(p_data["global_idx"]), 0))
 
-              if p_data.get("is_word"):
+              if p_data.get("is_word") and "pdf" not in p_data["mime_type"].lower():
                 pdf_page = new_doc.new_page(width=595, height=842)
                 w_text = p_data.get("word_text", "")
                 pdf_page.insert_text(
