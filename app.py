@@ -1083,6 +1083,49 @@ def normalize_qa_filename(filename):
     return f"{name}_QA_{code}" + (f"_{date}" if date else "") + ext
 
 
+# 본문에 이 문구가 있으면 AI 판단과 관계없이 해당 서류명으로 고정 (위에서부터 우선)
+CONTENT_FILENAME_RULES = [
+    ("Submission Confirmation Letter",
+     re.compile(r"IMM\s*5988|confirms\s+that\s+your\s+application\s+has\s+been\s+received"
+                r"|authori[sz]ed\s+to\s+continue\s+(working|studying).{0,120}until\s+a\s+decision", re.I | re.S)),
+]
+
+def crm_pages_text(global_pages, page_indices, max_chars=6000):
+    """묶인 페이지들의 글자 (PDF 텍스트 / Word 본문). 스캔본은 글자가 없으므로 빈 문자열."""
+    out, cache = [], {}
+    for p in global_pages:
+        if p["global_idx"] not in page_indices:
+            continue
+        try:
+            if "pdf" in p["mime_type"].lower():
+                key = id(p["file_bytes"])
+                if key not in cache:
+                    cache[key] = fitz.open(stream=p["file_bytes"], filetype="pdf")
+                out.append(cache[key].load_page(p["pdf_page_idx"]).get_text("text"))
+            elif p.get("word_text"):
+                out.append(p["word_text"])
+        except Exception:
+            pass
+        if sum(len(x) for x in out) > max_chars:
+            break
+    for d in cache.values():
+        d.close()
+    return "\n".join(out)[:max_chars]
+
+def fix_filename_by_content(filename, text):
+    """'정미_WP_2026.12.11.pdf' + (IMM 5988 본문) → '정미_Submission Confirmation Letter.pdf'"""
+    if not filename or not text:
+        return filename
+    for doc_name, pat in CONTENT_FILENAME_RULES:
+        if pat.search(text):
+            if doc_name.lower() in filename.lower():
+                return filename
+            name = filename.split("_")[0].strip()
+            ext = os.path.splitext(filename)[1] if re.search(r"\.(pdf|jpe?g|png|docx?)$", filename, re.I) else ""
+            return f"{name}_{doc_name}{ext}"
+    return filename
+
+
 UNKNOWN_NAME_RE = re.compile(r"^(unknown|unkown|client|name|n\s*/?\s*a|미상|이름\s*미상|이름없음)(?=[_.]|$)", re.I)
 
 def replace_unknown_name(filename, name):
@@ -3099,6 +3142,7 @@ elif app_mode == MENU_4:
             [CATEGORIES & CMS SUFFIX RULES]
             1. Passport (including stamp/visa pages): {{Name}}_PP_{{ExpiryDate YYYY.MM.DD}}
             2. Work Permit / Study Permit / Visitor Record (IMM 1442) / Coop / PGWP / BOWP: {{Name}}_{{WP/SP/VR/Coop/PGWP/BOWP}}_{{ExpiryDate YYYY.MM.DD}}
+               (CRITICAL: ONLY the actual permit document itself (IMM 1442 with 'Work Permit' / 'Study Permit' title and permit number). IRCC LETTERS that merely talk about a permit are NOT permits — see rule 26.)
             3. Questionnaire (CanNest Q&A / 질문지): {{Name}}_QA_{{Code}}_{{ReceivedDate YYYY.MM.DD}}
                {{Code}} MUST be EXACTLY one of these short codes — never a description:
                  - Work Permit questionnaire (initial, extension, LMIA, PGWP — any work permit) -> WP
@@ -3134,6 +3178,7 @@ elif app_mode == MENU_4:
             23. Digital Photo / Passport Photo: {{Name}}_Digital Photo (Use .pdf if multiple pages, else .jpg)
             24. T4 (Statement of Remuneration Paid): {{Name}}_T4_{{EmployerNameInEnglish}}_{{Year YYYY}}
             25. Letter of Acceptance / Official Admission Letter (입학허가서): {{Name}}_LOA_{{SchoolNameInEnglish}} (e.g. 공원준_LOA_Metropolitan Community College)
+            26. Submission Confirmation Letter (IRCC IMM 5988 / "This confirms that your application has been received by IRCC" / letter allowing you to keep working or studying until a decision — maintained status letter): {{Name}}_Submission Confirmation Letter (CRITICAL: NEVER name this WP/SP/VR even though it mentions a work permit and an "until" date.)
 
             [CRITICAL FALLBACK RULE FOR UNKNOWN DOCUMENTS]
             - Step 1: If a document does NOT match any categories above, extract the official document title printed at the top of the document (in English, Title Case) and format as: {{Name}}_{{DocumentTitleInEnglish}}.
@@ -3237,6 +3282,11 @@ elif app_mode == MENU_4:
                 existing["page_indices"].append(ni)
           else:
             docs_info.append(d)
+
+        # [수정] AI가 서류 종류를 착각해도 본문 내용으로 한 번 더 확인 (예: IMM 5988 접수 확인 레터 → WP로 잘못 지음)
+        for d in docs_info:
+          d["suggested_filename"] = fix_filename_by_content(
+              d.get("suggested_filename", ""), crm_pages_text(global_pages, d.get("page_indices", [])))
 
       except Exception as e:
         st.error(f"AI 분석 중 오류가 발생했습니다: {e}")
