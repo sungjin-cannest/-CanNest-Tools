@@ -2462,6 +2462,7 @@ Return ONLY this JSON:
    "person_name": "<full name of the person this document is about, as written>",
    "dob": "YYYY-MM-DD or null",
    "passport_no": "<as written or null>",
+   "doc_date": "<date this document was written / signed / issued, YYYY-MM-DD or YYYY-MM, or null>",
    "permit": null OR {
        "permit_type": "Work Permit | Study Permit | Visitor Record | ...",
        "is_closed": true if the permit names a specific employer (employer-specific / closed), false if 'open', null if unknown,
@@ -2475,7 +2476,9 @@ Return ONLY this JSON:
    "permits_mentioned": [ {"permit_type": "", "employer": "", "valid_from_raw": "", "valid_from": "", "valid_to_raw": "", "valid_to": ""} ],
    "jobs": [
      {"employer": "<company name exactly as written in THIS document>",
-      "job_title": "", "location": "<city/address as written>",
+      "job_title": "<as written>",
+      "job_title_standard": "<standard English occupation name: expand abbreviations (ECE -> Early Childhood Educator, IT -> Infant Toddler), drop seniority words (Main/Lead/Senior/Head/Assistant) when it is the same occupation>",
+      "location": "<city/address as written>",
       "start_raw": "<exactly as written>", "start": "YYYY-MM-DD or YYYY-MM or null",
       "end_raw": "<exactly as written>", "end": "YYYY-MM-DD or YYYY-MM or 'present' or null"}
    ]
@@ -2589,6 +2592,34 @@ def _xc_same_place(a, b):
         return True
     return bool(ta2 & tb2)
 
+def _xc_ym(p):
+    if not p or not p.get("date") or p.get("invalid"):
+        return None
+    return (p["date"].year, p["date"].month)
+
+def xc_doc_date(d):
+    """서류 작성일: AI가 읽은 값 → 없으면 파일명의 날짜 (예: QA_WP_2025.12.pdf)"""
+    p = xc_parse_date(d.get("doc_date"), d.get("doc_date"))
+    if p["date"]:
+        return p
+    m = re.search(r"(20\d{2})[._\-](\d{1,2})(?:[._\-](\d{1,2}))?", d.get("file") or "")
+    if m:
+        norm = f"{m.group(1)}-{int(m.group(2)):02d}" + (f"-{int(m.group(3)):02d}" if m.group(3) else "")
+        p = xc_parse_date(norm, norm)
+        if p["date"]:
+            return p
+    return None
+
+_XC_PLACE_STOP = {"bc", "canada", "on", "ab", "qc", "mb", "sk", "ns", "nb", "british", "columbia", "ontario", "alberta",
+                  "province", "street", "st", "ave", "avenue", "road", "rd", "drive", "dr", "blvd", "unit", "suite",
+                  "korea", "republic", "of", "south", "usa", "city"}
+
+def _xc_city_tokens(loc):
+    """주소에서 도시 이름 후보만 (번지·우편번호·도로명·주/나라 제거)"""
+    s = re.sub(r"\b[a-z]\d[a-z]\s?\d[a-z]\d\b", " ", (loc or "").lower())  # 캐나다 우편번호
+    toks = {t for t in re.findall(r"[a-z가-힣]+", s) if len(t) > 2 and t not in _XC_PLACE_STOP}
+    return toks
+
 def xc_analyze(data, today=None):
     """
     AI 추출 결과 → 주제별로 묶은 확인 사항.
@@ -2653,6 +2684,8 @@ def xc_analyze(data, today=None):
         for j in d.get("jobs") or []:
             jobs.append({"doc": d, "label": label(d), "short": short(d), "employer": j.get("employer") or "",
                          "g": gid(j.get("employer")), "title": j.get("job_title") or "",
+                         "title_std": j.get("job_title_standard") or j.get("job_title") or "",
+                         "docdate": xc_doc_date(d),
                          "location": j.get("location") or "",
                          "s": xc_parse_date(j.get("start"), j.get("start_raw")),
                          "e": xc_parse_date(j.get("end"), j.get("end_raw"))})
@@ -2735,7 +2768,8 @@ def xc_analyze(data, today=None):
                 if _xc_cmp(end, vt) == 1:
                     add(x, "e", "red", "퍼밋 만료 후")
                     kinds.append("퍼밋 기간과 안 맞음")
-                if pp.get("occupation") and x["title"] and not _xc_similar(pp["occupation"], x["title"], 0.34):
+                if pp.get("occupation") and x["title"] and not (_xc_similar(pp["occupation"], x["title_std"], 0.34)
+                                                                 or _xc_similar(pp["occupation"], x["title"], 0.34)):
                     add(x, "t", "yellow", "퍼밋 직업과 다름")
                     kinds.append("직책 다름")
                 if pp.get("location") and x["location"] and not _xc_same_place(pp["location"], x["location"]):
@@ -2759,27 +2793,61 @@ def xc_analyze(data, today=None):
                         kinds.append(f"클로즈 퍼밋({pm['p']['employer']}) 기간 중 다른 회사 근무")
                         checks.append(f"클로즈 퍼밋 기간({_xc_fmt(pm['vf'])} ~ {_xc_fmt(pm['vt'])}) 중 {comp} 근무 여부 확인 — 허가받지 않은 근무로 보일 수 있음")
 
-        # 서류끼리 비교
+        # 서류끼리 비교 — [수정] 년·월만 같으면 일치 (일자는 서류마다 적는 방식이 달라 비교하지 않음)
+        #                   다수와 다른 서류에만 표시, '재직중'은 그 서류 작성 시점 기준으로 판단
         for fld, ko in (("s", "시작일"), ("e", "종료일")):
-            vals = [x for x in items if x[fld]["date"] or x[fld]["present"]]
-            if len(vals) < 2:
-                continue
-            def same(a, b):
-                return (a["present"] == b["present"]) and (a["present"] or _xc_cmp(a, b) in (0, "same_month"))
-            differ = any(not same(vals[i][fld], vals[k][fld]) for i in range(len(vals)) for k in range(i + 1, len(vals)))
-            if not differ:
-                if any(x[fld]["prec"] == "month" for x in vals) and any(x[fld]["prec"] == "day" for x in vals):
-                    for x in vals:
-                        if x[fld]["prec"] == "month":
-                            add(x, fld, "yellow", "월까지만 적힘")
-                continue
-            kinds.append("서류마다 다름")
-            clean = [x for x in vals if not any(lv == "red" for lv, _ in marks[id(x)][fld])]
-            if len({_xc_fmt(x[fld]) for x in clean}) > 1:
-                for x in clean:
-                    add(x, fld, "red", "서로 다름")
-            checks.append(f"서류마다 {ko}이 다름 — 맞는 날짜로 통일 (" +
-                          ", ".join(f"{x['short']} {_xc_fmt(x[fld])}" for x in vals) + ")")
+            dated = [x for x in items if x[fld]["date"] and not x[fld]["invalid"]]
+            pres = [x for x in items if x[fld]["present"]]
+            if fld == "e":
+                # 작성한 달과 같은 달로 종료일이 적혀 있고 다른 서류엔 더 늦은 종료일이 있으면 → 작성 당시 재직중으로 봄
+                later = lambda x: any(_xc_ym(y["e"]) and _xc_ym(y["e"]) > _xc_ym(x["e"]) for y in dated if y is not x)
+                as_present = [x for x in dated if x["docdate"] and _xc_ym(x["e"]) == _xc_ym(x["docdate"]) and later(x)]
+                dated = [x for x in dated if x not in as_present]
+                pres = pres + as_present
+            by_ym = {}
+            for x in dated:
+                by_ym.setdefault(_xc_ym(x[fld]), []).append(x)
+            ref_yms = []
+            if len(by_ym) > 1:
+                kinds.append("서류마다 다름")
+                top = max(len(v) for v in by_ym.values())
+                majors = [ym for ym, v in by_ym.items() if len(v) == top]
+                if len(majors) == 1:
+                    ref = majors[0]; ref_yms = [ref]
+                    for ym, v in by_ym.items():
+                        if ym != ref:
+                            for x in v:
+                                add(x, fld, "red", "다른 서류와 다름")
+                    outs = [x for ym, v in by_ym.items() if ym != ref for x in v]
+                    checks.append(f"{ko}: " + ", ".join(f"{x['short']} {_xc_fmt(x[fld])}" for x in outs) +
+                                  f" ↔ 다른 서류 {ref[0]}.{ref[1]:02d} — 맞는 날짜 확인")
+                else:
+                    # 동률이면: 이미 다른 이유(미래 날짜·없는 날짜 등)로 틀린 값을 빼고 남은 값이 하나로 모이면 그것을 기준으로
+                    clean = [x for x in dated if not any(lv == "red" for lv, _ in marks[id(x)][fld])]
+                    clean_yms = {_xc_ym(x[fld]) for x in clean}
+                    if len(clean_yms) == 1:
+                        ref_yms = list(clean_yms)
+                    else:
+                        ref_yms = list(by_ym)
+                        for x in dated:
+                            add(x, fld, "red", "서로 다름")
+                    checks.append(f"서류마다 {ko}이 다름 — 맞는 날짜로 통일 (" +
+                                  ", ".join(f"{x['short']} {_xc_fmt(x[fld])}" for x in dated) + ")")
+            elif by_ym:
+                ref_yms = list(by_ym)
+            if fld == "e" and pres and ref_yms:
+                ref_end = max(ref_yms)
+                for x in pres:
+                    dd = _xc_ym(x["docdate"]) if x["docdate"] else None
+                    if dd is None:
+                        if x["e"]["present"]:
+                            add(x, "e", "yellow", "작성일 확인")
+                            checks.append(f"{x['short']}엔 재직중, 다른 서류엔 종료 {ref_end[0]}.{ref_end[1]:02d} — {x['short']} 작성 시점 확인")
+                    elif ref_end < dd:
+                        add(x, "e", "red", "작성일엔 이미 퇴사")
+                        kinds.append("서류마다 다름")
+                        checks.append(f"{x['short']}({dd[0]}.{dd[1]:02d} 작성)엔 재직중인데 다른 서류엔 {ref_end[0]}.{ref_end[1]:02d}에 종료 — 확인")
+
         # 종료일 관련 확인 문구 (미래·퍼밋 만료 후를 한 줄로)
         for x in items:
             rs = [r for lv, r in marks[id(x)]["e"] if r in ("미래 날짜", "퍼밋 만료 후")]
@@ -2791,20 +2859,43 @@ def xc_analyze(data, today=None):
                     why.append(f"퍼밋 만료 {_xc_fmt(perm['vt'])} 이후" if perm else "퍼밋 만료 후")
                 tip = "재직 중이면 Present로" if "미래 날짜" in rs else "연장 신청(Maintained status) 여부 확인"
                 checks.append(f"{x['short']} 종료일 {_xc_fmt(x['e'])} 오기인지 확인 ({', '.join(why)} · {tip})")
-        titles = [x for x in items if x["title"]]
-        if len(titles) > 1 and any(not _xc_similar(titles[0]["title"], t["title"]) for t in titles[1:]):
-            for x in titles:
-                add(x, "t", "yellow", "서류마다 다름")
+        # 직책: AI가 약어를 풀어 표준 직업명으로 바꾼 값으로 비교, 다수와 다른 것만 표시
+        def _majority_outliers(vals, same_fn):
+            buckets = []
+            for x, v in vals:
+                for b in buckets:
+                    if same_fn(b[0][1], v):
+                        b.append((x, v)); break
+                else:
+                    buckets.append([(x, v)])
+            if len(buckets) < 2:
+                return None, []
+            top = max(len(b) for b in buckets)
+            majors = [b for b in buckets if len(b) == top]
+            if len(majors) == 1:
+                return majors[0], [xv for b in buckets if b is not majors[0] for xv in b]
+            return None, [xv for b in buckets for xv in b]
+        tvals = [(x, x["title_std"]) for x in items if x["title_std"]]
+        major, outs = _majority_outliers(tvals, lambda a, b: _xc_similar(a, b, 0.5))
+        if outs:
             kinds.append("직책 다름")
-        locs = [x for x in items if x["location"]]
-        if len(locs) > 1 and any(not _xc_same_place(locs[0]["location"], l["location"]) for l in locs[1:]):
-            for x in locs:
-                add(x, "l", "yellow", "서류마다 다름")
+            for x, v in outs:
+                add(x, "t", "yellow", "다른 서류와 다름" if major else "서로 다름")
+            checks.append("직책: " + ", ".join(f"{x['short']} '{x['title']}'" for x, v in outs) +
+                          (f" ↔ 다른 서류 '{major[0][0]['title']}'" if major else "") + " — 같은 직업인지 확인")
+        # 근무지: 도시가 다를 때만 (주·나라만 적힌 것은 문제 아님)
+        lvals = [(x, _xc_city_tokens(x["location"])) for x in items if _xc_city_tokens(x["location"])]
+        major, outs = _majority_outliers(lvals, lambda a, b: bool(a & b))
+        if outs:
             kinds.append("근무지 다름")
-        if any(r for x in items for lv, r in marks[id(x)]["t"]):
-            checks.append("직책 표기 통일" + (f" · 퍼밋 직업({perm['p']['occupation']})과 같은 일인지 확인" if perm and perm["p"].get("occupation") else ""))
-        if any(r for x in items for lv, r in marks[id(x)]["l"]):
-            checks.append("근무지 확인" + (f" (퍼밋 근무지: {perm['p']['location']})" if perm and perm["p"].get("location") else ""))
+            for x, v in outs:
+                add(x, "l", "yellow", "다른 서류와 다름" if major else "서로 다름")
+            checks.append("근무지: " + ", ".join(f"{x['short']} '{x['location']}'" for x, v in outs) +
+                          (f" ↔ 다른 서류 '{major[0][0]['location']}'" if major else "") + " — 실제 근무 도시 확인")
+        if any(r == "퍼밋 직업과 다름" for x in items for lv, r in marks[id(x)]["t"]):
+            checks.append(f"퍼밋 직업({perm['p']['occupation']})과 같은 일인지 확인")
+        if any(r == "퍼밋 근무지와 다름" for x in items for lv, r in marks[id(x)]["l"]):
+            checks.append(f"퍼밋 근무지({perm['p']['location']})와 같은 곳인지 확인")
 
         has_issue = any(marks[id(x)][f] for x in items for f in marks[id(x)])
         if not has_issue and not notes:
