@@ -1083,6 +1083,24 @@ def normalize_qa_filename(filename):
     return f"{name}_QA_{code}" + (f"_{date}" if date else "") + ext
 
 
+UNKNOWN_NAME_RE = re.compile(r"^(unknown|unkown|client|name|n\s*/?\s*a|미상|이름\s*미상|이름없음)(?=[_.]|$)", re.I)
+
+def replace_unknown_name(filename, name):
+    """'Unknown_Travel History.pdf' → '홍길동_Travel History.pdf'"""
+    if not name:
+        return filename
+    return UNKNOWN_NAME_RE.sub(name.strip(), filename, count=1)
+
+def ensure_extension(filename, mime):
+    """확장자를 지웠으면 파일 형식에 맞게 다시 붙임."""
+    filename = (filename or "").strip() or "Document"
+    if re.search(r"\.(pdf|jpe?g|png|docx?)$", filename, re.I):
+        return filename
+    ext = {"application/pdf": ".pdf", "image/jpeg": ".jpg", "image/png": ".png",
+           "application/msword": ".doc"}.get(mime, ".docx" if "word" in (mime or "") else ".pdf")
+    return filename + ext
+
+
 # ==========================================
 # 5-0b. [메뉴 4] Word(.doc/.docx) → PDF 실제 변환
 # ==========================================
@@ -1125,14 +1143,58 @@ def word_to_pdf_bytes(file_bytes, file_name):
     except Exception:
         return None, "failed"
 
-def _docx_to_pdf_basic(file_bytes):
-    import html as _html
-    d = docx.Document(io.BytesIO(file_bytes))
-    parts = []
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+_R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_WP = "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}"
 
-    def runs_html(p):
+def _docx_images(element, part):
+    """요소 안의 그림들: [(이미지 bytes, 너비pt, 높이pt, 떠있는그림여부)]"""
+    out = []
+    for drawing in element.iter(_W + "drawing"):
+        blip = next(drawing.iter(_A + "blip"), None)
+        if blip is None:
+            continue
+        rid = blip.get(_R + "embed")
+        try:
+            blob = part.related_parts[rid].blob
+        except Exception:
+            continue
+        ext = next(drawing.iter(_WP + "extent"), None)
+        w = int(ext.get("cx")) / 12700 if ext is not None else 100
+        h = int(ext.get("cy")) / 12700 if ext is not None else 60
+        floating = next(drawing.iter(_WP + "anchor"), None) is not None
+        out.append((blob, w, h, floating))
+    return out
+
+def _docx_to_pdf_basic(file_bytes):
+    """
+    LibreOffice가 없을 때의 대체 변환.
+    문단·글머리표·굵게·표·본문 그림(서명 등) + 머리글(회사명·주소·로고)·바닥글을 살림.
+    """
+    import html as _html
+    from docx.text.paragraph import Paragraph as _Para
+    from docx.table import Table as _Table
+    d = docx.Document(io.BytesIO(file_bytes))
+    archive = fitz.Archive()
+    img_no = [0]
+
+    def add_img(blob, w, h):
+        img_no[0] += 1
+        name = f"img{img_no[0]}"
+        try:
+            pil = Image.open(io.BytesIO(blob)).convert("RGB")
+            b = io.BytesIO(); pil.save(b, format="PNG"); blob = b.getvalue()
+        except Exception:
+            pass
+        archive.add((blob, name + ".png"))
+        return f"<img src='{name}.png' width='{min(w, 468):.0f}' height='{h * min(1, 468 / max(w, 1)):.0f}'/>"
+
+    def para_html(p, part):
         out = ""
         for r in p.runs:
+            for blob, w, h, _fl in _docx_images(r._element, part):
+                out += add_img(blob, w, h)
             t = _html.escape(r.text)
             if not t:
                 continue
@@ -1145,32 +1207,53 @@ def _docx_to_pdf_basic(file_bytes):
             out += t
         return out or _html.escape(p.text)
 
-    body = d.element.body
-    for child in body.iterchildren():
+    parts = []
+    for child in d.element.body.iterchildren():
         tag = child.tag.split("}")[-1]
         if tag == "p":
-            p = docx.text.paragraph.Paragraph(child, d)
-            txt = runs_html(p)
+            p = _Para(child, d)
+            txt = para_html(p, d.part)
             style = (p.style.name or "").lower() if p.style is not None else ""
-            is_list = "list" in style or child.find(".//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}numPr") is not None
+            is_list = "list" in style or child.find(".//" + _W + "numPr") is not None
             align = {1: "center", 2: "right", 3: "justify"}.get(int(p.alignment) if p.alignment is not None else 0, "left")
             if is_list:
-                parts.append(f"<ul><li>{txt}</li></ul>")
+                if txt.strip():  # 빈 글머리표는 건너뜀
+                    parts.append(f"<ul><li>{txt}</li></ul>")
             elif style.startswith("heading"):
                 parts.append(f"<h3 style='text-align:{align}'>{txt}</h3>")
             else:
                 parts.append(f"<p style='text-align:{align}'>{txt or '&nbsp;'}</p>")
         elif tag == "tbl":
-            t = docx.table.Table(child, d)
+            t = _Table(child, d)
             rows = "".join("<tr>" + "".join(f"<td>{_html.escape(c.text)}</td>" for c in r.cells) + "</tr>" for r in t.rows)
             parts.append(f"<table border='1' cellspacing='0' cellpadding='3'>{rows}</table>")
-    html_doc = "".join(parts)
-    css = "* {font-family: sans-serif; font-size: 10.5pt;} p {margin: 0 0 6px 0;} ul {margin: 0 0 2px 0;} td {font-size: 9.5pt;}"
-    story = fitz.Story(html=html_doc, user_css=css)
+
+    # 머리글/바닥글 (모든 페이지 공통)
+    sec = d.sections[0]
+    head_lines, head_imgs, foot_lines = [], [], []
+    try:
+        hdr = sec.header
+        head_lines = [p.text.replace("\t", " ").strip() for p in hdr.paragraphs if p.text.strip()]
+        head_imgs = _docx_images(hdr._element, hdr.part)
+    except Exception:
+        pass
+    try:
+        ftr = sec.footer
+        foot_lines = [p.text.replace("\t", " ").strip() for p in ftr.paragraphs if p.text.strip()]
+    except Exception:
+        pass
+
+    mediabox = fitz.paper_rect("letter")
+    logo_h = max([min(h * min(1, 130 / max(w, 1)), 90) for _, w, h, _ in head_imgs] + [0])
+    head_h = max(len(head_lines) * 13, logo_h) + (14 if (head_lines or head_imgs) else 0)
+    foot_h = len(foot_lines) * 12 + (10 if foot_lines else 0)
+    where = fitz.Rect(54, 40 + head_h, mediabox.width - 54, mediabox.height - 40 - foot_h)
+
+    css = ("* {font-family: sans-serif; font-size: 10.5pt;} body {margin: 0; padding: 0;} "
+           "p {margin: 0 0 6px 0;} ul {margin: 0 0 2px 0;} td {font-size: 9.5pt;}")
+    story = fitz.Story(html="".join(parts), user_css=css, archive=archive)
     buf = io.BytesIO()
     writer = fitz.DocumentWriter(buf)
-    mediabox = fitz.paper_rect("letter")
-    where = mediabox + (54, 54, -54, -54)
     more = True
     while more:
         dev = writer.begin_page(mediabox)
@@ -1178,7 +1261,31 @@ def _docx_to_pdf_basic(file_bytes):
         story.draw(dev)
         writer.end_page()
     writer.close()
-    return buf.getvalue()
+
+    if not (head_lines or head_imgs or foot_lines):
+        return buf.getvalue()
+    out = fitz.open(stream=buf.getvalue(), filetype="pdf")
+    for page in out:
+        y = 40
+        for line in head_lines:
+            page.insert_text((54, y + 10), line, fontsize=10, fontname="helv")
+            y += 13
+        x_right = mediabox.width - 54
+        for blob, w, h, _fl in head_imgs[:2]:
+            scale = min(1, 130 / max(w, 1), 90 / max(h, 1))
+            iw, ih = w * scale, h * scale
+            try:
+                page.insert_image(fitz.Rect(x_right - iw, 36, x_right, 36 + ih), stream=blob)
+            except Exception:
+                pass
+            x_right -= iw + 8
+        fy = mediabox.height - 40 - foot_h + 14
+        for line in foot_lines:
+            page.insert_text((54, fy), line, fontsize=8.5, fontname="helv")
+            fy += 12
+    res = out.tobytes(deflate=True, garbage=3)
+    out.close()
+    return res
 
 
 # ==========================================
@@ -2805,6 +2912,7 @@ elif app_mode == MENU_4:
       accept_multiple_files=True,
       key=st.session_state.uploader_key,
   )
+  crm_default_name = ""
 
   if uploaded_files:
     if st.button(
@@ -2952,6 +3060,12 @@ elif app_mode == MENU_4:
           " 중입니다... (페이지가 많을수록 오래 걸립니다)"
       )
 
+      if crm_default_name:
+        missing_name_rule = ("Rule 1-B (Missing name): If a document does not show the client's name, use '"
+                             + crm_default_name + "' as the name. NEVER write 'Unknown'.")
+      else:
+        missing_name_rule = ("Rule 1-B (Missing name): If a document does not show any name, use the name found on the"
+                             " other uploaded documents of the same client. Only if no name is found anywhere, write 'Unknown'.")
       prompt = f"""
             You are an expert AI document classifier for a Canadian immigration firm.
             I am providing {len(global_pages)} pages of documents uploaded by a client. 
@@ -2976,6 +3090,7 @@ elif app_mode == MENU_4:
 
             [STRICT CRM MANUAL FILENAME RULES]
             Rule 1 (Name): Korean client -> Full Korean Name without spaces (e.g. 홍길동). Foreign client -> VERY FIRST WORD of English Given Name in Title Case (e.g. Richard, Pham).
+            {missing_name_rule}
             Rule 2 (Dates): MUST be YYYY.MM.DD (e.g. 2022.01.02). Use dots '.' as delimiters.
             Rule 3 (Delimiter): Underscore '_' between Name, Document Category, and Date/Company.
             Rule 4 (Date Range): Use hyphen '-' for ranges (e.g. 2022.04.22-2022.05.22).
@@ -3075,6 +3190,8 @@ elif app_mode == MENU_4:
         docs_info = []
         for d in raw_docs_info:
           d["suggested_filename"] = normalize_qa_filename(d.get("suggested_filename", ""))
+          if crm_default_name:
+            d["suggested_filename"] = replace_unknown_name(d["suggested_filename"], crm_default_name)
           c_name = d.get("client_name", "").strip()
           c_cat = d.get("doc_category", "").strip()
 
@@ -3380,7 +3497,10 @@ elif app_mode == MENU_4:
             "모든 서류의 묶기/분할 및 스마트 회전 최적화가 완료되었습니다."
         )
 
+      for r in results:
+        r["final_name"] = ensure_extension(r["suggested_filename"], r["mime"])
       st.session_state.analysis_results = results
+      st.session_state.crm_run_id = str(uuid.uuid4())[:8]  # 새 분석마다 파일명 입력칸 초기화
 
   if st.session_state.analysis_results:
     st.markdown("---")
@@ -3389,49 +3509,57 @@ elif app_mode == MENU_4:
       _run = st.session_state.get("gemini_last_run") or {}
       st.caption(f"AI 분석: {_run.get('model', '')} · {st.session_state['crm_ai_seconds']}초")
 
-    zip_buffer = io.BytesIO()
-    final_downloads = []
+    results_list = st.session_state.analysis_results
+    run_id = st.session_state.get("crm_run_id", "0")
 
-    for idx, item in enumerate(st.session_state.analysis_results):
+    st.info("✏️ 이름 수정이 필요한 경우, 파일명 칸을 수정한 뒤 **반드시 Enter**를 누르고 다운로드하세요. "
+            "(Enter를 누르지 않으면 이전 이름으로 다운로드됩니다)")
+
+    for idx, item in enumerate(results_list):
       col1, col2, col3 = st.columns([3, 3, 2])
+
+      # 파일명 칸 (새 분석마다 칸 초기화 → 이전 분석에서 고친 이름이 섞이지 않음)
+      edit_key = f"edit_{run_id}_{idx}"
+      if edit_key in st.session_state:
+        item["final_name"] = ensure_extension(st.session_state[edit_key], item["mime"])
+      is_unknown = bool(UNKNOWN_NAME_RE.match(item["final_name"]))
 
       with col1:
         st.write(f"**출처**: `{item['original_name']}`")
-        st.caption(
-            f"{item['orig_kb']:.1f} KB ➡️ **{item['comp_kb']:.1f} KB**"
-        )
-        if item.get("is_unclassified"):
+        st.caption(f"{item['orig_kb']:.1f} KB ➡️ **{item['comp_kb']:.1f} KB**")
+        if is_unknown:
+          st.warning("⚠️ 이름을 찾지 못했어요. 파일명을 수정한 뒤 Enter를 눌러주세요")
+        elif item.get("is_unclassified"):
           st.warning("⚠️ 규칙 미확인 서류 (파일명 수동 확인 필요)")
 
       with col2:
-        user_edited_name = st.text_input(
-            "파일명",
-            value=item["suggested_filename"],
-            key=f"edit_{idx}",
-            label_visibility="collapsed",
-        )
-        final_downloads.append(
-            (user_edited_name, item["bytes"], item["mime"])
-        )
+        st.text_input("파일명", value=item["final_name"], key=edit_key, label_visibility="collapsed")
 
       with col3:
         st.download_button(
             "⬇️ 개별 다운로드",
             data=item["bytes"],
-            file_name=user_edited_name,
+            file_name=item["final_name"],
             mime=item["mime"],
-            key=f"dl_btn_{idx}",
+            key=f"dl_btn_{run_id}_{idx}_{item['final_name']}",
         )
 
-    with zipfile.ZipFile(
-        zip_buffer, "w", zipfile.ZIP_DEFLATED
-    ) as zip_file:
-      for fname, fbytes, _ in final_downloads:
-        zip_file.writestr(fname, fbytes)
-
+    # ZIP: 지금 보이는 이름 그대로 (같은 이름은 (2), (3)을 붙여 덮어쓰기 방지)
+    zip_buffer = io.BytesIO()
+    used = {}
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+      for item in results_list:
+        fname = item["final_name"]
+        if fname in used:
+          used[fname] += 1
+          base, ext = os.path.splitext(fname)
+          fname = f"{base} ({used[item['final_name']]}){ext}"
+        else:
+          used[fname] = 1
+        zip_file.writestr(fname, item["bytes"])
     zip_buffer.seek(0)
-    today_str = datetime.date.today().strftime("%Y%m%d")
 
+    today_str = datetime.date.today().strftime("%Y%m%d")
     st.markdown("---")
     st.download_button(
         "📦 전체 서류 ZIP 다운로드",
@@ -3439,11 +3567,11 @@ elif app_mode == MENU_4:
         file_name=f"CRM_Documents_{today_str}.zip",
         mime="application/zip",
         type="primary",
-        use_container_width=True,
+        **_WIDE,
     )
 
     st.markdown("---")
-    if st.button("🔄 전체 리셋", type="secondary", use_container_width=True):
+    if st.button("🔄 전체 리셋", type="secondary", **_WIDE):
       for key in list(st.session_state.keys()):
         if key != "password_correct":
           del st.session_state[key]
