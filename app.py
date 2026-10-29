@@ -30,7 +30,9 @@ import pillow_heif  # HEIC 지원 라이브러리
 import streamlit as st
 
 # 📌 가장 먼저 실행되어야 하는 Streamlit 페이지 설정
-st.set_page_config(page_title="CanNest 통합 업무 시스템", layout="wide")
+# 개발(Demo)용 앱 이름 — 정식 배포용에서는 "[Demo] "만 지우면 됨
+APP_NAME = "[Demo] CanNest 통합 업무 시스템"
+st.set_page_config(page_title=APP_NAME, layout="wide")
 
 # DOCX 파싱 지원
 try:
@@ -76,7 +78,7 @@ def check_password():
       st.session_state["password_correct"] = False
 
   if "password_correct" not in st.session_state:
-    st.title("🔒 CanNest 통합 업무 시스템")
+    st.title(f"🔒 {APP_NAME}")
     st.text_input(
         "접속 비밀번호를 입력하세요",
         type="password",
@@ -85,7 +87,7 @@ def check_password():
     )
     return False
   elif not st.session_state["password_correct"]:
-    st.title("🔒 CanNest 통합 업무 시스템")
+    st.title(f"🔒 {APP_NAME}")
     st.text_input(
         "접속 비밀번호를 입력하세요",
         type="password",
@@ -2518,35 +2520,55 @@ def xc_company_key(name):
     s = _XC_SUFFIX.sub(" ", s)
     return re.sub(r"\s+", "", s)
 
+_XC_MONTHS = {m: i for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+
+def _xc_parse_text(t):
+    """글자로 된 날짜 해석 → (y, m, d, prec) 또는 None. 불가능한 값이면 'invalid'."""
+    t = (t or "").strip().lower()
+    if not t:
+        return None
+    m = re.search(r"(\d{4})\s*[.\-/년]\s*(\d{1,2})(?:\s*[.\-/월]\s*(\d{1,2}))?", t)
+    if m:
+        y, mo = int(m.group(1)), int(m.group(2))
+        d = int(m.group(3)) if m.group(3) else None
+        if not (1 <= mo <= 12) or (d is not None and not (1 <= d <= 31)):
+            return "invalid"
+        return (y, mo, d, "day" if d else "month")
+    m = re.search(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s*(\d{1,2})?(?:st|nd|rd|th)?,?\s*(\d{4})", t)
+    if m:
+        d = int(m.group(2)) if m.group(2) else None
+        return (int(m.group(3)), _XC_MONTHS[m.group(1)], d, "day" if d else "month")
+    m = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?,?\s*(\d{4})", t)
+    if m:
+        return (int(m.group(3)), _XC_MONTHS[m.group(2)], int(m.group(1)), "day")
+    m = re.fullmatch(r"\D*((?:19|20)\d{2})\D*", t)  # 연도만 (예: '2014')
+    if m:
+        return (int(m.group(1)), 1, None, "year")
+    return None
+
 def xc_parse_date(norm, raw=""):
-    """→ {'date': date|None, 'prec': 'day'|'month'|None, 'present': bool, 'invalid': bool, 'raw': str}"""
+    """→ {'date': date|None, 'prec': 'day'|'month'|'year'|None, 'present': bool, 'invalid': bool, 'raw': str}"""
     out = {"date": None, "prec": None, "present": False, "invalid": False, "raw": (raw or norm or "") if (raw or norm) else ""}
     txt = (norm or "").strip().lower()
     raw_l = (raw or "").strip().lower()
     if txt in ("present", "current", "now", "ongoing") or re.search(r"present|current|now|현재|재직", raw_l):
         out["present"] = True
         return out
-    # 서류에 적힌 숫자 날짜가 불가능한 값인지 먼저 검사 (AI가 고쳐서 돌려줘도 원본 기준으로 잡음)
-    m = re.search(r"(\d{4})\s*[.\-/년]\s*(\d{1,2})(?:\s*[.\-/월]\s*(\d{1,2}))?", raw or "")
-    if m:
-        y, mo = int(m.group(1)), int(m.group(2))
-        d = int(m.group(3)) if m.group(3) else None
-        if not (1 <= mo <= 12) or (d is not None and not (1 <= d <= 31)):
-            out["invalid"] = True
-            return out
-    m = re.match(r"^(\d{4})-(\d{1,2})(?:-(\d{1,2}))?$", txt)
-    if not m:
-        if raw and re.search(r"\d", raw) and not txt:
-            out["invalid"] = not bool(m)
-        return out
-    try:
-        y, mo = int(m.group(1)), int(m.group(2))
-        if m.group(3):
-            out["date"], out["prec"] = datetime.date(y, mo, int(m.group(3))), "day"
-        else:
-            out["date"], out["prec"] = datetime.date(y, mo, 1), "month"
-    except ValueError:
+    # 서류에 적힌 그대로(raw)를 먼저 해석 — AI가 '2024.50.20'을 고쳐서 돌려줘도 원본 기준으로 잡음
+    r = _xc_parse_text(raw) if raw else None
+    if r is None:
+        r = _xc_parse_text(norm)
+    if r == "invalid":
         out["invalid"] = True
+        return out
+    if r is None:
+        return out  # 날짜로 읽을 수 없음 (오류로 보지 않고 비교만 건너뜀)
+    y, mo, d, prec = r
+    try:
+        out["date"] = datetime.date(y, mo, d or 1)
+        out["prec"] = prec
+    except ValueError:
+        out["invalid"] = True  # 예: 2월 30일
     return out
 
 def _xc_fmt(p):
@@ -2558,15 +2580,23 @@ def _xc_fmt(p):
         return f"'{p['raw']}' (잘못된 날짜)"
     if p["date"] is None:
         return p["raw"] or "-"
-    return p["date"].strftime("%Y.%m.%d") if p["prec"] == "day" else p["date"].strftime("%Y.%m")
+    d = p["date"]
+    if p["prec"] == "year":
+        return str(d.year)
+    if p["prec"] == "month":
+        return f"{d.year}.{d.month:02d}"
+    return f"{d.year}.{d.month:02d}.{d.day:02d}"
 
 def _xc_cmp(a, b):
-    """두 날짜 비교: -1 a<b, 0 같음, 1 a>b, None 비교불가, 'same_month' 한쪽이 월까지만이고 같은 달"""
+    """두 날짜 비교: -1 a<b, 0 같음, 1 a>b, None 비교불가, 'same_month' 정밀도가 낮아 판단 불가(같은 달/같은 해)"""
     if not a or not b or a["date"] is None or b["date"] is None:
         return None
     if a["prec"] == "day" and b["prec"] == "day":
         return (a["date"] > b["date"]) - (a["date"] < b["date"])
-    ka, kb = (a["date"].year, a["date"].month), (b["date"].year, b["date"].month)
+    if "year" in (a["prec"], b["prec"]):
+        ka, kb = a["date"].year, b["date"].year
+    else:
+        ka, kb = (a["date"].year, a["date"].month), (b["date"].year, b["date"].month)
     if ka == kb:
         return "same_month"
     return (ka > kb) - (ka < kb)
@@ -2592,10 +2622,18 @@ def _xc_same_place(a, b):
         return True
     return bool(ta2 & tb2)
 
-def _xc_ym(p):
+def _xc_ym(p, level="month"):
+    """비교용 키: level='month' → (년, 월), 'year' → (년,)"""
     if not p or not p.get("date") or p.get("invalid"):
         return None
+    if level == "year":
+        return (p["date"].year,)
+    if p.get("prec") == "year":
+        return None
     return (p["date"].year, p["date"].month)
+
+def _xc_key_str(k):
+    return ".".join(f"{v:02d}" if i else str(v) for i, v in enumerate(k))
 
 def xc_doc_date(d):
     """서류 작성일: AI가 읽은 값 → 없으면 파일명의 날짜 (예: QA_WP_2025.12.pdf)"""
@@ -2798,15 +2836,18 @@ def xc_analyze(data, today=None):
         for fld, ko in (("s", "시작일"), ("e", "종료일")):
             dated = [x for x in items if x[fld]["date"] and not x[fld]["invalid"]]
             pres = [x for x in items if x[fld]["present"]]
+            # 한 서류라도 연도만 적혀 있으면 (이력서에 흔함) 연도끼리 비교
+            lvl = "year" if any(x[fld]["prec"] == "year" for x in dated) else "month"
+            ym = lambda p, _l=lvl: _xc_ym(p, _l)
             if fld == "e":
                 # 작성한 달과 같은 달로 종료일이 적혀 있고 다른 서류엔 더 늦은 종료일이 있으면 → 작성 당시 재직중으로 봄
-                later = lambda x: any(_xc_ym(y["e"]) and _xc_ym(y["e"]) > _xc_ym(x["e"]) for y in dated if y is not x)
-                as_present = [x for x in dated if x["docdate"] and _xc_ym(x["e"]) == _xc_ym(x["docdate"]) and later(x)]
+                later = lambda x: any(ym(y["e"]) and ym(x["e"]) and ym(y["e"]) > ym(x["e"]) for y in dated if y is not x)
+                as_present = [x for x in dated if lvl == "month" and x["docdate"] and _xc_ym(x["e"]) == _xc_ym(x["docdate"]) and later(x)]
                 dated = [x for x in dated if x not in as_present]
                 pres = pres + as_present
             by_ym = {}
             for x in dated:
-                by_ym.setdefault(_xc_ym(x[fld]), []).append(x)
+                by_ym.setdefault(ym(x[fld]), []).append(x)
             ref_yms = []
             if len(by_ym) > 1:
                 kinds.append("서류마다 다름")
@@ -2820,11 +2861,11 @@ def xc_analyze(data, today=None):
                                 add(x, fld, "red", "다른 서류와 다름")
                     outs = [x for ym, v in by_ym.items() if ym != ref for x in v]
                     checks.append(f"{ko}: " + ", ".join(f"{x['short']} {_xc_fmt(x[fld])}" for x in outs) +
-                                  f" ↔ 다른 서류 {ref[0]}.{ref[1]:02d} — 맞는 날짜 확인")
+                                  f" ↔ 다른 서류 {_xc_key_str(ref)} — 맞는 날짜 확인")
                 else:
                     # 동률이면: 이미 다른 이유(미래 날짜·없는 날짜 등)로 틀린 값을 빼고 남은 값이 하나로 모이면 그것을 기준으로
                     clean = [x for x in dated if not any(lv == "red" for lv, _ in marks[id(x)][fld])]
-                    clean_yms = {_xc_ym(x[fld]) for x in clean}
+                    clean_yms = {ym(x[fld]) for x in clean}
                     if len(clean_yms) == 1:
                         ref_yms = list(clean_yms)
                     else:
@@ -2838,15 +2879,15 @@ def xc_analyze(data, today=None):
             if fld == "e" and pres and ref_yms:
                 ref_end = max(ref_yms)
                 for x in pres:
-                    dd = _xc_ym(x["docdate"]) if x["docdate"] else None
+                    dd = _xc_ym(x["docdate"], lvl) if x["docdate"] else None
                     if dd is None:
                         if x["e"]["present"]:
                             add(x, "e", "yellow", "작성일 확인")
-                            checks.append(f"{x['short']}엔 재직중, 다른 서류엔 종료 {ref_end[0]}.{ref_end[1]:02d} — {x['short']} 작성 시점 확인")
+                            checks.append(f"{x['short']}엔 재직중, 다른 서류엔 종료 {_xc_key_str(ref_end)} — {x['short']} 작성 시점 확인")
                     elif ref_end < dd:
                         add(x, "e", "red", "작성일엔 이미 퇴사")
                         kinds.append("서류마다 다름")
-                        checks.append(f"{x['short']}({dd[0]}.{dd[1]:02d} 작성)엔 재직중인데 다른 서류엔 {ref_end[0]}.{ref_end[1]:02d}에 종료 — 확인")
+                        checks.append(f"{x['short']}({_xc_key_str(dd)} 작성)엔 재직중인데 다른 서류엔 {_xc_key_str(ref_end)}에 종료 — 확인")
 
         # 종료일 관련 확인 문구 (미래·퍼밋 만료 후를 한 줄로)
         for x in items:
