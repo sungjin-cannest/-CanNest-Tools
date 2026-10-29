@@ -2601,16 +2601,31 @@ def _xc_cmp(a, b):
         return "same_month"
     return (ka > kb) - (ka < kb)
 
+_XC_WORD_STOP = {"and", "or", "of", "the", "en", "de", "du", "des", "et", "la", "le", "les", "in", "at", "for"}
+
+def _xc_stem(t):
+    # 복수형 정리 (providers → provider, educators → educator)
+    if len(t) > 4 and t.endswith("ies"):
+        return t[:-3] + "y"
+    if len(t) > 3 and t.endswith("s") and not t.endswith("ss"):
+        return t[:-1]
+    return t
+
 def _xc_tokens(s):
-    return {t for t in re.findall(r"[a-z0-9가-힣]+", (s or "").lower()) if len(t) > 1}
+    return {_xc_stem(t) for t in re.findall(r"[a-z0-9가-힣]+", (s or "").lower()) if len(t) > 1 and t not in _XC_WORD_STOP}
 
 def _xc_similar(a, b, th=0.5):
-    ta, tb = _xc_tokens(a), _xc_tokens(b)
-    if not ta or not tb:
-        return True  # 한쪽이 비어 있으면 비교하지 않음
-    if ta <= tb or tb <= ta:
-        return True
-    return len(ta & tb) / len(ta | tb) >= th
+    """직책 등 비교. 영어/프랑스어 병기('A / B')는 각각 비교, 짧은 쪽 단어가 대부분 겹치면 같다고 봄."""
+    pa = [x for x in re.split(r"\s+/\s+", a or "") if x.strip()] or [a or ""]
+    pb = [x for x in re.split(r"\s+/\s+", b or "") if x.strip()] or [b or ""]
+    for xa in pa:
+        for xb in pb:
+            ta, tb = _xc_tokens(xa), _xc_tokens(xb)
+            if not ta or not tb:
+                return True  # 한쪽이 비어 있으면 비교하지 않음
+            if len(ta & tb) / min(len(ta), len(tb)) >= max(th, 0.6):
+                return True
+    return False
 
 def _xc_same_place(a, b):
     ta, tb = _xc_tokens(a), _xc_tokens(b)
@@ -2799,11 +2814,17 @@ def xc_analyze(data, today=None):
                     add(x, "s", "red", "퍼밋 시작 전")
                     checks.append(f"실제 근무 시작일 확인 — {x['short']}에 {_xc_fmt(x['s'])}로 적힘 (퍼밋 시작 {_xc_fmt(vf)} 이전에 근무했는지)")
                     kinds.append("퍼밋 기간과 안 맞음")
-                elif cs == "same_month":
-                    add(x, "s", "yellow", "일자 확인")
-                    checks.append(f"{x['short']} 시작일 일자 확인 (퍼밋 시작 {_xc_fmt(vf)}와 같은 달)")
-                end = today_p if x["e"]["present"] else x["e"]
-                if _xc_cmp(end, vt) == 1:
+                # (같은 달이면 일치로 봄 — 년·월 기준)
+                if x["e"]["present"]:
+                    # '재직중'은 그 서류를 쓴 시점 기준 → 작성일이 퍼밋 만료 후일 때만 문제
+                    if x["docdate"] and _xc_cmp(x["docdate"], vt) == 1:
+                        add(x, "e", "red", "작성일 기준 퍼밋 만료 후 재직")
+                        kinds.append("퍼밋 기간과 안 맞음")
+                        checks.append(f"{x['short']}({_xc_fmt(x['docdate'])} 작성)에 재직중으로 적혀 있는데 퍼밋은 {_xc_fmt(vt)} 만료 — 연장 신청(Maintained status) 여부 확인")
+                    elif not x["docdate"] and _xc_cmp(today_p, vt) == 1:
+                        add(x, "e", "yellow", "퍼밋 만료일 지남")
+                        checks.append(f"{x['short']}엔 재직중으로 적혀 있음 — 퍼밋이 {_xc_fmt(vt)}에 만료됐으니 연장 신청 여부 확인 (서류 작성일 미확인)")
+                elif _xc_cmp(x["e"], vt) == 1:
                     add(x, "e", "red", "퍼밋 만료 후")
                     kinds.append("퍼밋 기간과 안 맞음")
                 if pp.get("occupation") and x["title"] and not (_xc_similar(pp["occupation"], x["title_std"], 0.34)
