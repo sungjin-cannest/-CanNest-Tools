@@ -30,8 +30,8 @@ import pillow_heif  # HEIC 지원 라이브러리
 import streamlit as st
 
 # 📌 가장 먼저 실행되어야 하는 Streamlit 페이지 설정
-# 개발(Demo)용 앱 이름 — 정식 배포용에서는 "[Demo] "만 지우면 됨
-APP_NAME = "[Demo] CanNest 통합 업무 시스템"
+# 앱 이름 (브라우저 탭·로그인 화면)
+APP_NAME = "CanNest 통합 업무 시스템"
 st.set_page_config(page_title=APP_NAME, layout="wide")
 
 # DOCX 파싱 지원
