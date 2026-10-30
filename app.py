@@ -30,7 +30,9 @@ import pillow_heif  # HEIC 지원 라이브러리
 import streamlit as st
 
 # 📌 가장 먼저 실행되어야 하는 Streamlit 페이지 설정
-st.set_page_config(page_title="CanNest 통합 업무 시스템", layout="wide")
+# 개발(Demo)용 앱 이름 — 정식 배포용에서는 "[Demo] "만 지우면 됨
+APP_NAME = "[Demo] CanNest 통합 업무 시스템"
+st.set_page_config(page_title=APP_NAME, layout="wide")
 
 # DOCX 파싱 지원
 try:
@@ -76,7 +78,7 @@ def check_password():
       st.session_state["password_correct"] = False
 
   if "password_correct" not in st.session_state:
-    st.title("🔒 CanNest 통합 업무 시스템")
+    st.title(f"🔒 {APP_NAME}")
     st.text_input(
         "접속 비밀번호를 입력하세요",
         type="password",
@@ -85,7 +87,7 @@ def check_password():
     )
     return False
   elif not st.session_state["password_correct"]:
-    st.title("🔒 CanNest 통합 업무 시스템")
+    st.title(f"🔒 {APP_NAME}")
     st.text_input(
         "접속 비밀번호를 입력하세요",
         type="password",
@@ -202,10 +204,9 @@ def _call_model(model_name, contents, json_mode, thinking_level):
 
 def safe_generate_content(contents, json_mode=False, thinking=None):
     """
-    모든 메뉴 공통 AI 호출.
-    - thinking: None이면 모델 기본값 (메뉴 1~4), "low"면 빠르게 (메뉴 5)
+    모든 메뉴 공통 AI 호출. 모델 폴백 + 일시적 오류(429/500/503) 재시도. 걸린 시간과 모델을 session_state에 기록.
+    - thinking: None이면 모델 기본값, "low"면 빠르게
     """
-    """모델 폴백 + 일시적 오류(429/500/503) 재시도. 걸린 시간과 모델을 session_state에 기록."""
     contents = _clean_contents(contents)
     last_error = None
     # 지난번에 성공한 모델을 먼저 시도 → 매번 종료된 모델부터 두드리지 않음
@@ -249,6 +250,10 @@ def safe_generate_content(contents, json_mode=False, thinking=None):
                     break  # 다음 모델로
                 if any(k in msg for k in ["429", "500", "503", "unavailable", "overloaded", "deadline", "resource exhausted"]):
                     attempt += 1
+                    try:  # 왜 오래 걸리는지 화면에 알려줌
+                        st.toast(f"AI 서버가 바빠서 다시 시도 중입니다… ({attempt}/3, {model_name})")
+                    except Exception:
+                        pass
                     time.sleep(2 * attempt)
                     continue  # 같은 모델 재시도
                 raise
@@ -1080,6 +1085,254 @@ def normalize_qa_filename(filename):
     return f"{name}_QA_{code}" + (f"_{date}" if date else "") + ext
 
 
+# 본문에 이 문구가 있으면 AI 판단과 관계없이 해당 서류명으로 고정 (위에서부터 우선)
+CONTENT_FILENAME_RULES = [
+    ("Submission Confirmation Letter",
+     re.compile(r"IMM\s*5988|confirms\s+that\s+your\s+application\s+has\s+been\s+received"
+                r"|authori[sz]ed\s+to\s+continue\s+(working|studying).{0,120}until\s+a\s+decision", re.I | re.S)),
+]
+
+def crm_pages_text(global_pages, page_indices, max_chars=6000):
+    """묶인 페이지들의 글자 (PDF 텍스트 / Word 본문). 스캔본은 글자가 없으므로 빈 문자열."""
+    out, cache = [], {}
+    for p in global_pages:
+        if p["global_idx"] not in page_indices:
+            continue
+        try:
+            if "pdf" in p["mime_type"].lower():
+                key = id(p["file_bytes"])
+                if key not in cache:
+                    cache[key] = fitz.open(stream=p["file_bytes"], filetype="pdf")
+                out.append(cache[key].load_page(p["pdf_page_idx"]).get_text("text"))
+            elif p.get("word_text"):
+                out.append(p["word_text"])
+        except Exception:
+            pass
+        if sum(len(x) for x in out) > max_chars:
+            break
+    for d in cache.values():
+        d.close()
+    return "\n".join(out)[:max_chars]
+
+def fix_filename_by_content(filename, text):
+    """'정미_WP_2026.12.11.pdf' + (IMM 5988 본문) → '정미_Submission Confirmation Letter.pdf'"""
+    if not filename or not text:
+        return filename
+    for doc_name, pat in CONTENT_FILENAME_RULES:
+        if pat.search(text):
+            if doc_name.lower() in filename.lower():
+                return filename
+            name = filename.split("_")[0].strip()
+            ext = os.path.splitext(filename)[1] if re.search(r"\.(pdf|jpe?g|png|docx?)$", filename, re.I) else ""
+            return f"{name}_{doc_name}{ext}"
+    return filename
+
+
+UNKNOWN_NAME_RE = re.compile(r"^(unknown|unkown|client|name|n\s*/?\s*a|미상|이름\s*미상|이름없음)(?=[_.]|$)", re.I)
+
+def replace_unknown_name(filename, name):
+    """'Unknown_Travel History.pdf' → '홍길동_Travel History.pdf'"""
+    if not name:
+        return filename
+    return UNKNOWN_NAME_RE.sub(name.strip(), filename, count=1)
+
+def ensure_extension(filename, mime):
+    """확장자를 지웠으면 파일 형식에 맞게 다시 붙임."""
+    filename = (filename or "").strip() or "Document"
+    if re.search(r"\.(pdf|jpe?g|png|docx?)$", filename, re.I):
+        return filename
+    ext = {"application/pdf": ".pdf", "image/jpeg": ".jpg", "image/png": ".png",
+           "application/msword": ".doc"}.get(mime, ".docx" if "word" in (mime or "") else ".pdf")
+    return filename + ext
+
+
+# ==========================================
+# 5-0b. [메뉴 4] Word(.doc/.docx) → PDF 실제 변환
+# ==========================================
+# [수정] 기존에는 Word의 글자만 뽑아 빈 페이지 왼쪽 위에 찍어서, 서식·로고·줄바꿈이 사라지고
+# 긴 줄은 오른쪽이 잘렸음 → LibreOffice로 원본 모양 그대로 PDF 변환.
+# (Streamlit Cloud에서는 packages.txt에 libreoffice-writer 가 있어야 함. 없으면 아래 대체 방식 사용)
+import shutil
+import subprocess
+import tempfile
+
+def _find_soffice():
+    return shutil.which("soffice") or shutil.which("libreoffice")
+
+@st.cache_data(show_spinner=False, max_entries=50)
+def word_to_pdf_bytes(file_bytes, file_name):
+    """Word → PDF. 반환: (pdf_bytes 또는 None, 방식 'libreoffice' | 'basic')"""
+    soffice = _find_soffice()
+    if soffice:
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                ext = os.path.splitext(file_name)[1].lower() or ".docx"
+                src = os.path.join(tmp, "input" + ext)
+                with open(src, "wb") as f:
+                    f.write(file_bytes)
+                profile = "file://" + os.path.join(tmp, "lo_profile")  # 동시 실행 시 프로필 잠김 방지
+                subprocess.run(
+                    [soffice, f"-env:UserInstallation={profile}", "--headless", "--norestore",
+                     "--convert-to", "pdf", "--outdir", tmp, src],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120,
+                    env={**os.environ, "HOME": tmp})
+                out = os.path.join(tmp, "input.pdf")
+                if os.path.exists(out) and os.path.getsize(out) > 0:
+                    with open(out, "rb") as f:
+                        return f.read(), "libreoffice"
+        except Exception:
+            pass
+    # 대체 방식: 문단·글머리표·굵게·표를 살려 자동 줄바꿈되는 PDF로 (로고 등 그림은 빠짐)
+    try:
+        return _docx_to_pdf_basic(file_bytes), "basic"
+    except Exception:
+        return None, "failed"
+
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+_R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_WP = "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}"
+
+def _docx_images(element, part):
+    """요소 안의 그림들: [(이미지 bytes, 너비pt, 높이pt, 떠있는그림여부)]"""
+    out = []
+    for drawing in element.iter(_W + "drawing"):
+        blip = next(drawing.iter(_A + "blip"), None)
+        if blip is None:
+            continue
+        rid = blip.get(_R + "embed")
+        try:
+            blob = part.related_parts[rid].blob
+        except Exception:
+            continue
+        ext = next(drawing.iter(_WP + "extent"), None)
+        w = int(ext.get("cx")) / 12700 if ext is not None else 100
+        h = int(ext.get("cy")) / 12700 if ext is not None else 60
+        floating = next(drawing.iter(_WP + "anchor"), None) is not None
+        out.append((blob, w, h, floating))
+    return out
+
+def _docx_to_pdf_basic(file_bytes):
+    """
+    LibreOffice가 없을 때의 대체 변환.
+    문단·글머리표·굵게·표·본문 그림(서명 등) + 머리글(회사명·주소·로고)·바닥글을 살림.
+    """
+    import html as _html
+    from docx.text.paragraph import Paragraph as _Para
+    from docx.table import Table as _Table
+    d = docx.Document(io.BytesIO(file_bytes))
+    archive = fitz.Archive()
+    img_no = [0]
+
+    def add_img(blob, w, h):
+        img_no[0] += 1
+        name = f"img{img_no[0]}"
+        try:
+            pil = Image.open(io.BytesIO(blob)).convert("RGB")
+            b = io.BytesIO(); pil.save(b, format="PNG"); blob = b.getvalue()
+        except Exception:
+            pass
+        archive.add((blob, name + ".png"))
+        return f"<img src='{name}.png' width='{min(w, 468):.0f}' height='{h * min(1, 468 / max(w, 1)):.0f}'/>"
+
+    def para_html(p, part):
+        out = ""
+        for r in p.runs:
+            for blob, w, h, _fl in _docx_images(r._element, part):
+                out += add_img(blob, w, h)
+            t = _html.escape(r.text)
+            if not t:
+                continue
+            if r.bold:
+                t = f"<b>{t}</b>"
+            if r.italic:
+                t = f"<i>{t}</i>"
+            if r.underline:
+                t = f"<u>{t}</u>"
+            out += t
+        return out or _html.escape(p.text)
+
+    parts = []
+    for child in d.element.body.iterchildren():
+        tag = child.tag.split("}")[-1]
+        if tag == "p":
+            p = _Para(child, d)
+            txt = para_html(p, d.part)
+            style = (p.style.name or "").lower() if p.style is not None else ""
+            is_list = "list" in style or child.find(".//" + _W + "numPr") is not None
+            align = {1: "center", 2: "right", 3: "justify"}.get(int(p.alignment) if p.alignment is not None else 0, "left")
+            if is_list:
+                if txt.strip():  # 빈 글머리표는 건너뜀
+                    parts.append(f"<ul><li>{txt}</li></ul>")
+            elif style.startswith("heading"):
+                parts.append(f"<h3 style='text-align:{align}'>{txt}</h3>")
+            else:
+                parts.append(f"<p style='text-align:{align}'>{txt or '&nbsp;'}</p>")
+        elif tag == "tbl":
+            t = _Table(child, d)
+            rows = "".join("<tr>" + "".join(f"<td>{_html.escape(c.text)}</td>" for c in r.cells) + "</tr>" for r in t.rows)
+            parts.append(f"<table border='1' cellspacing='0' cellpadding='3'>{rows}</table>")
+
+    # 머리글/바닥글 (모든 페이지 공통)
+    sec = d.sections[0]
+    head_lines, head_imgs, foot_lines = [], [], []
+    try:
+        hdr = sec.header
+        head_lines = [p.text.replace("\t", " ").strip() for p in hdr.paragraphs if p.text.strip()]
+        head_imgs = _docx_images(hdr._element, hdr.part)
+    except Exception:
+        pass
+    try:
+        ftr = sec.footer
+        foot_lines = [p.text.replace("\t", " ").strip() for p in ftr.paragraphs if p.text.strip()]
+    except Exception:
+        pass
+
+    mediabox = fitz.paper_rect("letter")
+    logo_h = max([min(h * min(1, 130 / max(w, 1)), 90) for _, w, h, _ in head_imgs] + [0])
+    head_h = max(len(head_lines) * 13, logo_h) + (14 if (head_lines or head_imgs) else 0)
+    foot_h = len(foot_lines) * 12 + (10 if foot_lines else 0)
+    where = fitz.Rect(54, 40 + head_h, mediabox.width - 54, mediabox.height - 40 - foot_h)
+
+    css = ("* {font-family: sans-serif; font-size: 10.5pt;} body {margin: 0; padding: 0;} "
+           "p {margin: 0 0 6px 0;} ul {margin: 0 0 2px 0;} td {font-size: 9.5pt;}")
+    story = fitz.Story(html="".join(parts), user_css=css, archive=archive)
+    buf = io.BytesIO()
+    writer = fitz.DocumentWriter(buf)
+    more = True
+    while more:
+        dev = writer.begin_page(mediabox)
+        more, _ = story.place(where)
+        story.draw(dev)
+        writer.end_page()
+    writer.close()
+
+    if not (head_lines or head_imgs or foot_lines):
+        return buf.getvalue()
+    out = fitz.open(stream=buf.getvalue(), filetype="pdf")
+    for page in out:
+        y = 40
+        for line in head_lines:
+            page.insert_text((54, y + 10), line, fontsize=10, fontname="helv")
+            y += 13
+        x_right = mediabox.width - 54
+        for blob, w, h, _fl in head_imgs[:2]:
+            scale = min(1, 130 / max(w, 1), 90 / max(h, 1))
+            iw, ih = w * scale, h * scale
+            try:
+                page.insert_image(fitz.Rect(x_right - iw, 36, x_right, 36 + ih), stream=blob)
+            except Exception:
+                pass
+            x_right -= iw + 8
+        fy = mediabox.height - 40 - foot_h + 14
+        for line in foot_lines:
+            page.insert_text((54, fy), line, fontsize=8.5, fontname="helv")
+            fy += 12
+    res = out.tobytes(deflate=True, garbage=3)
+    out.close()
+    return res
+
+
 # ==========================================
 # 5-1. [메뉴 4] 페이지 수 제한 완화 도우미
 # ==========================================
@@ -1087,6 +1340,8 @@ def normalize_qa_filename(filename):
 # 모든 페이지를 AI에 '한 번에' 보내야 서류 묶기(여권+스탬프, 은행내역 여러 장 등)가 정확하므로
 # 요청을 나누지 않고, 장수가 많을수록 미리보기 이미지를 작게 만들어 요청 용량 한도 안에 맞춤.
 CRM_MAX_PAGES = 200
+# AI '생각 단계' 길이: "low" = 빠름. 분류·회전 정확도가 떨어진다 싶으면 None(모델 기본값, 느림)으로 바꾸세요.
+CRM_THINKING_LEVEL = "low"
 CRM_PAYLOAD_LIMIT = 15 * 1024 * 1024  # AI 요청 한 번의 이미지 총량 목표 (한도 약 20MB보다 여유 있게)
 
 def count_total_pages(files):
@@ -2182,6 +2437,679 @@ def files_signature(files):
     return h.hexdigest()
 
 
+
+# ==========================================
+# 5-3. [메뉴 6] 서류 정보 일치 확인 엔진
+# ==========================================
+# 구조: AI는 서류마다 '적힌 그대로' 정보만 뽑고 → 비교·판단은 아래 규칙(코드)이 함.
+# (날짜 비교를 AI에게 맡기면 놓치거나 틀릴 수 있어서)
+
+XC_DOC_TYPES_KO = {
+    "questionnaire": "질문지", "resume": "이력서", "employment_letter": "재직/경력증명서",
+    "job_offer": "Job Offer", "work_permit": "워크퍼밋", "study_permit": "학생비자",
+    "visitor_record": "Visitor Record", "passport": "여권", "lmia": "LMIA", "other": "기타 서류",
+}
+
+XC_PROMPT = """
+You are a meticulous Canadian immigration case reviewer. Several documents of ONE client are attached
+(each starts with a header like '--- [Document: FILE NAME] ---').
+Your ONLY job is to EXTRACT facts exactly as written. Do NOT judge, fix, or compare anything.
+
+Return ONLY this JSON:
+{
+ "documents": [
+  {
+   "file": "<exact FILE NAME from the header>",
+   "doc_type": "questionnaire | resume | employment_letter | job_offer | work_permit | study_permit | visitor_record | passport | lmia | other",
+   "person_name": "<full name of the person this document is about, as written>",
+   "dob": "YYYY-MM-DD or null",
+   "passport_no": "<as written or null>",
+   "doc_date": "<date this document was written / signed / issued, YYYY-MM-DD or YYYY-MM, or null>",
+   "permit": null OR {
+       "permit_type": "Work Permit | Study Permit | Visitor Record | ...",
+       "is_closed": true if the permit names a specific employer (employer-specific / closed), false if 'open', null if unknown,
+       "employer": "<employer name exactly as printed on the permit>",
+       "occupation": "<occupation as printed>",
+       "location": "<work location as printed>",
+       "valid_from_raw": "<date text exactly as written>", "valid_from": "YYYY-MM-DD or null",
+       "valid_to_raw": "<date text exactly as written>", "valid_to": "YYYY-MM-DD or null",
+       "permit_no": "<as written>"
+   },
+   "permits_mentioned": [ {"permit_type": "", "employer": "", "valid_from_raw": "", "valid_from": "", "valid_to_raw": "", "valid_to": ""} ],
+   "jobs": [
+     {"employer": "<company name exactly as written in THIS document>",
+      "job_title": "<as written>",
+      "job_title_standard": "<standard English occupation name: expand abbreviations (ECE -> Early Childhood Educator, IT -> Infant Toddler), drop seniority words (Main/Lead/Senior/Head/Assistant) when it is the same occupation>",
+      "location": "<city/address as written>",
+      "start_raw": "<exactly as written>", "start": "YYYY-MM-DD or YYYY-MM or null",
+      "end_raw": "<exactly as written>", "end": "YYYY-MM-DD or YYYY-MM or 'present' or null"}
+   ]
+  }
+ ],
+ "companies": [
+   {"names": ["<name 1 as written>", "<name 2 as written>"],
+    "status": "confirmed | assumed",
+    "evidence": "<short reason in Korean>"}
+ ]
+}
+
+RULES:
+1. Copy every *_raw value EXACTLY as written, even if it looks wrong (e.g. '2024.50.20'). In the normalized field put null if the
+   written date is impossible (month > 12, day > 31). NEVER silently correct a date.
+2. "jobs": list EVERY employment record of the main person found in the document (resume, questionnaire work-history table,
+   employment letter, job offer). One entry per row/position. Ongoing job → end = "present".
+   Do NOT include jobs of family members (spouse, parents) from a questionnaire.
+3. "permit": only for an actual permit document (IMM 1442 etc.). For other documents that merely state permit details
+   (e.g. a questionnaire saying 'current work permit valid until ...'), use "permits_mentioned".
+4. "companies": group the different spellings/names that refer to the SAME company across all documents
+   (legal name vs operating/trade name, abbreviations, 'Ltd.' vs 'Limited').
+   - status "confirmed" ONLY if a document itself shows the link (e.g. '12345 Ltd. dba CanNest', 'operating as',
+     a letterhead/job offer/LMIA showing both names together). Put that proof in "evidence".
+   - status "assumed" if there is no written proof but it is very likely the same employer (e.g. the permit employer and the
+     resume employer for the same period/role). Explain in "evidence".
+   - Include every company that appears, even alone (names with one entry).
+5. Dates in the normalized fields must be ISO (YYYY-MM-DD, or YYYY-MM when only month is written).
+"""
+
+_XC_SUFFIX = re.compile(r"\b(ltd|limited|inc|incorporated|corp|corporation|co|company|llc|ltee|lt[eé]e|group|the)\b", re.I)
+
+def xc_company_key(name):
+    s = (name or "").lower().replace("&", " and ")
+    s = re.sub(r"\b(dba|o/a|operating as|doing business as)\b.*$", "", s)
+    s = re.sub(r"[^\w\s]", " ", s)
+    s = _XC_SUFFIX.sub(" ", s)
+    return re.sub(r"\s+", "", s)
+
+_XC_MONTHS = {m: i for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+
+def _xc_parse_text(t):
+    """글자로 된 날짜 해석 → (y, m, d, prec) 또는 None. 불가능한 값이면 'invalid'."""
+    t = (t or "").strip().lower()
+    if not t:
+        return None
+    m = re.search(r"(\d{4})\s*[.\-/년]\s*(\d{1,2})(?:\s*[.\-/월]\s*(\d{1,2}))?", t)
+    if m:
+        y, mo = int(m.group(1)), int(m.group(2))
+        d = int(m.group(3)) if m.group(3) else None
+        if not (1 <= mo <= 12) or (d is not None and not (1 <= d <= 31)):
+            return "invalid"
+        return (y, mo, d, "day" if d else "month")
+    m = re.search(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s*(\d{1,2})?(?:st|nd|rd|th)?,?\s*(\d{4})", t)
+    if m:
+        d = int(m.group(2)) if m.group(2) else None
+        return (int(m.group(3)), _XC_MONTHS[m.group(1)], d, "day" if d else "month")
+    m = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?,?\s*(\d{4})", t)
+    if m:
+        return (int(m.group(3)), _XC_MONTHS[m.group(2)], int(m.group(1)), "day")
+    m = re.fullmatch(r"\D*((?:19|20)\d{2})\D*", t)  # 연도만 (예: '2014')
+    if m:
+        return (int(m.group(1)), 1, None, "year")
+    return None
+
+def xc_parse_date(norm, raw=""):
+    """→ {'date': date|None, 'prec': 'day'|'month'|'year'|None, 'present': bool, 'invalid': bool, 'raw': str}"""
+    out = {"date": None, "prec": None, "present": False, "invalid": False, "raw": (raw or norm or "") if (raw or norm) else ""}
+    txt = (norm or "").strip().lower()
+    raw_l = (raw or "").strip().lower()
+    if txt in ("present", "current", "now", "ongoing") or re.search(r"present|current|now|현재|재직", raw_l):
+        out["present"] = True
+        return out
+    # 서류에 적힌 그대로(raw)를 먼저 해석 — AI가 '2024.50.20'을 고쳐서 돌려줘도 원본 기준으로 잡음
+    r = _xc_parse_text(raw) if raw else None
+    if r is None:
+        r = _xc_parse_text(norm)
+    if r == "invalid":
+        out["invalid"] = True
+        return out
+    if r is None:
+        return out  # 날짜로 읽을 수 없음 (오류로 보지 않고 비교만 건너뜀)
+    y, mo, d, prec = r
+    try:
+        out["date"] = datetime.date(y, mo, d or 1)
+        out["prec"] = prec
+    except ValueError:
+        out["invalid"] = True  # 예: 2월 30일
+    return out
+
+def _xc_fmt(p):
+    if p is None:
+        return "-"
+    if p["present"]:
+        return "현재(재직중)"
+    if p["invalid"]:
+        return f"'{p['raw']}' (잘못된 날짜)"
+    if p["date"] is None:
+        return p["raw"] or "-"
+    d = p["date"]
+    if p["prec"] == "year":
+        return str(d.year)
+    if p["prec"] == "month":
+        return f"{d.year}.{d.month:02d}"
+    return f"{d.year}.{d.month:02d}.{d.day:02d}"
+
+def _xc_cmp(a, b):
+    """두 날짜 비교: -1 a<b, 0 같음, 1 a>b, None 비교불가, 'same_month' 정밀도가 낮아 판단 불가(같은 달/같은 해)"""
+    if not a or not b or a["date"] is None or b["date"] is None:
+        return None
+    if a["prec"] == "day" and b["prec"] == "day":
+        return (a["date"] > b["date"]) - (a["date"] < b["date"])
+    if "year" in (a["prec"], b["prec"]):
+        ka, kb = a["date"].year, b["date"].year
+    else:
+        ka, kb = (a["date"].year, a["date"].month), (b["date"].year, b["date"].month)
+    if ka == kb:
+        return "same_month"
+    return (ka > kb) - (ka < kb)
+
+_XC_WORD_STOP = {"and", "or", "of", "the", "en", "de", "du", "des", "et", "la", "le", "les", "in", "at", "for"}
+
+def _xc_stem(t):
+    # 복수형 정리 (providers → provider, educators → educator)
+    if len(t) > 4 and t.endswith("ies"):
+        return t[:-3] + "y"
+    if len(t) > 3 and t.endswith("s") and not t.endswith("ss"):
+        return t[:-1]
+    return t
+
+def _xc_tokens(s):
+    return {_xc_stem(t) for t in re.findall(r"[a-z0-9가-힣]+", (s or "").lower()) if len(t) > 1 and t not in _XC_WORD_STOP}
+
+def _xc_similar(a, b, th=0.5):
+    """직책 등 비교. 영어/프랑스어 병기('A / B')는 각각 비교, 짧은 쪽 단어가 대부분 겹치면 같다고 봄."""
+    pa = [x for x in re.split(r"\s+/\s+", a or "") if x.strip()] or [a or ""]
+    pb = [x for x in re.split(r"\s+/\s+", b or "") if x.strip()] or [b or ""]
+    for xa in pa:
+        for xb in pb:
+            ta, tb = _xc_tokens(xa), _xc_tokens(xb)
+            if not ta or not tb:
+                return True  # 한쪽이 비어 있으면 비교하지 않음
+            if len(ta & tb) / min(len(ta), len(tb)) >= max(th, 0.6):
+                return True
+    return False
+
+def _xc_same_place(a, b):
+    ta, tb = _xc_tokens(a), _xc_tokens(b)
+    if not ta or not tb:
+        return True
+    stop = {"bc", "canada", "on", "ab", "british", "columbia", "province", "street", "st", "ave", "road", "rd"}
+    ta2, tb2 = ta - stop, tb - stop
+    if not ta2 or not tb2:
+        return True
+    return bool(ta2 & tb2)
+
+def _xc_ym(p, level="month"):
+    """비교용 키: level='month' → (년, 월), 'year' → (년,)"""
+    if not p or not p.get("date") or p.get("invalid"):
+        return None
+    if level == "year":
+        return (p["date"].year,)
+    if p.get("prec") == "year":
+        return None
+    return (p["date"].year, p["date"].month)
+
+def _xc_key_str(k):
+    return ".".join(f"{v:02d}" if i else str(v) for i, v in enumerate(k))
+
+def xc_doc_date(d):
+    """서류 작성일: AI가 읽은 값 → 없으면 파일명의 날짜 (예: QA_WP_2025.12.pdf)"""
+    p = xc_parse_date(d.get("doc_date"), d.get("doc_date"))
+    if p["date"]:
+        return p
+    m = re.search(r"(20\d{2})[._\-](\d{1,2})(?:[._\-](\d{1,2}))?", d.get("file") or "")
+    if m:
+        norm = f"{m.group(1)}-{int(m.group(2)):02d}" + (f"-{int(m.group(3)):02d}" if m.group(3) else "")
+        p = xc_parse_date(norm, norm)
+        if p["date"]:
+            return p
+    return None
+
+_XC_PLACE_STOP = {"bc", "canada", "on", "ab", "qc", "mb", "sk", "ns", "nb", "british", "columbia", "ontario", "alberta",
+                  "province", "street", "st", "ave", "avenue", "road", "rd", "drive", "dr", "blvd", "unit", "suite",
+                  "korea", "republic", "of", "south", "usa", "city"}
+
+def _xc_city_tokens(loc):
+    """주소에서 도시 이름 후보만 (번지·우편번호·도로명·주/나라 제거)"""
+    s = re.sub(r"\b[a-z]\d[a-z]\s?\d[a-z]\d\b", " ", (loc or "").lower())  # 캐나다 우편번호
+    toks = {t for t in re.findall(r"[a-z가-힣]+", s) if len(t) > 2 and t not in _XC_PLACE_STOP}
+    return toks
+
+def xc_analyze(data, today=None):
+    """
+    AI 추출 결과 → 주제별로 묶은 확인 사항.
+    반환: (groups, oks, job_table, doc_rows)
+      group = {"level": "red"|"yellow", "title": str, "columns": [...], "rows": [[...], ...],
+               "checks": [확인할 것...], "notes": [참고...]}
+    """
+    today = today or datetime.datetime.now(LOCAL_TZ).date()
+    today_p = {"date": today, "prec": "day", "present": False, "invalid": False, "raw": ""}
+    docs = data.get("documents") or []
+    groups, oks = [], []
+
+    def label(d):
+        return f"{XC_DOC_TYPES_KO.get(d.get('doc_type'), '서류')} ({d.get('file', '')})"
+
+    def short(d):
+        return XC_DOC_TYPES_KO.get(d.get("doc_type"), "서류")
+
+    def cell(text, marks):
+        """값 + 문제 표시. marks: [(level, 사유)]"""
+        if not marks:
+            return f"{text} ✅" if text not in ("", "-") else (text or "-")
+        reds = [m for lv, m in marks if lv == "red"]
+        yel = [m for lv, m in marks if lv == "yellow"]
+        out = text
+        if reds:
+            out += " ❌ " + " · ".join(dict.fromkeys(reds))
+        if yel:
+            out += " ⚠️ " + " · ".join(dict.fromkeys(yel))
+        return out
+
+    # ---- 회사 그룹 (AI 판단 + 철자 차이 보정) ----
+    gid_of, status_of, evidence_of, names_of = {}, {}, {}, {}
+    for gi, grp in enumerate(data.get("companies") or []):
+        for n in grp.get("names") or []:
+            k = xc_company_key(n)
+            if k and k not in gid_of:
+                gid_of[k] = gi
+                names_of.setdefault(gi, []).append(n)
+        status_of[gi] = grp.get("status", "assumed")
+        evidence_of[gi] = grp.get("evidence", "")
+    next_gid = [len(data.get("companies") or [])]
+
+    def gid(name):
+        k = xc_company_key(name)
+        if not k:
+            return None
+        if k in gid_of:
+            return gid_of[k]
+        for kk, g in gid_of.items():
+            if len(k) >= 4 and len(kk) >= 4 and (k in kk or kk in k):
+                gid_of[k] = g
+                names_of.setdefault(g, []).append(name)
+                return g
+        g = next_gid[0]; next_gid[0] += 1
+        gid_of[k] = g; status_of[g] = "single"; names_of[g] = [name]
+        return g
+
+    # ---- 근무 기록 정리 ----
+    jobs = []
+    for d in docs:
+        for j in d.get("jobs") or []:
+            jobs.append({"doc": d, "label": label(d), "short": short(d), "employer": j.get("employer") or "",
+                         "g": gid(j.get("employer")), "title": j.get("job_title") or "",
+                         "title_std": j.get("job_title_standard") or j.get("job_title") or "",
+                         "docdate": xc_doc_date(d),
+                         "location": j.get("location") or "",
+                         "s": xc_parse_date(j.get("start"), j.get("start_raw")),
+                         "e": xc_parse_date(j.get("end"), j.get("end_raw"))})
+
+    permits = []
+    for d in docs:
+        p = d.get("permit")
+        if p:
+            permits.append({"doc": d, "p": p,
+                            "vf": xc_parse_date(p.get("valid_from"), p.get("valid_from_raw")),
+                            "vt": xc_parse_date(p.get("valid_to"), p.get("valid_to_raw")),
+                            "g": gid(p.get("employer")) if p.get("employer") else None})
+    closed = [x for x in permits if x["p"].get("is_closed") and x["p"].get("employer")]
+
+    # ---- 같은 회사·같은 직책끼리 묶기 ----
+    clusters = []
+    for jb in jobs:
+        placed = False
+        for c in clusters:
+            if c["g"] != jb["g"]:
+                continue
+            if any(x["doc"] is jb["doc"] for x in c["items"]):
+                continue
+            ref = c["items"][0]
+            overlap = not ((ref["s"]["date"] and jb["e"]["date"] and jb["e"]["date"] < ref["s"]["date"]) or
+                           (jb["s"]["date"] and ref["e"]["date"] and ref["e"]["date"] < jb["s"]["date"]))
+            if _xc_similar(ref["title"], jb["title"], 0.34) or overlap:
+                c["items"].append(jb); placed = True; break
+        if not placed:
+            clusters.append({"g": jb["g"], "items": [jb]})
+
+    job_table = []
+
+    # ---- 1. 회사(근무 이력)별 묶음 ----
+    for c in clusters:
+        items = c["items"]
+        g = c["g"]
+        _seen_k, job_names = set(), []
+        for x in items:  # 'ABC Corp' / 'ABC Corp.'처럼 표기만 다른 이름은 하나로
+            k = xc_company_key(x["employer"])
+            if x["employer"] and k not in _seen_k:
+                _seen_k.add(k); job_names.append(x["employer"])
+        perm = next((pm for pm in closed if pm["g"] == g), None)
+        comp = " / ".join(job_names) or "?"
+        if perm and xc_company_key(perm["p"]["employer"]) not in {xc_company_key(n) for n in job_names}:
+            comp += f" (= {perm['p']['employer']})"
+        title_txt = next((x["title"] for x in items if x["title"]), "")
+        job_table.append({"회사": comp, "직책": title_txt,
+                          **{x["label"]: f"{_xc_fmt(x['s'])} ~ {_xc_fmt(x['e'])}" for x in items}})
+
+        marks = {id(x): {"s": [], "e": [], "t": [], "l": []} for x in items}
+        checks, notes, kinds = [], [], []
+
+        def add(x, field, level, reason):
+            marks[id(x)][field].append((level, reason))
+
+        for x in items:
+            for fld, ko in (("s", "시작일"), ("e", "종료일")):
+                if x[fld]["invalid"]:
+                    add(x, fld, "red", "없는 날짜")
+                    checks.append(f"{x['short']} {ko} 오타 정정 ('{x[fld]['raw']}')")
+                    kinds.append("없는 날짜")
+            if x["e"]["date"] and _xc_cmp(x["e"], today_p) == 1:
+                add(x, "e", "red", "미래 날짜")
+                kinds.append("미래 날짜")
+
+        # 퍼밋(클로즈) 조건과 비교
+        if perm:
+            vf, vt, pp = perm["vf"], perm["vt"], perm["p"]
+            for x in items:
+                cs = _xc_cmp(x["s"], vf)
+                if cs == -1:
+                    add(x, "s", "red", "퍼밋 시작 전")
+                    checks.append(f"실제 근무 시작일 확인 — {x['short']}에 {_xc_fmt(x['s'])}로 적힘 (퍼밋 시작 {_xc_fmt(vf)} 이전에 근무했는지)")
+                    kinds.append("퍼밋 기간과 안 맞음")
+                # (같은 달이면 일치로 봄 — 년·월 기준)
+                if x["e"]["present"]:
+                    # '재직중'은 그 서류를 쓴 시점 기준 → 작성일이 퍼밋 만료 후일 때만 문제
+                    if x["docdate"] and _xc_cmp(x["docdate"], vt) == 1:
+                        add(x, "e", "red", "작성일 기준 퍼밋 만료 후 재직")
+                        kinds.append("퍼밋 기간과 안 맞음")
+                        checks.append(f"{x['short']}({_xc_fmt(x['docdate'])} 작성)에 재직중으로 적혀 있는데 퍼밋은 {_xc_fmt(vt)} 만료 — 연장 신청(Maintained status) 여부 확인")
+                    elif not x["docdate"] and _xc_cmp(today_p, vt) == 1:
+                        add(x, "e", "yellow", "퍼밋 만료일 지남")
+                        checks.append(f"{x['short']}엔 재직중으로 적혀 있음 — 퍼밋이 {_xc_fmt(vt)}에 만료됐으니 연장 신청 여부 확인 (서류 작성일 미확인)")
+                elif _xc_cmp(x["e"], vt) == 1:
+                    add(x, "e", "red", "퍼밋 만료 후")
+                    kinds.append("퍼밋 기간과 안 맞음")
+                if pp.get("occupation") and x["title"] and not (_xc_similar(pp["occupation"], x["title_std"], 0.34)
+                                                                 or _xc_similar(pp["occupation"], x["title"], 0.34)):
+                    add(x, "t", "yellow", "퍼밋 직업과 다름")
+                    kinds.append("직책 다름")
+                if pp.get("location") and x["location"] and not _xc_same_place(pp["location"], x["location"]):
+                    add(x, "l", "yellow", "퍼밋 근무지와 다름")
+                    kinds.append("근무지 다름")
+            other_names = [n for n in job_names if xc_company_key(n) != xc_company_key(pp["employer"])]
+            if other_names and status_of.get(g) == "assumed":
+                notes.append(f"🟡 퍼밋엔 '{pp['employer']}', 다른 서류엔 '{', '.join(other_names)}'(으)로 적혀 있어 같은 회사로 가정하고 비교했습니다. "
+                             f"같은 회사가 맞는지 확인해 주세요. (AI 판단: {evidence_of.get(g, '')})")
+            elif other_names and status_of.get(g) == "confirmed":
+                notes.append(f"'{pp['employer']}' = '{', '.join(other_names)}' 같은 회사로 확인 (근거: {evidence_of.get(g, '')})")
+        else:
+            # 클로즈 퍼밋 기간 중 다른 회사 근무
+            for pm in closed:
+                if not pm["vf"]["date"] or not pm["vt"]["date"]:
+                    continue
+                for x in items:
+                    s = x["s"]["date"]; e = today if x["e"]["present"] else x["e"]["date"]
+                    if s and e and s <= pm["vt"]["date"] and e >= pm["vf"]["date"]:
+                        add(x, "s", "red", "클로즈 퍼밋 기간 중")
+                        kinds.append(f"클로즈 퍼밋({pm['p']['employer']}) 기간 중 다른 회사 근무")
+                        checks.append(f"클로즈 퍼밋 기간({_xc_fmt(pm['vf'])} ~ {_xc_fmt(pm['vt'])}) 중 {comp} 근무 여부 확인 — 허가받지 않은 근무로 보일 수 있음")
+
+        # 서류끼리 비교 — [수정] 년·월만 같으면 일치 (일자는 서류마다 적는 방식이 달라 비교하지 않음)
+        #                   다수와 다른 서류에만 표시, '재직중'은 그 서류 작성 시점 기준으로 판단
+        for fld, ko in (("s", "시작일"), ("e", "종료일")):
+            dated = [x for x in items if x[fld]["date"] and not x[fld]["invalid"]]
+            pres = [x for x in items if x[fld]["present"]]
+            # 한 서류라도 연도만 적혀 있으면 (이력서에 흔함) 연도끼리 비교
+            lvl = "year" if any(x[fld]["prec"] == "year" for x in dated) else "month"
+            ym = lambda p, _l=lvl: _xc_ym(p, _l)
+            if fld == "e":
+                # 작성한 달과 같은 달로 종료일이 적혀 있고 다른 서류엔 더 늦은 종료일이 있으면 → 작성 당시 재직중으로 봄
+                later = lambda x: any(ym(y["e"]) and ym(x["e"]) and ym(y["e"]) > ym(x["e"]) for y in dated if y is not x)
+                as_present = [x for x in dated if lvl == "month" and x["docdate"] and _xc_ym(x["e"]) == _xc_ym(x["docdate"]) and later(x)]
+                dated = [x for x in dated if x not in as_present]
+                pres = pres + as_present
+            by_ym = {}
+            for x in dated:
+                by_ym.setdefault(ym(x[fld]), []).append(x)
+            ref_yms = []
+            if len(by_ym) > 1:
+                kinds.append("서류마다 다름")
+                top = max(len(v) for v in by_ym.values())
+                majors = [ym for ym, v in by_ym.items() if len(v) == top]
+                if len(majors) == 1:
+                    ref = majors[0]; ref_yms = [ref]
+                    for ym, v in by_ym.items():
+                        if ym != ref:
+                            for x in v:
+                                add(x, fld, "red", "다른 서류와 다름")
+                    outs = [x for ym, v in by_ym.items() if ym != ref for x in v]
+                    checks.append(f"{ko}: " + ", ".join(f"{x['short']} {_xc_fmt(x[fld])}" for x in outs) +
+                                  f" ↔ 다른 서류 {_xc_key_str(ref)} — 맞는 날짜 확인")
+                else:
+                    # 동률이면: 이미 다른 이유(미래 날짜·없는 날짜 등)로 틀린 값을 빼고 남은 값이 하나로 모이면 그것을 기준으로
+                    clean = [x for x in dated if not any(lv == "red" for lv, _ in marks[id(x)][fld])]
+                    clean_yms = {ym(x[fld]) for x in clean}
+                    if len(clean_yms) == 1:
+                        ref_yms = list(clean_yms)
+                    else:
+                        ref_yms = list(by_ym)
+                        for x in dated:
+                            add(x, fld, "red", "서로 다름")
+                    checks.append(f"서류마다 {ko}이 다름 — 맞는 날짜로 통일 (" +
+                                  ", ".join(f"{x['short']} {_xc_fmt(x[fld])}" for x in dated) + ")")
+            elif by_ym:
+                ref_yms = list(by_ym)
+            if fld == "e" and pres and ref_yms:
+                ref_end = max(ref_yms)
+                for x in pres:
+                    dd = _xc_ym(x["docdate"], lvl) if x["docdate"] else None
+                    if dd is None:
+                        if x["e"]["present"]:
+                            add(x, "e", "yellow", "작성일 확인")
+                            checks.append(f"{x['short']}엔 재직중, 다른 서류엔 종료 {_xc_key_str(ref_end)} — {x['short']} 작성 시점 확인")
+                    elif ref_end < dd:
+                        add(x, "e", "red", "작성일엔 이미 퇴사")
+                        kinds.append("서류마다 다름")
+                        checks.append(f"{x['short']}({_xc_key_str(dd)} 작성)엔 재직중인데 다른 서류엔 {_xc_key_str(ref_end)}에 종료 — 확인")
+
+        # 종료일 관련 확인 문구 (미래·퍼밋 만료 후를 한 줄로)
+        for x in items:
+            rs = [r for lv, r in marks[id(x)]["e"] if r in ("미래 날짜", "퍼밋 만료 후")]
+            if rs:
+                why = []
+                if "미래 날짜" in rs:
+                    why.append("미래 날짜")
+                if "퍼밋 만료 후" in rs:
+                    why.append(f"퍼밋 만료 {_xc_fmt(perm['vt'])} 이후" if perm else "퍼밋 만료 후")
+                tip = "재직 중이면 Present로" if "미래 날짜" in rs else "연장 신청(Maintained status) 여부 확인"
+                checks.append(f"{x['short']} 종료일 {_xc_fmt(x['e'])} 오기인지 확인 ({', '.join(why)} · {tip})")
+        # 직책: AI가 약어를 풀어 표준 직업명으로 바꾼 값으로 비교, 다수와 다른 것만 표시
+        def _majority_outliers(vals, same_fn):
+            buckets = []
+            for x, v in vals:
+                for b in buckets:
+                    if same_fn(b[0][1], v):
+                        b.append((x, v)); break
+                else:
+                    buckets.append([(x, v)])
+            if len(buckets) < 2:
+                return None, []
+            top = max(len(b) for b in buckets)
+            majors = [b for b in buckets if len(b) == top]
+            if len(majors) == 1:
+                return majors[0], [xv for b in buckets if b is not majors[0] for xv in b]
+            return None, [xv for b in buckets for xv in b]
+        tvals = [(x, x["title_std"]) for x in items if x["title_std"]]
+        major, outs = _majority_outliers(tvals, lambda a, b: _xc_similar(a, b, 0.5))
+        if outs:
+            kinds.append("직책 다름")
+            for x, v in outs:
+                add(x, "t", "yellow", "다른 서류와 다름" if major else "서로 다름")
+            checks.append("직책: " + ", ".join(f"{x['short']} '{x['title']}'" for x, v in outs) +
+                          (f" ↔ 다른 서류 '{major[0][0]['title']}'" if major else "") + " — 같은 직업인지 확인")
+        # 근무지: 도시가 다를 때만 (주·나라만 적힌 것은 문제 아님)
+        lvals = [(x, _xc_city_tokens(x["location"])) for x in items if _xc_city_tokens(x["location"])]
+        major, outs = _majority_outliers(lvals, lambda a, b: bool(a & b))
+        if outs:
+            kinds.append("근무지 다름")
+            for x, v in outs:
+                add(x, "l", "yellow", "다른 서류와 다름" if major else "서로 다름")
+            checks.append("근무지: " + ", ".join(f"{x['short']} '{x['location']}'" for x, v in outs) +
+                          (f" ↔ 다른 서류 '{major[0][0]['location']}'" if major else "") + " — 실제 근무 도시 확인")
+        if any(r == "퍼밋 직업과 다름" for x in items for lv, r in marks[id(x)]["t"]):
+            checks.append(f"퍼밋 직업({perm['p']['occupation']})과 같은 일인지 확인")
+        if any(r == "퍼밋 근무지와 다름" for x in items for lv, r in marks[id(x)]["l"]):
+            checks.append(f"퍼밋 근무지({perm['p']['location']})와 같은 곳인지 확인")
+
+        has_issue = any(marks[id(x)][f] for x in items for f in marks[id(x)])
+        if not has_issue and not notes:
+            if len(items) > 1 or perm:
+                oks.append(f"{comp} 근무기간")
+            continue
+        level = "red" if any(lv == "red" for x in items for f in marks[id(x)] for lv, _ in marks[id(x)][f]) else "yellow"
+        show_t = any(marks[id(x)]["t"] for x in items)
+        show_l = any(marks[id(x)]["l"] for x in items)
+        cols = ["서류", "시작", "종료"] + (["직책"] if show_t else []) + (["근무지"] if show_l else [])
+        rows = []
+        if perm:
+            r = [f"{short(perm['doc'])} (기준)", _xc_fmt(perm["vf"]), _xc_fmt(perm["vt"])]
+            if show_t: r.append(perm["p"].get("occupation") or "-")
+            if show_l: r.append(perm["p"].get("location") or "-")
+            rows.append(r)
+        for x in items:
+            mk = marks[id(x)]
+            fv = lambda p: p["raw"] if p["invalid"] else _xc_fmt(p)
+            r = [x["label"], cell(fv(x["s"]), mk["s"]), cell(fv(x["e"]), mk["e"])]
+            if show_t: r.append(cell(x["title"] or "-", mk["t"]))
+            if show_l: r.append(cell(x["location"] or "-", mk["l"]))
+            rows.append(r)
+        kinds_u = list(dict.fromkeys(kinds))
+        groups.append({"level": level, "title": f"{comp} 근무기간" + (f": {', '.join(kinds_u)}" if kinds_u else ": 확인 필요"),
+                       "columns": cols, "rows": rows, "checks": list(dict.fromkeys(checks)), "notes": notes})
+
+    # ---- 2. 클로즈 퍼밋 고용주와 맞는 근무 기록이 없음 ----
+    for pm in closed:
+        if not any(c["g"] == pm["g"] for c in clusters):
+            groups.append({"level": "yellow", "title": f"퍼밋 고용주 '{pm['p']['employer']}'의 근무 기록을 찾지 못함",
+                           "columns": ["서류", "회사"],
+                           "rows": [[f"{short(pm['doc'])} (기준)", pm["p"]["employer"]]] + [[x["label"], x["employer"]] for x in jobs],
+                           "checks": ["운영명(상호)으로 적혀 있다면 같은 회사인지 확인", "퍼밋 회사에서 실제로 근무 중인지 확인"],
+                           "notes": []})
+
+    # ---- 3. 퍼밋 정보 (퍼밋 자체 날짜 오류 + 다른 서류에 적힌 퍼밋 정보) ----
+    for pm in permits:
+        pp = pm["p"]
+        marks_rows, checks = [], []
+        base_marks = {"vf": [], "vt": []}
+        for fld, ko in (("vf", "시작일"), ("vt", "만료일")):
+            if pm[fld]["invalid"]:
+                base_marks[fld].append(("red", "읽을 수 없음"))
+                checks.append(f"퍼밋 {ko} 원본 확인 ('{pm[fld]['raw']}')")
+        for d in docs:
+            for m in d.get("permits_mentioned") or []:
+                if (m.get("permit_type") or "").split()[0:1] != (pp.get("permit_type") or "").split()[0:1]:
+                    continue
+                mk = {"vf": [], "vt": [], "emp": []}
+                a_f = xc_parse_date(m.get("valid_from"), m.get("valid_from_raw"))
+                a_t = xc_parse_date(m.get("valid_to"), m.get("valid_to_raw"))
+                for fld, a, ko in (("vf", a_f, "시작일"), ("vt", a_t, "만료일")):
+                    if a["invalid"]:
+                        mk[fld].append(("red", "없는 날짜"))
+                        checks.append(f"{short(d)}에 적힌 퍼밋 {ko} 오타 정정 ('{a['raw']}')")
+                    elif _xc_cmp(a, pm[fld]) not in (0, None, "same_month"):
+                        mk[fld].append(("red", "퍼밋과 다름"))
+                        checks.append(f"{short(d)}에 적힌 퍼밋 {ko} 정정 ({_xc_fmt(a)} → 퍼밋 {_xc_fmt(pm[fld])})")
+                if m.get("employer") and pp.get("employer") and gid(m["employer"]) != gid(pp["employer"]):
+                    mk["emp"].append(("yellow", "퍼밋과 다름"))
+                    checks.append(f"{short(d)}에 적힌 퍼밋 고용주 확인 ('{m['employer']}' vs 퍼밋 '{pp['employer']}')")
+                if any(mk.values()):
+                    marks_rows.append([label(d), cell(_xc_fmt(a_f), mk["vf"]), cell(_xc_fmt(a_t), mk["vt"]),
+                                       cell(m.get("employer") or "-", mk["emp"])])
+        if marks_rows or any(base_marks.values()):
+            level = "red" if any("❌" in c for r in marks_rows for c in r) or any(base_marks.values()) else "yellow"
+            base = [f"{short(pm['doc'])} (기준)", cell(_xc_fmt(pm["vf"]), base_marks["vf"]).replace(" ✅", ""),
+                    cell(_xc_fmt(pm["vt"]), base_marks["vt"]).replace(" ✅", ""), pp.get("employer") or "-"]
+            what = "다른 서류에 다르게 적힘" if marks_rows else "날짜 확인 필요"
+            groups.append({"level": level, "title": f"{pp.get('permit_type') or '퍼밋'} 정보: {what}",
+                           "columns": ["서류", "시작", "만료", "고용주"], "rows": [base] + marks_rows,
+                           "checks": list(dict.fromkeys(checks)), "notes": []})
+        elif any(d.get("permits_mentioned") for d in docs):
+            oks.append("퍼밋 기간")
+
+    # ---- 4. 신원 정보 ----
+    def norm_name(n):
+        return " ".join(sorted(re.findall(r"[a-z가-힣]+", (n or "").lower())))
+    fields = (("person_name", "이름", norm_name),
+              ("dob", "생년월일", lambda v: re.sub(r"\D", "", v or "")),
+              ("passport_no", "여권번호", lambda v: re.sub(r"[^A-Z0-9]", "", (v or "").upper())))
+    bad_fields = []
+    for f, ko, nf in fields:
+        vals = {nf(d.get(f)) for d in docs if d.get(f) and nf(d.get(f))}
+        if len(vals) > 1:
+            bad_fields.append((f, ko, nf))
+        elif sum(1 for d in docs if d.get(f)) >= 2:
+            oks.append(ko)
+    if bad_fields:
+        rows = []
+        for d in docs:
+            if not any(d.get(f) for f, _, _ in bad_fields):
+                continue
+            r = [label(d)]
+            for f, ko, nf in bad_fields:
+                vals = [nf(x.get(f)) for x in docs if x.get(f)]
+                common = max(set(vals), key=vals.count) if vals else ""
+                v = d.get(f) or "-"
+                r.append(v if (not d.get(f) or nf(v) == common and vals.count(common) > 1) else f"{v} ❌")
+            rows.append(r)
+        groups.append({"level": "red", "title": f"신원 정보: {', '.join(ko for _, ko, _ in bad_fields)}이(가) 서류마다 다름",
+                       "columns": ["서류"] + [ko for _, ko, _ in bad_fields], "rows": rows,
+                       "checks": [f"{ko} 확인 — 여권 기준으로 정정" for _, ko, _ in bad_fields] +
+                                 (["다른 사람 서류가 섞였는지 확인"] if any(f == "person_name" for f, _, _ in bad_fields) else []),
+                       "notes": []})
+
+    groups.sort(key=lambda g: 0 if g["level"] == "red" else 1)
+    doc_rows = [{"서류": label(d), "이름": d.get("person_name") or "", "생년월일": d.get("dob") or "",
+                 "여권번호": d.get("passport_no") or "", "근무 기록 수": len(d.get("jobs") or []),
+                 "퍼밋": (f"{d['permit'].get('permit_type','')} · {'클로즈' if d['permit'].get('is_closed') else ('오픈' if d['permit'].get('is_closed') is False else '?')}"
+                          f" · {d['permit'].get('employer') or ''} · {d['permit'].get('valid_from_raw') or ''} ~ {d['permit'].get('valid_to_raw') or ''}")
+                         if d.get("permit") else ""} for d in docs]
+    return groups, oks, job_table, doc_rows
+
+def xc_md_table(cols, rows):
+    esc = lambda v: str(v).replace("|", "\\|").replace("\n", " ")
+    out = "| " + " | ".join(esc(c) for c in cols) + " |\n|" + "---|" * len(cols) + "\n"
+    for r in rows:
+        out += "| " + " | ".join(esc(c) for c in r) + " |\n"
+    return out
+
+def xc_summary_text(groups, oks, client=""):
+    today = datetime.datetime.now(LOCAL_TZ).strftime("%Y.%m.%d")
+    lines = [f"[서류 정보 일치 확인] {client} ({today})".replace("  ", " "), ""]
+    if not groups:
+        lines.append("■ 서류끼리 다른 부분 없음")
+    for i, g in enumerate(groups, 1):
+        lines.append(f"{'🔴' if g['level'] == 'red' else '🟡'} {i}. {g['title']}")
+        cols = g["columns"]
+        for r in g["rows"]:
+            lines.append("   - " + r[0] + ": " + " / ".join(f"{c} {v}" for c, v in zip(cols[1:], r[1:])))
+        for n in g["notes"]:
+            lines.append("   " + n)
+        if g["checks"]:
+            lines.append("   [확인할 것]")
+            for c in g["checks"]:
+                lines.append(f"    · {c}")
+        lines.append("")
+    if oks:
+        lines.append("✅ 일치: " + " · ".join(oks))
+    return "\n".join(lines)
+
+def xc_run(files):
+    parts, warns = qa_batch_process_client_files(files)
+    if not parts:
+        return None, warns
+    resp = safe_generate_content([XC_PROMPT] + parts, json_mode=True, thinking=THINKING_LEVEL)
+    data = parse_json_response(resp.text)
+    return data, warns
+
+
 # ==========================================
 # 6. Streamlit 네비게이션 및 UI 구성
 # ==========================================
@@ -2190,10 +3118,11 @@ MENU_2 = "✈️ 한부모 동의서 자동 작성"
 MENU_3 = "📋 IMM서류 정보 정리"
 MENU_4 = "🏷️ CRM 파일명 생성 및 묶기/분할"
 MENU_5 = "📝 질문지 기존 정보 기입"
+MENU_6 = "🔍 서류 정보 일치 확인"
 
 st.sidebar.title("🦅 CanNest Tool")
 app_mode = st.sidebar.radio(
-    "원하시는 업무 도구를 선택하세요", [MENU_1, MENU_2, MENU_3, MENU_4, MENU_5]
+    "원하시는 업무 도구를 선택하세요", [MENU_1, MENU_2, MENU_3, MENU_4, MENU_5, MENU_6]
 )
 
 # ------------------------------------------
@@ -2702,6 +3631,7 @@ elif app_mode == MENU_4:
       accept_multiple_files=True,
       key=st.session_state.uploader_key,
   )
+  crm_default_name = ""
 
   if uploaded_files:
     if st.button(
@@ -2727,7 +3657,38 @@ elif app_mode == MENU_4:
         mime_type = file.type if file.type else "application/pdf"
         fname_lower = file.name.lower()
 
+        word_pdf = None
         if fname_lower.endswith((".doc", ".docx")):
+          word_pdf, _how = word_to_pdf_bytes(file_bytes, file.name)
+          if _how == "basic":
+            st.caption(f"ℹ️ {file.name}: 서버에 LibreOffice가 없어 간이 변환했습니다 (로고·그림 제외).")
+
+        if word_pdf:
+          # [수정] Word를 실제 PDF로 바꾼 뒤 PDF와 똑같이 처리 (AI도 실제 페이지 모양을 보고 분류)
+          text_content = read_word_document_text(file_bytes, file.name)
+          wdoc = fitz.open(stream=word_pdf, filetype="pdf")
+          for i in range(len(wdoc)):
+            if page_counter > CRM_MAX_PAGES:
+              break
+            pix = wdoc.load_page(i).get_pixmap(matrix=fitz.Matrix(prev_zoom, prev_zoom))
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=prev_quality)
+            global_pages.append({
+                "global_idx": page_counter,
+                "original_name": file.name,
+                "mime_type": "application/pdf",
+                "file_bytes": word_pdf,
+                "pdf_page_idx": i,
+                "preview_bytes": buf.getvalue(),
+                "is_word": True,
+                "word_text": text_content,
+                "word_orig_bytes": file_bytes,  # 이력서는 원본 Word 그대로 내려주기 위함
+                "word_orig_mime": mime_type,
+            })
+            page_counter += 1
+          wdoc.close()
+        elif fname_lower.endswith((".doc", ".docx")):
           if page_counter > CRM_MAX_PAGES:
             continue
           text_content = read_word_document_text(file_bytes, file.name)
@@ -2814,10 +3775,16 @@ elif app_mode == MENU_4:
       shrink_previews_to_fit(global_pages)
 
       status_text.text(
-          "2. AI가 페이지별 문맥을 분석하여 연관 서류를 묶거나 나누는"
-          " 중입니다..."
+          f"2. AI가 {len(global_pages)}페이지의 문맥을 분석하여 연관 서류를 묶거나 나누는"
+          " 중입니다... (페이지가 많을수록 오래 걸립니다)"
       )
 
+      if crm_default_name:
+        missing_name_rule = ("Rule 1-B (Missing name): If a document does not show the client's name, use '"
+                             + crm_default_name + "' as the name. NEVER write 'Unknown'.")
+      else:
+        missing_name_rule = ("Rule 1-B (Missing name): If a document does not show any name, use the name found on the"
+                             " other uploaded documents of the same client. Only if no name is found anywhere, write 'Unknown'.")
       prompt = f"""
             You are an expert AI document classifier for a Canadian immigration firm.
             I am providing {len(global_pages)} pages of documents uploaded by a client. 
@@ -2842,6 +3809,7 @@ elif app_mode == MENU_4:
 
             [STRICT CRM MANUAL FILENAME RULES]
             Rule 1 (Name): Korean client -> Full Korean Name without spaces (e.g. 홍길동). Foreign client -> VERY FIRST WORD of English Given Name in Title Case (e.g. Richard, Pham).
+            {missing_name_rule}
             Rule 2 (Dates): MUST be YYYY.MM.DD (e.g. 2022.01.02). Use dots '.' as delimiters.
             Rule 3 (Delimiter): Underscore '_' between Name, Document Category, and Date/Company.
             Rule 4 (Date Range): Use hyphen '-' for ranges (e.g. 2022.04.22-2022.05.22).
@@ -2850,6 +3818,7 @@ elif app_mode == MENU_4:
             [CATEGORIES & CMS SUFFIX RULES]
             1. Passport (including stamp/visa pages): {{Name}}_PP_{{ExpiryDate YYYY.MM.DD}}
             2. Work Permit / Study Permit / Visitor Record (IMM 1442) / Coop / PGWP / BOWP: {{Name}}_{{WP/SP/VR/Coop/PGWP/BOWP}}_{{ExpiryDate YYYY.MM.DD}}
+               (CRITICAL: ONLY the actual permit document itself (IMM 1442 with 'Work Permit' / 'Study Permit' title and permit number). IRCC LETTERS that merely talk about a permit are NOT permits — see rule 26.)
             3. Questionnaire (CanNest Q&A / 질문지): {{Name}}_QA_{{Code}}_{{ReceivedDate YYYY.MM.DD}}
                {{Code}} MUST be EXACTLY one of these short codes — never a description:
                  - Work Permit questionnaire (initial, extension, LMIA, PGWP — any work permit) -> WP
@@ -2885,6 +3854,7 @@ elif app_mode == MENU_4:
             23. Digital Photo / Passport Photo: {{Name}}_Digital Photo (Use .pdf if multiple pages, else .jpg)
             24. T4 (Statement of Remuneration Paid): {{Name}}_T4_{{EmployerNameInEnglish}}_{{Year YYYY}}
             25. Letter of Acceptance / Official Admission Letter (입학허가서): {{Name}}_LOA_{{SchoolNameInEnglish}} (e.g. 공원준_LOA_Metropolitan Community College)
+            26. Submission Confirmation Letter (IRCC IMM 5988 / "This confirms that your application has been received by IRCC" / letter allowing you to keep working or studying until a decision — maintained status letter): {{Name}}_Submission Confirmation Letter (CRITICAL: NEVER name this WP/SP/VR even though it mentions a work permit and an "until" date.)
 
             [CRITICAL FALLBACK RULE FOR UNKNOWN DOCUMENTS]
             - Step 1: If a document does NOT match any categories above, extract the official document title printed at the top of the document (in English, Title Case) and format as: {{Name}}_{{DocumentTitleInEnglish}}.
@@ -2920,7 +3890,9 @@ elif app_mode == MENU_4:
         )
 
       try:
-        response = safe_generate_content(contents)
+        _t0 = time.time()
+        response = safe_generate_content(contents, thinking=CRM_THINKING_LEVEL)
+        st.session_state["crm_ai_seconds"] = round(time.time() - _t0, 1)
         clean_text = (
             response.text.strip().replace("```json", "").replace("```", "")
         )
@@ -2939,6 +3911,8 @@ elif app_mode == MENU_4:
         docs_info = []
         for d in raw_docs_info:
           d["suggested_filename"] = normalize_qa_filename(d.get("suggested_filename", ""))
+          if crm_default_name:
+            d["suggested_filename"] = replace_unknown_name(d["suggested_filename"], crm_default_name)
           c_name = d.get("client_name", "").strip()
           c_cat = d.get("doc_category", "").strip()
 
@@ -2984,6 +3958,11 @@ elif app_mode == MENU_4:
                 existing["page_indices"].append(ni)
           else:
             docs_info.append(d)
+
+        # [수정] AI가 서류 종류를 착각해도 본문 내용으로 한 번 더 확인 (예: IMM 5988 접수 확인 레터 → WP로 잘못 지음)
+        for d in docs_info:
+          d["suggested_filename"] = fix_filename_by_content(
+              d.get("suggested_filename", ""), crm_pages_text(global_pages, d.get("page_indices", [])))
 
       except Exception as e:
         st.error(f"AI 분석 중 오류가 발생했습니다: {e}")
@@ -3041,8 +4020,8 @@ elif app_mode == MENU_4:
           orig_ext = os.path.splitext(group_pages[0]["original_name"])[1]
           final_name = base_name + orig_ext
 
-          comp_bytes = group_pages[0]["file_bytes"]
-          out_mime = group_pages[0]["mime_type"]
+          comp_bytes = group_pages[0].get("word_orig_bytes", group_pages[0]["file_bytes"])
+          out_mime = group_pages[0].get("word_orig_mime", group_pages[0]["mime_type"])
           orig_kb = len(comp_bytes) / 1024
           comp_kb = orig_kb
 
@@ -3120,7 +4099,7 @@ elif app_mode == MENU_4:
             for p_data in group_pages:
               rot = int(rotations.get(str(p_data["global_idx"]), 0))
 
-              if p_data.get("is_word"):
+              if p_data.get("is_word") and "pdf" not in p_data["mime_type"].lower():
                 pdf_page = new_doc.new_page(width=595, height=842)
                 w_text = p_data.get("word_text", "")
                 pdf_page.insert_text(
@@ -3244,55 +4223,69 @@ elif app_mode == MENU_4:
             "모든 서류의 묶기/분할 및 스마트 회전 최적화가 완료되었습니다."
         )
 
+      for r in results:
+        r["final_name"] = ensure_extension(r["suggested_filename"], r["mime"])
       st.session_state.analysis_results = results
+      st.session_state.crm_run_id = str(uuid.uuid4())[:8]  # 새 분석마다 파일명 입력칸 초기화
 
   if st.session_state.analysis_results:
     st.markdown("---")
     st.subheader("변환 완료된 서류 다운로드")
+    if st.session_state.get("crm_ai_seconds") is not None:
+      _run = st.session_state.get("gemini_last_run") or {}
+      st.caption(f"AI 분석: {_run.get('model', '')} · {st.session_state['crm_ai_seconds']}초")
 
-    zip_buffer = io.BytesIO()
-    final_downloads = []
+    results_list = st.session_state.analysis_results
+    run_id = st.session_state.get("crm_run_id", "0")
 
-    for idx, item in enumerate(st.session_state.analysis_results):
+    st.info("✏️ 이름 수정이 필요한 경우, 파일명 칸을 수정한 뒤 **반드시 Enter**를 누르고 다운로드하세요. "
+            "(Enter를 누르지 않으면 이전 이름으로 다운로드됩니다)")
+
+    for idx, item in enumerate(results_list):
       col1, col2, col3 = st.columns([3, 3, 2])
+
+      # 파일명 칸 (새 분석마다 칸 초기화 → 이전 분석에서 고친 이름이 섞이지 않음)
+      edit_key = f"edit_{run_id}_{idx}"
+      if edit_key in st.session_state:
+        item["final_name"] = ensure_extension(st.session_state[edit_key], item["mime"])
+      is_unknown = bool(UNKNOWN_NAME_RE.match(item["final_name"]))
 
       with col1:
         st.write(f"**출처**: `{item['original_name']}`")
-        st.caption(
-            f"{item['orig_kb']:.1f} KB ➡️ **{item['comp_kb']:.1f} KB**"
-        )
-        if item.get("is_unclassified"):
+        st.caption(f"{item['orig_kb']:.1f} KB ➡️ **{item['comp_kb']:.1f} KB**")
+        if is_unknown:
+          st.warning("⚠️ 이름을 찾지 못했어요. 파일명을 수정한 뒤 Enter를 눌러주세요")
+        elif item.get("is_unclassified"):
           st.warning("⚠️ 규칙 미확인 서류 (파일명 수동 확인 필요)")
 
       with col2:
-        user_edited_name = st.text_input(
-            "파일명",
-            value=item["suggested_filename"],
-            key=f"edit_{idx}",
-            label_visibility="collapsed",
-        )
-        final_downloads.append(
-            (user_edited_name, item["bytes"], item["mime"])
-        )
+        st.text_input("파일명", value=item["final_name"], key=edit_key, label_visibility="collapsed")
 
       with col3:
         st.download_button(
             "⬇️ 개별 다운로드",
             data=item["bytes"],
-            file_name=user_edited_name,
+            file_name=item["final_name"],
             mime=item["mime"],
-            key=f"dl_btn_{idx}",
+            key=f"dl_btn_{run_id}_{idx}_{item['final_name']}",
         )
 
-    with zipfile.ZipFile(
-        zip_buffer, "w", zipfile.ZIP_DEFLATED
-    ) as zip_file:
-      for fname, fbytes, _ in final_downloads:
-        zip_file.writestr(fname, fbytes)
-
+    # ZIP: 지금 보이는 이름 그대로 (같은 이름은 (2), (3)을 붙여 덮어쓰기 방지)
+    zip_buffer = io.BytesIO()
+    used = {}
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+      for item in results_list:
+        fname = item["final_name"]
+        if fname in used:
+          used[fname] += 1
+          base, ext = os.path.splitext(fname)
+          fname = f"{base} ({used[item['final_name']]}){ext}"
+        else:
+          used[fname] = 1
+        zip_file.writestr(fname, item["bytes"])
     zip_buffer.seek(0)
-    today_str = datetime.date.today().strftime("%Y%m%d")
 
+    today_str = datetime.date.today().strftime("%Y%m%d")
     st.markdown("---")
     st.download_button(
         "📦 전체 서류 ZIP 다운로드",
@@ -3300,11 +4293,11 @@ elif app_mode == MENU_4:
         file_name=f"CRM_Documents_{today_str}.zip",
         mime="application/zip",
         type="primary",
-        use_container_width=True,
+        **_WIDE,
     )
 
     st.markdown("---")
-    if st.button("🔄 전체 리셋", type="secondary", use_container_width=True):
+    if st.button("🔄 전체 리셋", type="secondary", **_WIDE):
       for key in list(st.session_state.keys()):
         if key != "password_correct":
           del st.session_state[key]
@@ -3426,3 +4419,103 @@ elif app_mode == MENU_5:
     # 전체 리셋은 맨 아래
     st.markdown("")
     st.button("🔄 전체 리셋", **_WIDE, on_click=reset_menu5)
+
+
+# ------------------------------------------
+# 메뉴 6: 서류 정보 일치 확인
+# ------------------------------------------
+elif app_mode == MENU_6:
+    st.title(MENU_6)
+    st.caption("질문지·이력서·재직/경력증명서·퍼밋·여권 등을 한 번에 올리면, 서류끼리 정보가 맞는지 확인해서 "
+               "확인해야 할 내용을 정리해 드립니다.")
+
+    if "xc_uploader_key" not in st.session_state:
+        st.session_state.xc_uploader_key = str(uuid.uuid4())
+    st.session_state.setdefault("xc_result", None)
+
+    xc_files = st.file_uploader(
+        "한 손님의 서류 (복수 선택)",
+        type=['pdf', 'docx', 'jpg', 'jpeg', 'png', 'heic', 'heif', 'webp'],
+        accept_multiple_files=True,
+        key=f"xc_files_{st.session_state.xc_uploader_key}",
+    )
+    st.caption("※ 구형 .doc 파일은 Word에서 .docx 또는 PDF로 저장 후 올려주세요.")
+
+    has_xc = st.session_state.xc_result is not None
+    if st.button("🔁 다시 확인하기" if has_xc else "🔍 서류 정보 일치 확인 시작",
+                 type="secondary" if has_xc else "primary", **_WIDE):
+        if not xc_files or len(xc_files) < 2:
+            st.warning("비교할 서류를 2개 이상 올려주세요.")
+        else:
+            with st.spinner("서류에서 정보를 읽고 서로 비교하는 중입니다..."):
+                try:
+                    data, warns = xc_run(xc_files)
+                    if data is None:
+                        st.error("읽을 수 있는 서류가 없습니다.")
+                    else:
+                        alerts, oks, table, rows = xc_analyze(data)
+                        client = next((d.get("person_name") for d in data.get("documents") or [] if d.get("person_name")), "")
+                        st.session_state.xc_result = {"alerts": alerts, "oks": oks, "table": table, "rows": rows,
+                                                      "warns": warns, "client": client}
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"서류 분석 중 오류가 발생했습니다: {e}")
+
+    res = st.session_state.xc_result
+    if res:
+        for w in res["warns"]:
+            st.warning(w)
+        groups = res["alerts"]
+        reds = [g for g in groups if g["level"] == "red"]
+        yels = [g for g in groups if g["level"] == "yellow"]
+        st.markdown("---")
+        st.subheader("확인해야 할 내용")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("🔴 불일치", f"{len(reds)}건")
+        m2.metric("🟡 확인 필요", f"{len(yels)}건")
+        m3.metric("✅ 일치", f"{len(res['oks'])}건")
+        run = st.session_state.get("gemini_last_run")
+        if run:
+            st.caption(f"AI 분석: {run['model']} · {run['seconds']}초")
+
+        if not groups:
+            st.success("서류끼리 다른 부분을 찾지 못했습니다.")
+        for n, g in enumerate(groups, 1):
+            icon = "🔴" if g["level"] == "red" else "🟡"
+            try:
+                box = st.container(border=True)
+            except TypeError:
+                box = st.container()
+            with box:
+                st.markdown(f"#### {icon} {n}. {g['title']}")
+                st.markdown(xc_md_table(g["columns"], g["rows"]))
+                for note in g["notes"]:
+                    (st.warning if note.startswith("🟡") else st.caption)(note)
+                if g["checks"]:
+                    st.markdown("**확인할 것**\n" + "\n".join(f"- {c}" for c in g["checks"]))
+        if res["oks"]:
+            st.success("✅ 일치: " + " · ".join(res["oks"]))
+
+        with st.expander("📋 근무 이력 서류별 비교표"):
+            if res["table"]:
+                st.dataframe(res["table"], hide_index=True, **_WIDE)
+            else:
+                st.write("근무 이력이 없습니다.")
+        with st.expander("📄 서류별로 읽은 정보"):
+            st.dataframe(res["rows"], hide_index=True, **_WIDE)
+
+        st.markdown("**📝 정리본 (복사해서 CRM·메일에 붙여넣기)**")
+        summary = xc_summary_text(res["alerts"], res["oks"], res.get("client", ""))
+        try:
+            st.code(summary, language=None, wrap_lines=True)  # 긴 줄 자동 줄바꿈
+        except TypeError:
+            st.code(summary, language=None)
+        st.download_button("📥 정리본 내려받기 (.txt)", data=summary.encode("utf-8"),
+                           file_name=f"서류확인_{res.get('client') or 'client'}_{datetime.date.today():%Y%m%d}.txt",
+                           mime="text/plain", type="primary", **_WIDE)
+
+    st.markdown("")
+    if st.button("🔄 전체 리셋", **_WIDE, key="xc_reset"):
+        st.session_state.xc_result = None
+        st.session_state.xc_uploader_key = str(uuid.uuid4())
+        st.rerun()
