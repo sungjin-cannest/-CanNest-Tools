@@ -56,28 +56,9 @@ except Exception:
 
 HANGUL_RE = re.compile(r"[\u3131-\u318E\uAC00-\uD7A3]")
 
-# [수정] 일부 환경에서 다운로드 버튼 부품(DownloadButton.js)을 불러오지 못해 버튼이 오류로 바뀌는 문제가 있어
-# 버튼 바로 아래에 '예비 다운로드 링크'를 함께 표시 (링크는 이미 불러온 기본 글자 부품만 사용)
-import base64 as _b64
-import html as _html_mod
-
 def safe_download_button(label, data=None, file_name=None, mime=None, **kwargs):
-    result = st.download_button(label, data=data, file_name=file_name, mime=mime, **kwargs)
-    try:
-        raw = data.getvalue() if hasattr(data, "getvalue") else data
-        if isinstance(raw, str):
-            raw = raw.encode("utf-8")
-        if raw and len(raw) <= 60 * 1024 * 1024:  # 60MB 이하만
-            b64 = _b64.b64encode(raw).decode()
-            fname = _html_mod.escape(file_name or "download", quote=True)
-            st.markdown(
-                f'<div style="text-align:center;font-size:0.85em;margin-top:-6px">'
-                f'<a href="data:{mime or "application/octet-stream"};base64,{b64}" download="{fname}">'
-                f'버튼이 안 보이거나 오류가 나면 여기를 눌러 내려받기</a></div>',
-                unsafe_allow_html=True)
-    except Exception:
-        pass
-    return result
+    """다운로드 버튼 (예비 링크는 큰 파일에서 글자가 그대로 보이는 문제가 있어 제거)"""
+    return st.download_button(label, data=data, file_name=file_name, mime=mime, **kwargs)
 
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.heic', '.heif', '.webp')
 
