@@ -55,6 +55,11 @@ except Exception:
     _WIDE = {"use_container_width": True}
 
 HANGUL_RE = re.compile(r"[\u3131-\u318E\uAC00-\uD7A3]")
+
+def safe_download_button(label, data=None, file_name=None, mime=None, **kwargs):
+    """다운로드 버튼 (예비 링크는 큰 파일에서 글자가 그대로 보이는 문제가 있어 제거)"""
+    return st.download_button(label, data=data, file_name=file_name, mime=mime, **kwargs)
+
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.heic', '.heif', '.webp')
 
 # ==========================================
@@ -1524,7 +1529,7 @@ CURRENT_ADDRESS_KO_RE = re.compile(r"현재(거주지|집주소|거주하는곳|
 def _is_current_address_label(text):
     if not text:
         return False
-    if "사망" in text:  # 가족표 '현재 주소 (사망 시…)'는 제외
+    if re.search(r"사망|deceased|date\s*/\s*city|provide\s+date", text, re.I):  # 가족표 주소 ('사망 시…', 'if deceased…')는 제외
         return False
     return bool(CURRENT_ADDRESS_RE.search(text) or CURRENT_ADDRESS_KO_RE.search(re.sub(r"\s+", "", text)))
 RECENT_ENTRY_PHRASES = ["가장 최근 입국", "최근 입국", "가장 최근에 들어온", "최근에 들어온", "최근 들어온",
@@ -1573,6 +1578,9 @@ def mark_always_blank(doc, fields):
 
     for f in fields:
         if f["type"] != fitz.PDF_WIDGET_TYPE_TEXT:
+            continue
+        # [수정] 가족 정보 표 안의 칸(가족들의 주소·이름 등)은 '현재 거주지 주소 비우기' 대상이 아님
+        if re.search(r"family|가족", f.get("section") or "", re.I):
             continue
         page = doc[f["page"]]
         x0, y0, x1, y1 = f["rect"]
@@ -1638,10 +1646,25 @@ def compute_printed_labels(doc, fields):
             f["label_side"] = "left" if label.strip() else ""
             if not label.strip():
                 block_y = max([r[3] for r in rects if r[3] <= y0 + 1 and r[0] < x1 - 2 and r[2] > x0 + 2 and r != f["rect"]] + [y0 - 40])
+
+                def is_left_label_of_other(w):
+                    # 이 글자 오른쪽 같은 줄에 다른 칸이 있으면 → 그 칸의 라벨이므로 빌려오지 않음
+                    cy = (w[1] + w[3]) / 2
+                    return any(r != f["rect"] and r[1] - 2 <= cy <= r[3] + 2 and r[0] >= w[2] - 2 for r in rects)
                 above = [w for w in words if w[3] <= y0 + 2 and w[1] >= block_y - 1
-                         and x0 - 4 <= (w[0] + w[2]) / 2 <= x1 + 4]
+                         and x0 - 4 <= (w[0] + w[2]) / 2 <= x1 + 4 and not is_left_label_of_other(w)]
                 label = " ".join(w[4] for w in sorted(above, key=lambda w: (round(w[1] / 3), w[0])))
             f["printed_label"] = clean_text(label.strip())[:120]
+        # 라벨이 없는 칸은 같은 세로줄(열) 위쪽 칸의 라벨(열 제목)을 물려받음 — 가족 표 2번째 줄부터 등
+        for f in sorted(flist, key=lambda f: f["rect"][1]):
+            if f["type"] in BUTTON_TYPES or f.get("printed_label"):
+                continue
+            x0, y0, x1, y1 = f["rect"]
+            col = [g for g in flist if g is not f and g.get("printed_label") and g["rect"][3] <= y0 + 1
+                   and abs(g["rect"][0] - x0) <= 6 and abs(g["rect"][2] - x1) <= 12]
+            if col:
+                f["printed_label"] = max(col, key=lambda g: g["rect"][1])["printed_label"]
+                f["label_side"] = "column"
 
 def extract_pdf_form_fields(pdf_bytes):
     """
@@ -1969,13 +1992,35 @@ def qa_prepare_document_for_gemini(file_bytes, mime_type, file_name="", max_char
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
             text = ""
-            for page in doc:
+            filled_pages = []
+            for p_idx, page in enumerate(doc):
                 text += page.get_text("text") + "\n"
+                # [수정] 칸 내부 이름이 뒤죽박죽인 질문지가 있어(예: 생년월일 칸 이름이 '123'),
+                # 칸 이름 대신 '화면에 보이는 줄 순서'대로 값을 묶어서 전달 (표의 열 제목 순서와 같음)
+                vals = []
                 for w in page.widgets():
                     v = w.field_value
-                    if v and str(v).lower() != "off":
-                        label = w.field_label or w.field_name
-                        text += f"[Filled field: {label}] {v}\n"
+                    if v and str(v).strip().lower() not in ("off", "") and w.field_type not in (
+                            fitz.PDF_WIDGET_TYPE_CHECKBOX, fitz.PDF_WIDGET_TYPE_RADIOBUTTON):
+                        vals.append((w.rect.y0, w.rect.x0, clean_text(str(v)).strip()))
+                if vals:
+                    filled_pages.append(p_idx)
+                    vals.sort()
+                    rows, cur, cur_y = [], [], None
+                    for y, x, v in vals:
+                        if cur and abs(y - cur_y) > 5:  # 5pt 이상 내려가면 다음 줄
+                            rows.append(cur); cur = []
+                        if not cur:
+                            cur_y = y
+                        cur.append((x, v))
+                    if cur:
+                        rows.append(cur)
+                    text += f"[Filled answers on page {p_idx + 1}, one line per row, left → right]\n"
+                    for r in rows:
+                        text += "  " + " | ".join(v for _, v in sorted(r)) + "\n"
+            if filled_pages:
+                text += ("(Note: the internal field names of this form may be wrong — read each answer by its POSITION "
+                         "on the page image, under the printed column header.)\n")
 
             # [수정] 텍스트가 조금만 있는 스캔본(예: 여권 스캔 + 워터마크 문구)도 이미지로 함께 보냄
             page_count = len(doc)
@@ -1983,6 +2028,15 @@ def qa_prepare_document_for_gemini(file_bytes, mime_type, file_name="", max_char
             parts = []
             if text.strip():
                 parts.append(header + text[:max_chars] + "\n")
+            if filled_pages and avg_chars >= 200:
+                # 채워진 질문지는 페이지 이미지도 함께 (표를 눈으로 보듯 읽게)
+                for p_idx in filled_pages[:12]:
+                    pix = doc.load_page(p_idx).get_pixmap(matrix=fitz.Matrix(1.4, 1.4))
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=75)
+                    parts.append(f"(page {p_idx + 1} image of {file_name})")
+                    parts.append({"mime_type": "image/jpeg", "data": buf.getvalue()})
             if avg_chars < 200:
                 if not parts:
                     parts.append(header + "(scanned pages below)")
@@ -2055,6 +2109,10 @@ PEOPLE_RULES = """
 - '신청자 가족관계 정보' (applicant family table) = the MAIN APPLICANT's parents, spouse, children, siblings.
   '배우자 가족관계 정보' (spouse family table) = the SPOUSE's parents, siblings, and also the MAIN APPLICANT as 'Spouse' and their children.
 - NEVER copy one person's data (address history, schools, jobs, travel, birth place, height, eye colour) into another person's section.
+- FAMILY TABLES: list EVERY family member of that table's person — in this order: spouse/common-law partner, children (oldest first),
+  father, mother, then siblings (oldest first). Fill every column you know for each person (full name, date of birth, country/city of birth,
+  relationship, marital status, occupation, address). Take members from ALL documents: e.g. a child listed only in the spouse's
+  questionnaire is still the main applicant's child, and the main applicant is the spouse's spouse.
 - If there are NO family member documents, fill only the main applicant's sections (plus spouse/child names and dates if the main applicant's documents state them).
 """
 
@@ -3121,9 +3179,17 @@ MENU_5 = "📝 질문지 기존 정보 기입"
 MENU_6 = "🔍 서류 정보 일치 확인"
 
 st.sidebar.title("🦅 CanNest Tool")
-app_mode = st.sidebar.radio(
-    "원하시는 업무 도구를 선택하세요", [MENU_1, MENU_2, MENU_3, MENU_4, MENU_5, MENU_6]
-)
+# [수정] 일부 서버 환경에서 라디오 버튼 부품(Radio.js)을 불러오지 못해 메뉴가 안 보이는 문제가 있어
+# 일반 버튼으로 메뉴를 구성 (선택된 메뉴는 진한 색으로 표시)
+ALL_MENUS = [MENU_1, MENU_2, MENU_3, MENU_4, MENU_5, MENU_6]
+st.session_state.setdefault("app_mode", MENU_1)
+st.sidebar.caption("원하시는 업무 도구를 선택하세요")
+for _m in ALL_MENUS:
+    if st.sidebar.button(_m, key=f"menu_btn_{_m}", **_WIDE,
+                         type="primary" if st.session_state.app_mode == _m else "secondary"):
+        st.session_state.app_mode = _m
+        st.rerun()
+app_mode = st.session_state.app_mode
 
 # ------------------------------------------
 # 메뉴 1: IMM5476 자동 작성
@@ -3211,7 +3277,7 @@ if app_mode == MENU_1:
             "signDate": sign_date.strftime("%Y-%m-%d"),
         }
         pdf_out = fill_imm5476(template_5476_bytes, final_data)
-        st.download_button(
+        safe_download_button(
             "📥 다운로드",
             pdf_out,
             file_name=f"IMM5476_{surname}_{given}.pdf",
@@ -3226,7 +3292,7 @@ if app_mode == MENU_1:
         key="reset_btn_m1",
     ):
       for key in list(st.session_state.keys()):
-        if key != "password_correct":
+        if key not in ("password_correct", "app_mode"):  # 로그인·현재 메뉴는 유지
           del st.session_state[key]
       st.rerun()
 
@@ -3431,7 +3497,7 @@ elif app_mode == MENU_2:
           f"{crm_name}_Consent Letter for Children Travelling Abroad.pdf"
       )
 
-      st.download_button(
+      safe_download_button(
           "📥 다운로드", pdf_out, download_file_name, "application/pdf"
       )
 
@@ -3443,7 +3509,7 @@ elif app_mode == MENU_2:
       key="reset_btn_m2",
   ):
     for key in list(st.session_state.keys()):
-      if key != "password_correct":
+      if key not in ("password_correct", "app_mode"):  # 로그인·현재 메뉴는 유지
         del st.session_state[key]
     st.rerun()
 
@@ -4262,7 +4328,7 @@ elif app_mode == MENU_4:
         st.text_input("파일명", value=item["final_name"], key=edit_key, label_visibility="collapsed")
 
       with col3:
-        st.download_button(
+        safe_download_button(
             "⬇️ 개별 다운로드",
             data=item["bytes"],
             file_name=item["final_name"],
@@ -4287,7 +4353,7 @@ elif app_mode == MENU_4:
 
     today_str = datetime.date.today().strftime("%Y%m%d")
     st.markdown("---")
-    st.download_button(
+    safe_download_button(
         "📦 전체 서류 ZIP 다운로드",
         data=zip_buffer,
         file_name=f"CRM_Documents_{today_str}.zip",
@@ -4299,7 +4365,7 @@ elif app_mode == MENU_4:
     st.markdown("---")
     if st.button("🔄 전체 리셋", type="secondary", **_WIDE):
       for key in list(st.session_state.keys()):
-        if key != "password_correct":
+        if key not in ("password_correct", "app_mode"):  # 로그인·현재 메뉴는 유지
           del st.session_state[key]
       st.session_state.uploader_key = str(uuid.uuid4())
       st.rerun()
@@ -4405,7 +4471,7 @@ elif app_mode == MENU_5:
                             st.write(f"- {r['주변 문구'] or r['칸 (Key)']}: {r['값']}  — {r['확인 필요']}")
                         for k in skipped:
                             st.write(f"- {k}: 서식에서 위치를 찾지 못함")
-                st.download_button(
+                safe_download_button(
                     label="📥 Info Filled 질문지 내려받기",
                     data=out_bytes,
                     file_name=out_name,
@@ -4510,7 +4576,7 @@ elif app_mode == MENU_6:
             st.code(summary, language=None, wrap_lines=True)  # 긴 줄 자동 줄바꿈
         except TypeError:
             st.code(summary, language=None)
-        st.download_button("📥 정리본 내려받기 (.txt)", data=summary.encode("utf-8"),
+        safe_download_button("📥 정리본 내려받기 (.txt)", data=summary.encode("utf-8"),
                            file_name=f"서류확인_{res.get('client') or 'client'}_{datetime.date.today():%Y%m%d}.txt",
                            mime="text/plain", type="primary", **_WIDE)
 
