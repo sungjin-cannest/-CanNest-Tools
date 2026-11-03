@@ -55,6 +55,30 @@ except Exception:
     _WIDE = {"use_container_width": True}
 
 HANGUL_RE = re.compile(r"[\u3131-\u318E\uAC00-\uD7A3]")
+
+# [수정] 일부 환경에서 다운로드 버튼 부품(DownloadButton.js)을 불러오지 못해 버튼이 오류로 바뀌는 문제가 있어
+# 버튼 바로 아래에 '예비 다운로드 링크'를 함께 표시 (링크는 이미 불러온 기본 글자 부품만 사용)
+import base64 as _b64
+import html as _html_mod
+
+def safe_download_button(label, data=None, file_name=None, mime=None, **kwargs):
+    result = st.download_button(label, data=data, file_name=file_name, mime=mime, **kwargs)
+    try:
+        raw = data.getvalue() if hasattr(data, "getvalue") else data
+        if isinstance(raw, str):
+            raw = raw.encode("utf-8")
+        if raw and len(raw) <= 60 * 1024 * 1024:  # 60MB 이하만
+            b64 = _b64.b64encode(raw).decode()
+            fname = _html_mod.escape(file_name or "download", quote=True)
+            st.markdown(
+                f'<div style="text-align:center;font-size:0.85em;margin-top:-6px">'
+                f'<a href="data:{mime or "application/octet-stream"};base64,{b64}" download="{fname}">'
+                f'버튼이 안 보이거나 오류가 나면 여기를 눌러 내려받기</a></div>',
+                unsafe_allow_html=True)
+    except Exception:
+        pass
+    return result
+
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.heic', '.heif', '.webp')
 
 # ==========================================
@@ -3174,9 +3198,17 @@ MENU_5 = "📝 질문지 기존 정보 기입"
 MENU_6 = "🔍 서류 정보 일치 확인"
 
 st.sidebar.title("🦅 CanNest Tool")
-app_mode = st.sidebar.radio(
-    "원하시는 업무 도구를 선택하세요", [MENU_1, MENU_2, MENU_3, MENU_4, MENU_5, MENU_6]
-)
+# [수정] 일부 서버 환경에서 라디오 버튼 부품(Radio.js)을 불러오지 못해 메뉴가 안 보이는 문제가 있어
+# 일반 버튼으로 메뉴를 구성 (선택된 메뉴는 진한 색으로 표시)
+ALL_MENUS = [MENU_1, MENU_2, MENU_3, MENU_4, MENU_5, MENU_6]
+st.session_state.setdefault("app_mode", MENU_1)
+st.sidebar.caption("원하시는 업무 도구를 선택하세요")
+for _m in ALL_MENUS:
+    if st.sidebar.button(_m, key=f"menu_btn_{_m}", **_WIDE,
+                         type="primary" if st.session_state.app_mode == _m else "secondary"):
+        st.session_state.app_mode = _m
+        st.rerun()
+app_mode = st.session_state.app_mode
 
 # ------------------------------------------
 # 메뉴 1: IMM5476 자동 작성
@@ -3264,7 +3296,7 @@ if app_mode == MENU_1:
             "signDate": sign_date.strftime("%Y-%m-%d"),
         }
         pdf_out = fill_imm5476(template_5476_bytes, final_data)
-        st.download_button(
+        safe_download_button(
             "📥 다운로드",
             pdf_out,
             file_name=f"IMM5476_{surname}_{given}.pdf",
@@ -3279,7 +3311,7 @@ if app_mode == MENU_1:
         key="reset_btn_m1",
     ):
       for key in list(st.session_state.keys()):
-        if key != "password_correct":
+        if key not in ("password_correct", "app_mode"):  # 로그인·현재 메뉴는 유지
           del st.session_state[key]
       st.rerun()
 
@@ -3484,7 +3516,7 @@ elif app_mode == MENU_2:
           f"{crm_name}_Consent Letter for Children Travelling Abroad.pdf"
       )
 
-      st.download_button(
+      safe_download_button(
           "📥 다운로드", pdf_out, download_file_name, "application/pdf"
       )
 
@@ -3496,7 +3528,7 @@ elif app_mode == MENU_2:
       key="reset_btn_m2",
   ):
     for key in list(st.session_state.keys()):
-      if key != "password_correct":
+      if key not in ("password_correct", "app_mode"):  # 로그인·현재 메뉴는 유지
         del st.session_state[key]
     st.rerun()
 
@@ -4315,7 +4347,7 @@ elif app_mode == MENU_4:
         st.text_input("파일명", value=item["final_name"], key=edit_key, label_visibility="collapsed")
 
       with col3:
-        st.download_button(
+        safe_download_button(
             "⬇️ 개별 다운로드",
             data=item["bytes"],
             file_name=item["final_name"],
@@ -4340,7 +4372,7 @@ elif app_mode == MENU_4:
 
     today_str = datetime.date.today().strftime("%Y%m%d")
     st.markdown("---")
-    st.download_button(
+    safe_download_button(
         "📦 전체 서류 ZIP 다운로드",
         data=zip_buffer,
         file_name=f"CRM_Documents_{today_str}.zip",
@@ -4352,7 +4384,7 @@ elif app_mode == MENU_4:
     st.markdown("---")
     if st.button("🔄 전체 리셋", type="secondary", **_WIDE):
       for key in list(st.session_state.keys()):
-        if key != "password_correct":
+        if key not in ("password_correct", "app_mode"):  # 로그인·현재 메뉴는 유지
           del st.session_state[key]
       st.session_state.uploader_key = str(uuid.uuid4())
       st.rerun()
@@ -4458,7 +4490,7 @@ elif app_mode == MENU_5:
                             st.write(f"- {r['주변 문구'] or r['칸 (Key)']}: {r['값']}  — {r['확인 필요']}")
                         for k in skipped:
                             st.write(f"- {k}: 서식에서 위치를 찾지 못함")
-                st.download_button(
+                safe_download_button(
                     label="📥 Info Filled 질문지 내려받기",
                     data=out_bytes,
                     file_name=out_name,
@@ -4563,7 +4595,7 @@ elif app_mode == MENU_6:
             st.code(summary, language=None, wrap_lines=True)  # 긴 줄 자동 줄바꿈
         except TypeError:
             st.code(summary, language=None)
-        st.download_button("📥 정리본 내려받기 (.txt)", data=summary.encode("utf-8"),
+        safe_download_button("📥 정리본 내려받기 (.txt)", data=summary.encode("utf-8"),
                            file_name=f"서류확인_{res.get('client') or 'client'}_{datetime.date.today():%Y%m%d}.txt",
                            mime="text/plain", type="primary", **_WIDE)
 
