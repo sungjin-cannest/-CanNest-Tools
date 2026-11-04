@@ -1,7 +1,7 @@
 import streamlit as st
 
 # 📌 가장 먼저 실행되어야 하는 Streamlit 페이지 설정
-APP_NAME = "CanNest 통합 업무 시스템"
+APP_NAME = "[Demo]CanNest 통합 업무 시스템"
 st.set_page_config(page_title=APP_NAME, layout="wide")
 
 from concurrent.futures import ThreadPoolExecutor
