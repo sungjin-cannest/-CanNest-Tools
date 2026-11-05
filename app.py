@@ -1941,6 +1941,97 @@ PRESENT_WORDS = {"present", "current", "now", "현재", "재직중", "재직 중
 def _is_present(v):
     return str(v or "").strip().lower() in PRESENT_WORDS
 
+# ------------------------------------------
+# 이전 질문지의 '현재 주소' → 새 질문지 주소 이력 맨 위에 추가 (이력에 없을 때만)
+# ------------------------------------------
+ADDRESS_COL_RE = re.compile(r"address|주소", re.I)
+DATE_COL_RE = re.compile(r"from|to\b|date|period|year|month|yyyy|mm|기간|부터|까지|년|월|날짜", re.I)
+_ADDR_ABBR = {
+    "street": "st", "str": "st", "avenue": "ave", "av": "ave", "road": "rd", "drive": "dr", "boulevard": "blvd",
+    "crescent": "cres", "court": "ct", "place": "pl", "lane": "ln", "highway": "hwy", "terrace": "terr",
+    "parkway": "pkwy", "circle": "cir", "square": "sq", "north": "n", "south": "s", "east": "e", "west": "w",
+    "apartment": "unit", "apt": "unit", "suite": "unit", "ste": "unit", "room": "unit", "rm": "unit", "ho": "unit",
+}
+# 비교에서 빼는 단어 (나라·주 이름 등 — 같은 도시면 누구나 겹침)
+_ADDR_STOP = {"canada", "korea", "republic", "of", "the", "south", "s", "rok", "kr", "ca", "bc", "ab", "on", "qc", "mb",
+              "sk", "ns", "nb", "nl", "pe", "yt", "nt", "nu", "british", "columbia", "alberta", "ontario", "quebec",
+              "manitoba", "saskatchewan", "province", "unit", "and"}
+
+def _addr_parts(text):
+    """주소 → (단어 집합, 번지 숫자 집합, 호수 집합)."""
+    s = (text or "").lower()
+    s = re.sub(r"\b[a-z]\d[a-z]\s?\d[a-z]\d\b", " ", s)          # 캐나다 우편번호
+    s = re.sub(r"(postal|zip)\s*code\s*[:#]?\s*\w+", " ", s)
+    units = set()
+    # '#5', 'unit 5', 'apt 5b', 'suite 1203', '1203호'
+    for m in re.finditer(r"(?:#|\b(?:unit|apt|apartment|suite|ste|room|rm)\.?\s*#?)\s*([0-9]+[a-z]?)\b", s):
+        units.add(m.group(1))
+    for m in re.finditer(r"\b([0-9]+[a-z]?)\s*호", s):
+        units.add(m.group(1))
+    s = re.sub(r"(?:#|\b(?:unit|apt|apartment|suite|ste|room|rm)\.?\s*#?)\s*[0-9]+[a-z]?\b", " ", s)
+    s = re.sub(r"\b[0-9]+[a-z]?\s*호", " ", s)
+    # '1203-456 Main St' (캐나다식 호수-번지)
+    m = re.search(r"\b([0-9]+[a-z]?)\s*-\s*([0-9]+)\s+[a-z]", s)
+    if m:
+        units.add(m.group(1))
+        s = s[:m.start()] + " " + m.group(2) + s[m.end(2):]
+    toks = re.findall(r"[a-z]+|[0-9]+|[가-힣]+", s)
+    words, nums = set(), set()
+    for t in toks:
+        if t.isdigit():
+            nums.add(t.lstrip("0") or "0")
+            continue
+        t = _ADDR_ABBR.get(t, t)
+        if t not in _ADDR_STOP and len(t) > 1:
+            words.add(t)
+    return words, nums, units
+
+def same_address(a, b):
+    """같은 주소인지 판단: 줄임말·대소문자·띄어쓰기 무시, 호수가 둘 다 있는데 다르면 다른 주소."""
+    wa, na, ua = _addr_parts(a)
+    wb, nb, ub = _addr_parts(b)
+    if not wa or not wb:
+        return False
+    if ua and ub and ua != ub:
+        return False
+    if na and nb and not (na <= nb or nb <= na):
+        return False
+    return len(wa & wb) / max(len(wa), len(wb)) >= 0.6
+
+def merge_previous_current_address(tables, ai_tables, ai_current):
+    """
+    AI가 찾은 '이전 자료의 현재 주소'가 해당 주소 이력 표에 없으면 맨 위(진행 중 레코드)로 추가.
+    반환: (새 ai_tables, 추가된 표 id 집합)
+    """
+    ai_tables = dict(ai_tables or {})
+    added = set()
+    if not isinstance(ai_current, dict):
+        return ai_tables, added
+    by_id = {t["id"]: t for t in tables}
+    for tid, rec in ai_current.items():
+        t = by_id.get(tid)
+        if t is None or not isinstance(rec, dict):
+            continue
+        if not any(ADDRESS_COL_RE.search(n) for n in t["columns"]):
+            continue  # 주소 칸이 있는 표(주소 이력)만 — 가족·거주국가 표 등은 건드리지 않음
+        addr_cols = [ci for ci, n in enumerate(t["columns"]) if not DATE_COL_RE.search(n)] or list(range(len(t["columns"])))
+        def addr_text(r):
+            return " ".join(str(r.get(f"c{ci + 1}") or "") for ci in addr_cols).strip()
+        cur_txt = addr_text(rec)
+        if not cur_txt:
+            continue
+        records = [r for r in (ai_tables.get(tid) or []) if isinstance(r, dict)]
+        if any(same_address(cur_txt, addr_text(r)) for r in records):
+            continue  # 이미 이력에 있음 → 그대로
+        new_rec = {k: v for k, v in rec.items() if re.fullmatch(r"c\d+", str(k))}
+        if t.get("to_col") is not None:
+            new_rec.pop(f"c{t['to_col'] + 1}", None)  # To는 비움 (아직 거주 중인지 모름)
+        new_rec["is_current"] = True
+        new_rec["_note"] = "이전 질문지 현재 주소"
+        ai_tables[tid] = [new_rec] + records
+        added.add(tid)
+    return ai_tables, added
+
 def place_table_records(tables, ai_tables):
     """
     AI가 준 표 데이터(최근→과거 순 레코드 목록)를 실제 칸에 배치.
@@ -1973,24 +2064,24 @@ def place_table_records(tables, ai_tables):
                 continue
             seen.add(sig)
             is_cur = bool(rec.get("is_current")) or (t["to_col"] is not None and _is_present(vals.get(t["to_col"])))
-            clean.append((is_cur, vals))
+            clean.append((is_cur, vals, rec.get("_note") or ""))
 
         n_rows = len(t["rows"])
         ci_row = t["current_row"]
         order = []  # (row_index, vals)
         # 진행 중 레코드는 To 칸 비우기 ('Present', 'Current' 등 제거)
         prepared = []
-        for is_cur, vals in clean:
+        for is_cur, vals, note in clean:
             if t["to_col"] is not None and (is_cur or _is_present(vals.get(t["to_col"]))):
                 vals = {ci: v for ci, v in vals.items() if ci != t["to_col"]}
-            prepared.append((is_cur, vals))
+            prepared.append((is_cur, vals, note))
         # 진행 중이던 레코드가 맨 위 (최근 순)
         prepared.sort(key=lambda x: not x[0])
         start = (ci_row + 1) if ci_row is not None else 0
-        order = [(start + i, v) for i, (_, v) in enumerate(prepared)]
+        order = [(start + i, v, note) for i, (_, v, note) in enumerate(prepared)]
 
         overflow = 0
-        for ri, vals in order:
+        for ri, vals, note in order:
             if ri >= n_rows:
                 overflow += 1
                 continue
@@ -2001,7 +2092,7 @@ def place_table_records(tables, ai_tables):
                     # Current 행의 'To' 칸처럼 칸 자체가 없는 경우 (인쇄된 Current) → 건너뜀
                     continue
                 values[key] = v
-                labels[key] = f"[{t['id']}] {ri + 1}행 · {t['columns'][ci][:20]}"
+                labels[key] = f"[{t['id']}] {ri + 1}행 · {t['columns'][ci][:20]}" + (f" ({note})" if note else "")
         if overflow:
             warns.append(f"표 {t['id']} ({t['title'][-30:]}): 칸이 부족해 {overflow}개 항목을 넣지 못했습니다. 별도 Word 파일로 정리해 주세요.")
     return values, labels, warns
@@ -2245,9 +2336,16 @@ TABLES (work history, education, addresses, travel, relatives, etc.):
 - Do NOT leave empty records to skip rows — the program places records into the right rows automatically
   (the pre-printed 'Current' row is always left blank for the client to update; all records start on the row below it).
 - Fill each table with the data of that table's PERSON only.
+PREVIOUS CURRENT ADDRESS (address-history / residence tables only):
+- For every ADDRESS HISTORY table, also return under "current_address" -> that table id ONE record (same column ids) with the
+  residential address that was the CURRENT address of that table's PERSON in their latest client document
+  (e.g. 'Current residential address' / '현재 주소' / '현 거주지' in a previous questionnaire). Write the full address as written.
+  From = the move-in date if a document states it; leave To empty. Omit the table if no current address is stated.
+- Return it there even if it also appears in the history — the program compares and adds it to the history only when missing.
 OUTPUT: Return ONLY a JSON object:
 {{"pdf_fields": {{"<KEY>": "<value>"}},
-  "tables": {{"<TABLE ID>": [{{"is_current": true, "c1": "2025-09", "c2": "Present", "c3": "..."}}, {{"is_current": false, "c1": "...", "c2": "..."}}]}}}}
+  "tables": {{"<TABLE ID>": [{{"is_current": true, "c1": "2025-09", "c2": "Present", "c3": "..."}}, {{"is_current": false, "c1": "...", "c2": "..."}}]}},
+  "current_address": {{"<ADDRESS TABLE ID>": {{"c1": "2023-05", "c3": "..."}}}}}}
 
 ===== TABLES OF THE TARGET FORM =====
 {format_table_catalog(tables)}
@@ -2301,7 +2399,8 @@ def build_review_rows(data, context):
     rows = []
     if context["kind"] == "pdf":
         by_key = {f["key"]: f for f in context["fields"] if not f["duplicate"]}
-        t_values, t_labels, t_warns = place_table_records(context.get("tables", []), data.get("tables"))
+        ai_tables, _ = merge_previous_current_address(context.get("tables", []), data.get("tables"), data.get("current_address"))
+        t_values, t_labels, t_warns = place_table_records(context.get("tables", []), ai_tables)
         context["table_warnings"] = t_warns
         plain = {k: v for k, v in (data.get("pdf_fields") or {}).items()
                  if not (by_key.get(k) or {}).get("table") and not (by_key.get(k) or {}).get("always_blank")}  # 표 칸은 표 로직 결과만 사용
