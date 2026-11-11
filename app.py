@@ -1816,6 +1816,34 @@ def extract_pdf_form_fields(pdf_bytes):
 # ------------------------------------------
 # 1-1b. 표(경력·학력·주소·여행 등) 자동 인식
 # ------------------------------------------
+def _has_header_above(page, row):
+    """다음 페이지 첫 행 바로 위에 열 제목(글자)이 있으면 = 이어지는 표가 아니라 새 표 (예: 학력표 → 다음 장 직장표)."""
+    try:
+        return len(page.get_text("words", clip=fitz.Rect(0, max(0, row["y0"] - 34), page.rect.width, row["y0"] - 1))) >= 2
+    except Exception:
+        return False
+
+def _row_is_current(page, row):
+    """
+    행에 'Current/Present/현재'가 인쇄돼 있으면 현재 행.
+    - 'C u r r e n t'처럼 글자가 한 자씩 떨어져 인쇄된 양식도 인식 (공백 제거 후 검사)
+    - 칸 안에 이미 적힌 값은 제외 (인쇄된 글자만 봄)
+    - 칸 이름이 대부분 'current'로 시작하는 행도 현재 행
+    """
+    keys = [f["key"].lower() for f in row["fields"]]
+    if sum(1 for k in keys if k.startswith("current")) >= max(2, len(keys) - 1):
+        return True
+    band = fitz.Rect(0, row["y0"] - 3, page.rect.width, row["y1"] + 3)
+    rects = [fitz.Rect(f["rect"]) for f in row["fields"]]
+    printed = []
+    for w in page.get_text("words", clip=band):
+        c = fitz.Point((w[0] + w[2]) / 2, (w[1] + w[3]) / 2)
+        if not any(rc.contains(c) for rc in rects):
+            printed.append(w)
+    printed.sort(key=lambda w: w[0])
+    txt = "".join(w[4] for w in printed).lower()
+    return bool(re.search(r"current|present|현재", txt))
+
 def detect_tables(pdf_bytes, fields):
     """
     위젯 위치로 표를 찾아 행/열 구조로 정리.
@@ -1851,7 +1879,8 @@ def detect_tables(pdf_bytes, fields):
         if ok and cur:
             prev = cur[-1]
             same_page_next = prev["page"] == r["page"] and r["y0"] - prev["y1"] < 15
-            next_page_top = (r["page"] == prev["page"] + 1 and rows[i - 1] is prev)
+            next_page_top = (r["page"] == prev["page"] + 1 and rows[i - 1] is prev
+                             and not _has_header_above(doc[r["page"]], r))
             if not ((same_page_next or next_page_top) and compatible(prev, r)):
                 groups.append(cur)
                 cur = []
@@ -1901,9 +1930,7 @@ def detect_tables(pdf_bytes, fields):
                 ci = min(range(len(col_xs)), key=lambda c: abs(col_xs[c] - f["rect"][0]))
                 cells[ci] = f["key"]
             pg = doc[r["page"]]
-            band = fitz.Rect(0, r["y0"] - 3, pg.rect.width, r["y1"] + 3)
-            words = [w[4].lower() for w in pg.get_text("words", clip=band)]
-            if current_idx is None and any(w.startswith("current") for w in words):
+            if current_idx is None and _row_is_current(pg, r):
                 current_idx = ri
             t_rows.append(cells)
         to_col = next((i for i, n in enumerate(col_names) if re.match(r"\s*(to\b|까지)", n, re.I)), None)
@@ -2192,7 +2219,11 @@ def qa_prepare_document_for_gemini(file_bytes, mime_type, file_name="", max_char
                 if not parts:
                     parts.append(header + "(scanned pages below)")
                 for p_idx in range(min(page_count, 10)):
-                    pix = doc.load_page(p_idx).get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+                    # [수정] 스캔 손글씨를 잘 읽도록 페이지 크기와 상관없이 긴 변 2000px로 맞춤
+                    # (작은 스캔은 900px밖에 안 돼 글자를 잘못 읽었고, 큰 스캔은 3400px라 메모리를 많이 썼음)
+                    pg = doc.load_page(p_idx)
+                    zoom = max(0.3, min(3.0, 2000 / max(pg.rect.width, pg.rect.height, 1)))
+                    pix = pg.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                     buf = io.BytesIO()
                     img.save(buf, format="JPEG", quality=80)
